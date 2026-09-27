@@ -580,6 +580,14 @@ fn ingest_inner(
     total: usize,
 ) -> Result<()> {
     let mappings = db::mappings(conn)?;
+    // Fewer files at once when reading from or writing to a NAS.
+    let mut io_paths: Vec<&Path> = vec![&cfg.repo];
+    io_paths.extend(files.first().and_then(|f| f.parent()));
+    let threads = util::io_threads(&io_paths);
+    log::info!("Reading {threads} files at a time");
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()?;
     let mut state = FileState {
         seen: HashSet::new(),
         planned: HashSet::new(),
@@ -598,10 +606,12 @@ fn ingest_inner(
         progress.update(done, total, &format!("Reading {}", label(&chunk[0])));
 
         // Unpack containers (zip, xisf, gz) into plain FITS files.
-        let unpacked: Vec<(PathBuf, Result<Vec<Staged>>)> = chunk
-            .par_iter()
-            .map(|p| (p.clone(), unpack(p, cfg, opts, work)))
-            .collect();
+        let unpacked: Vec<(PathBuf, Result<Vec<Staged>>)> = pool.install(|| {
+            chunk
+                .par_iter()
+                .map(|p| (p.clone(), unpack(p, cfg, opts, work)))
+                .collect()
+        });
         let mut staged: Vec<Staged> = Vec::new();
         for (input, r) in unpacked {
             match r {
@@ -611,10 +621,12 @@ fn ingest_inner(
         }
 
         // Parse, normalise and hash in parallel.
-        let prepared: Vec<(PathBuf, Result<Prepared>)> = staged
-            .into_par_iter()
-            .map(|st| (st.input.clone(), prepare(st, cfg, &mappings)))
-            .collect();
+        let prepared: Vec<(PathBuf, Result<Prepared>)> = pool.install(|| {
+            staged
+                .into_par_iter()
+                .map(|st| (st.input.clone(), prepare(st, cfg, &mappings)))
+                .collect()
+        });
 
         // File and catalogue this batch in one transaction.
         progress.update(done, total, &format!("Filing {}", label(&chunk[0])));

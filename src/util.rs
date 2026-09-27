@@ -123,6 +123,83 @@ fn gvfs_to_mount(path: &Path, mounts: &str) -> Option<PathBuf> {
     None
 }
 
+/// Whether `path` is on a network filesystem (SMB, NFS, GVFS, sshfs...).
+pub fn is_network_path(path: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+            return false;
+        };
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        // The mount holding the path is the longest mount point that prefixes it.
+        let fstype = mounts
+            .lines()
+            .filter_map(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                (f.len() >= 3).then(|| (PathBuf::from(unescape_mounts(f[1])), f[2].to_string()))
+            })
+            .filter(|(mp, _)| path.starts_with(mp))
+            .max_by_key(|(mp, _)| mp.as_os_str().len())
+            .map(|(_, t)| t)
+            .unwrap_or_default();
+        matches!(
+            fstype.as_str(),
+            "cifs" | "smb3" | "smbfs" | "nfs" | "nfs4" | "9p" | "afs"
+        ) || fstype.starts_with("fuse.gvfs")
+            || fstype == "fuse.sshfs"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // `mount` lists "//user@nas/share on /Volumes/share (smbfs, ...)".
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let Ok(out) = std::process::Command::new("/sbin/mount").output() else {
+            return false;
+        };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let (_, rest) = l.split_once(" on ")?;
+                let (mp, kind) = rest.rsplit_once(" (")?;
+                Some((PathBuf::from(mp), kind.split(',').next()?.to_string()))
+            })
+            .filter(|(mp, _)| path.starts_with(mp))
+            .max_by_key(|(mp, _)| mp.as_os_str().len())
+            .is_some_and(|(_, k)| matches!(k.as_str(), "smbfs" | "nfs" | "afpfs" | "webdav"))
+    }
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        s.starts_with("\\\\") && !s.starts_with("\\\\?\\") || s.starts_with("\\\\?\\UNC\\")
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// How many files to read at once from these places. A NAS's disks slow
+/// down when too many reads are in flight: a load of 40 frames took 16.9 s
+/// with 32 at once and 7.6-9.0 s with 4. Local disks get every core.
+pub fn io_threads(paths: &[&Path]) -> usize {
+    if paths.iter().any(|p| is_network_path(p)) {
+        4
+    } else {
+        rayon::current_num_threads()
+    }
+}
+
+/// Run `f` on a thread pool sized by [`io_threads`] for `paths`.
+pub fn with_io_pool<R: Send>(paths: &[&Path], f: impl FnOnce() -> R + Send) -> R {
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(io_threads(paths))
+        .build()
+    {
+        Ok(pool) => pool.install(f),
+        Err(_) => f(),
+    }
+}
+
 /// Normalise a path to forward slashes, as the original stores paths.
 pub fn normalize_path(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
@@ -749,5 +826,13 @@ mod tests {
         assert_eq!(FrameKind::classify("Bias Frame"), Some(FrameKind::Bias));
         assert_eq!(FrameKind::classify("MASTERDARK"), Some(FrameKind::Dark));
         assert!(exposures_match(Some("10"), Some("10.0")));
+    }
+}
+#[cfg(all(test, target_os = "linux"))]
+mod network_tests {
+    #[test]
+    fn local_paths_are_not_network() {
+        assert!(!super::is_network_path(std::path::Path::new("/tmp")));
+        assert!(!super::is_network_path(&std::env::temp_dir()));
     }
 }

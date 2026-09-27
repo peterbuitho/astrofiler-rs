@@ -415,39 +415,45 @@ pub fn export_files(
         .filter_map(|id| db::file_by_id(conn, id).ok().flatten())
         .collect();
     let done = AtomicUsize::new(0);
-    let results: Vec<(String, Result<PathBuf>)> = files
-        .par_iter()
-        .map(|f| {
-            let src = PathBuf::from(&f.name);
-            let dir = match layout {
-                ExportLayout::Flat => dest.to_path_buf(),
-                ExportLayout::ByObject => {
-                    let kind = FrameKind::classify(f.image_type.as_deref().unwrap_or(""));
-                    let sub = match kind {
-                        Some(FrameKind::Light) | None => {
-                            f.filter.clone().unwrap_or_else(|| "OSC".into())
-                        }
-                        Some(k) => k.object_name().to_string(),
-                    };
-                    dest.join(util::sanitize(f.object.as_deref().unwrap_or("Unknown")))
-                        .join(util::sanitize(&sub))
-                }
-            };
-            let target = util::unique_path(&dir.join(src.file_name().unwrap_or_default()));
-            let r = (|| -> Result<PathBuf> {
-                std::fs::create_dir_all(&dir)?;
-                if move_files {
-                    util::move_file(&src, &target)?;
-                } else {
-                    util::copy_file(&src, &target)?;
-                }
-                Ok(target)
-            })();
-            let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-            progress.update(d, files.len(), &f.file_name());
-            (f.id.clone(), r)
-        })
-        .collect();
+    let first = files
+        .first()
+        .map(|f| PathBuf::from(&f.name))
+        .unwrap_or_default();
+    let results: Vec<(String, Result<PathBuf>)> = util::with_io_pool(&[&first, dest], || {
+        files
+            .par_iter()
+            .map(|f| {
+                let src = PathBuf::from(&f.name);
+                let dir = match layout {
+                    ExportLayout::Flat => dest.to_path_buf(),
+                    ExportLayout::ByObject => {
+                        let kind = FrameKind::classify(f.image_type.as_deref().unwrap_or(""));
+                        let sub = match kind {
+                            Some(FrameKind::Light) | None => {
+                                f.filter.clone().unwrap_or_else(|| "OSC".into())
+                            }
+                            Some(k) => k.object_name().to_string(),
+                        };
+                        dest.join(util::sanitize(f.object.as_deref().unwrap_or("Unknown")))
+                            .join(util::sanitize(&sub))
+                    }
+                };
+                let target = util::unique_path(&dir.join(src.file_name().unwrap_or_default()));
+                let r = (|| -> Result<PathBuf> {
+                    std::fs::create_dir_all(&dir)?;
+                    if move_files {
+                        util::move_file(&src, &target)?;
+                    } else {
+                        util::copy_file(&src, &target)?;
+                    }
+                    Ok(target)
+                })();
+                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                progress.update(d, files.len(), &f.file_name());
+                (f.id.clone(), r)
+            })
+            .collect()
+    });
     let mut n = 0;
     for (id, r) in results {
         match r {
@@ -482,28 +488,34 @@ pub fn verify(
     let files = db::all_files(conn, false)?;
     let done = AtomicUsize::new(0);
     let total = files.len();
-    let states: Vec<(FitsFile, u8)> = files
-        .into_par_iter()
-        .map(|f| {
-            let p = Path::new(&f.name);
-            let state = if !p.exists() {
-                1
-            } else if check_hash
-                && f.hash
-                    .as_deref()
-                    .is_some_and(|h| util::sha256_file(p).map(|x| x != h).unwrap_or(true))
-            {
-                2
-            } else {
-                0
-            };
-            let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if d % 64 == 0 || d == total {
-                progress.update(d, total, "Verifying files");
-            }
-            (f, state)
-        })
-        .collect();
+    let first = files
+        .first()
+        .map(|f| PathBuf::from(&f.name))
+        .unwrap_or_default();
+    let states: Vec<(FitsFile, u8)> = util::with_io_pool(&[&first], || {
+        files
+            .into_par_iter()
+            .map(|f| {
+                let p = Path::new(&f.name);
+                let state = if !p.exists() {
+                    1
+                } else if check_hash
+                    && f.hash
+                        .as_deref()
+                        .is_some_and(|h| util::sha256_file(p).map(|x| x != h).unwrap_or(true))
+                {
+                    2
+                } else {
+                    0
+                };
+                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                if d % 64 == 0 || d == total {
+                    progress.update(d, total, "Verifying files");
+                }
+                (f, state)
+            })
+            .collect()
+    });
     let mut r = VerifyReport {
         checked: total,
         ..Default::default()
