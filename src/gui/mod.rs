@@ -701,10 +701,12 @@ impl App {
         });
         ui.separator();
 
+        let full_width = ui.available_width();
         egui::SidePanel::right("preview")
             .resizable(true)
-            .default_width(420.0)
-            .min_width(340.0)
+            .default_width((full_width * 0.3).clamp(240.0, 420.0))
+            .min_width(200.0)
+            .max_width(full_width * 0.45)
             .show_inside(ui, |ui| {
                 ui.heading("Preview");
                 if let Some(id) = self.preview_for.clone() {
@@ -742,100 +744,107 @@ impl App {
         let mut double: Option<usize> = None;
         let mut sort_click: Option<SortKey> = None;
         let n = self.filtered.len();
-        TableBuilder::new(ui)
-            .striped(true)
-            .resizable(true)
-            .sense(egui::Sense::click())
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::initial(150.0).clip(true).at_least(60.0))
-            .column(Column::initial(90.0).clip(true))
-            .column(Column::initial(140.0).clip(true))
-            .column(Column::initial(60.0).clip(true))
-            .column(Column::initial(55.0).clip(true))
-            .column(Column::initial(40.0).clip(true))
-            .column(Column::initial(50.0).clip(true))
-            .column(Column::initial(130.0).clip(true))
-            .column(Column::remainder().clip(true).at_least(100.0))
-            .header(22.0, |mut h| {
-                let mut head =
-                    |h: &mut egui_extras::TableRow, label: &str, key: Option<SortKey>| {
-                        h.col(|ui| {
-                            let mut text = label.to_string();
-                            if key == Some(self.sort) {
-                                text.push_str(if self.sort_desc { " ⏷" } else { " ⏶" });
+        // The scroll area clips the table to the space left of the preview
+        // and scrolls sideways when the columns don't fit.
+        egui::ScrollArea::horizontal()
+            .id_salt("images_hscroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                TableBuilder::new(ui)
+                    .striped(true)
+                    .resizable(true)
+                    .sense(egui::Sense::click())
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .column(Column::initial(150.0).clip(true).at_least(60.0))
+                    .column(Column::initial(90.0).clip(true))
+                    .column(Column::initial(140.0).clip(true))
+                    .column(Column::initial(60.0).clip(true))
+                    .column(Column::initial(55.0).clip(true))
+                    .column(Column::initial(40.0).clip(true))
+                    .column(Column::initial(50.0).clip(true))
+                    .column(Column::initial(130.0).clip(true))
+                    .column(Column::remainder().clip(true).at_least(100.0))
+                    .header(22.0, |mut h| {
+                        let mut head =
+                            |h: &mut egui_extras::TableRow, label: &str, key: Option<SortKey>| {
+                                h.col(|ui| {
+                                    let mut text = label.to_string();
+                                    if key == Some(self.sort) {
+                                        text.push_str(if self.sort_desc { " ⏷" } else { " ⏶" });
+                                    }
+                                    if ui
+                                        .add(
+                                            egui::Label::new(RichText::new(text).strong())
+                                                .sense(egui::Sense::click()),
+                                        )
+                                        .clicked()
+                                    {
+                                        sort_click = key;
+                                    }
+                                });
+                            };
+                        head(&mut h, "Object", Some(SortKey::Object));
+                        head(&mut h, "Type", Some(SortKey::Type));
+                        head(&mut h, "Date", Some(SortKey::Date));
+                        head(&mut h, "Filter", Some(SortKey::Filter));
+                        head(&mut h, "Exp (s)", Some(SortKey::Exposure));
+                        head(&mut h, "Bin", None);
+                        head(&mut h, "Temp", None);
+                        head(&mut h, "Telescope / camera", Some(SortKey::Telescope));
+                        head(&mut h, "File", None);
+                    })
+                    .body(|body| {
+                        body.rows(20.0, n, |mut row| {
+                            let i = row.index();
+                            let f = &self.files[self.filtered[i]];
+                            row.set_selected(self.selected.contains(&f.id));
+                            let typ = if f.stacked {
+                                "STACKED".to_string()
+                            } else {
+                                opt(&f.image_type).to_string()
+                            };
+                            row.col(|ui| {
+                                ui.label(opt(&f.object));
+                            });
+                            row.col(|ui| {
+                                ui.label(typ);
+                            });
+                            row.col(|ui| {
+                                ui.label(
+                                    opt(&f.date)
+                                        .replace('T', " ")
+                                        .chars()
+                                        .take(19)
+                                        .collect::<String>(),
+                                );
+                            });
+                            row.col(|ui| {
+                                ui.label(opt(&f.filter));
+                            });
+                            row.col(|ui| {
+                                ui.label(opt(&f.exptime));
+                            });
+                            row.col(|ui| {
+                                ui.label(format!("{}x{}", opt(&f.xbin), opt(&f.ybin)));
+                            });
+                            row.col(|ui| {
+                                ui.label(opt(&f.ccd_temp));
+                            });
+                            row.col(|ui| {
+                                ui.label(format!("{} / {}", opt(&f.telescope), opt(&f.instrument)));
+                            });
+                            row.col(|ui| {
+                                ui.label(f.file_name()).on_hover_text(&f.name);
+                            });
+                            let resp = row.response();
+                            if resp.clicked() {
+                                clicked = Some(i);
                             }
-                            if ui
-                                .add(
-                                    egui::Label::new(RichText::new(text).strong())
-                                        .sense(egui::Sense::click()),
-                                )
-                                .clicked()
-                            {
-                                sort_click = key;
+                            if resp.double_clicked() {
+                                double = Some(i);
                             }
                         });
-                    };
-                head(&mut h, "Object", Some(SortKey::Object));
-                head(&mut h, "Type", Some(SortKey::Type));
-                head(&mut h, "Date", Some(SortKey::Date));
-                head(&mut h, "Filter", Some(SortKey::Filter));
-                head(&mut h, "Exp (s)", Some(SortKey::Exposure));
-                head(&mut h, "Bin", None);
-                head(&mut h, "Temp", None);
-                head(&mut h, "Telescope / camera", Some(SortKey::Telescope));
-                head(&mut h, "File", None);
-            })
-            .body(|body| {
-                body.rows(20.0, n, |mut row| {
-                    let i = row.index();
-                    let f = &self.files[self.filtered[i]];
-                    row.set_selected(self.selected.contains(&f.id));
-                    let typ = if f.stacked {
-                        "STACKED".to_string()
-                    } else {
-                        opt(&f.image_type).to_string()
-                    };
-                    row.col(|ui| {
-                        ui.label(opt(&f.object));
                     });
-                    row.col(|ui| {
-                        ui.label(typ);
-                    });
-                    row.col(|ui| {
-                        ui.label(
-                            opt(&f.date)
-                                .replace('T', " ")
-                                .chars()
-                                .take(19)
-                                .collect::<String>(),
-                        );
-                    });
-                    row.col(|ui| {
-                        ui.label(opt(&f.filter));
-                    });
-                    row.col(|ui| {
-                        ui.label(opt(&f.exptime));
-                    });
-                    row.col(|ui| {
-                        ui.label(format!("{}x{}", opt(&f.xbin), opt(&f.ybin)));
-                    });
-                    row.col(|ui| {
-                        ui.label(opt(&f.ccd_temp));
-                    });
-                    row.col(|ui| {
-                        ui.label(format!("{} / {}", opt(&f.telescope), opt(&f.instrument)));
-                    });
-                    row.col(|ui| {
-                        ui.label(f.file_name()).on_hover_text(&f.name);
-                    });
-                    let resp = row.response();
-                    if resp.clicked() {
-                        clicked = Some(i);
-                    }
-                    if resp.double_clicked() {
-                        double = Some(i);
-                    }
-                });
             });
 
         if let Some(k) = sort_click {
