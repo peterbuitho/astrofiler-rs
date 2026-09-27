@@ -131,6 +131,8 @@ pub struct App {
     allow_close: bool,
     /// Zoom last applied from the interface-size setting (None = not yet).
     applied_zoom: Option<f32>,
+    /// "Auto" interface size, worked out once the monitor size is known.
+    auto_zoom: Option<f32>,
     db_path: PathBuf,
     tab: Tab,
     status: String,
@@ -184,6 +186,7 @@ impl App {
             last_refresh: std::time::Instant::now(),
             allow_close: false,
             applied_zoom: None,
+            auto_zoom: None,
             db_path,
             tab: Tab::Images,
             status: String::new(),
@@ -461,20 +464,34 @@ impl App {
 
     /// Zoom picked by "Auto": the desktop scaling, raised so text stays
     /// readable on high-resolution screens (4K at 100% -> 150%).
-    fn auto_zoom(ctx: &egui::Context) -> f32 {
+    /// Computed once and cached: the monitor size egui reports is in points,
+    /// which change with the zoom itself.
+    fn auto_zoom(&mut self, ctx: &egui::Context) -> f32 {
+        if let Some(z) = self.auto_zoom {
+            return z;
+        }
         let native = ctx.native_pixels_per_point().unwrap_or(1.0);
         let Some(monitor) = ctx.input(|i| i.viewport().monitor_size) else {
-            return 1.0;
+            return 1.0; // not known yet; try again next frame
         };
-        let physical_height = monitor.y * native;
+        // Points x current pixels-per-point = physical pixels, whatever the zoom.
+        let physical_height = monitor.y * ctx.pixels_per_point();
         let wanted = ((physical_height / 1440.0) * 4.0).round() / 4.0;
-        (wanted.max(native) / native).clamp(1.0, 3.0)
+        let zoom = (wanted.max(native) / native).clamp(1.0, 3.0);
+        log::info!(
+            "screen {:.0}px high, desktop scaling {:.0}%: auto interface size {:.0}%",
+            physical_height,
+            native * 100.0,
+            zoom * 100.0
+        );
+        self.auto_zoom = Some(zoom);
+        zoom
     }
 
-    fn wanted_zoom(&self, ctx: &egui::Context) -> f32 {
+    fn wanted_zoom(&mut self, ctx: &egui::Context) -> f32 {
         match self.cfg_edit.ui_scale.parse::<f32>() {
             Ok(z) => z.clamp(0.75, 3.0),
-            Err(_) => Self::auto_zoom(ctx),
+            Err(_) => self.auto_zoom(ctx),
         }
     }
 
@@ -1743,6 +1760,7 @@ impl App {
     // ------------------------------------------------------------ Config
 
     fn config_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let auto = self.auto_zoom(ctx);
         let c = &mut self.cfg_edit;
         egui::Grid::new("cfg")
             .num_columns(3)
@@ -1791,7 +1809,6 @@ impl App {
                 ui.end_row();
                 ui.label("Interface size");
             ui.horizontal(|ui| {
-                let auto = Self::auto_zoom(ctx);
                 let label = |v: &str| match v.parse::<f32>() {
                     Ok(z) => format!("{:.0}%", z * 100.0),
                     Err(_) => format!("Auto ({:.0}%)", auto * 100.0),
