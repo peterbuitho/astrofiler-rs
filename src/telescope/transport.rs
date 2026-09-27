@@ -70,7 +70,7 @@ impl Transport for LocalTransport {
         Ok(out)
     }
     fn fetch(&mut self, path: &str, local: &Path) -> Result<()> {
-        std::fs::copy(self.root.join(path), local)?;
+        crate::util::copy_file(&self.root.join(path), local)?;
         Ok(())
     }
     fn delete(&mut self, path: &str) -> Result<()> {

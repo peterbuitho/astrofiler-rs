@@ -152,6 +152,36 @@ pub fn unique_path(path: &Path) -> PathBuf {
         .unwrap()
 }
 
+/// Copy file contents only. Unlike `std::fs::copy` this never copies
+/// permissions, which network filesystems such as GNOME's GVFS reject with
+/// "Operation not supported". A partial destination is removed on failure.
+pub fn copy_file(from: &Path, to: &Path) -> Result<u64> {
+    use std::io::{Read, Write};
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let result = (|| -> Result<u64> {
+        let mut input = std::fs::File::open(from)?;
+        let mut output = std::fs::File::create(to)?;
+        let mut buf = vec![0u8; 4 << 20];
+        let mut total = 0u64;
+        loop {
+            let n = input.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            output.write_all(&buf[..n])?;
+            total += n as u64;
+        }
+        output.flush()?;
+        Ok(total)
+    })();
+    if result.is_err() {
+        std::fs::remove_file(to).ok();
+    }
+    result
+}
+
 /// Move a file, falling back to copy+delete across filesystems.
 pub fn move_file(from: &Path, to: &Path) -> Result<()> {
     if let Some(parent) = to.parent() {
@@ -160,7 +190,7 @@ pub fn move_file(from: &Path, to: &Path) -> Result<()> {
     if std::fs::rename(from, to).is_ok() {
         return Ok(());
     }
-    std::fs::copy(from, to)?;
+    copy_file(from, to)?;
     std::fs::remove_file(from)?;
     Ok(())
 }
@@ -257,6 +287,22 @@ mod tests {
         assert_eq!(sanitize(" M 31 / core "), "M_31_core");
         assert_eq!(sanitize("a::b"), "a_b");
         assert_eq!(sanitize("  "), "Unknown");
+    }
+
+    #[test]
+    fn copies_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.bin");
+        let b = dir.path().join("sub/b.bin");
+        let data: Vec<u8> = (0..10_000_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&a, &data).unwrap();
+        assert_eq!(copy_file(&a, &b).unwrap(), data.len() as u64);
+        assert_eq!(std::fs::read(&b).unwrap(), data);
+        assert!(copy_file(&dir.path().join("missing"), &dir.path().join("c")).is_err());
+        assert!(
+            !dir.path().join("c").exists(),
+            "no partial file left behind"
+        );
     }
 
     #[test]

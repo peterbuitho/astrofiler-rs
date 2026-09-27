@@ -235,7 +235,7 @@ pub fn export_files(
                 if move_files {
                     util::move_file(&src, &target)?;
                 } else {
-                    std::fs::copy(&src, &target)?;
+                    util::copy_file(&src, &target)?;
                 }
                 Ok(target)
             })();

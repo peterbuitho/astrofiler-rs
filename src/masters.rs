@@ -83,7 +83,7 @@ pub fn register_master(
             util::move_file(path, &final_path)?;
         } else {
             std::fs::create_dir_all(&masters_dir)?;
-            std::fs::copy(path, &final_path)?;
+            util::copy_file(path, &final_path)?;
         }
     }
     let final_str = util::normalize_path(&final_path);

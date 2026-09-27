@@ -445,7 +445,7 @@ fn file_prepared(
                     std::fs::create_dir_all(&dest_dir)
                         .map_err(anyhow::Error::from)
                         .and_then(|_| {
-                            std::fs::copy(&staged.path, &dest)?;
+                            util::copy_file(&staged.path, &dest)?;
                             Ok(())
                         })
                 };
