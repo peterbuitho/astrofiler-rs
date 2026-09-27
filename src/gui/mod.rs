@@ -1,6 +1,7 @@
 //! Desktop GUI (egui). Long operations run on background threads with their
 //! own database connection; the UI polls a shared [`JobState`] for progress.
 
+mod picker;
 mod preview;
 
 use crate::batch::{self, EditOptions, ExportLayout};
@@ -165,6 +166,7 @@ pub struct App {
     preview_tex: Option<egui::TextureHandle>,
     preview_info: String,
     preview_rx: Option<mpsc::Receiver<(String, Result<preview::Preview, String>)>>,
+    picker: picker::FolderPicker,
 
     sessions: Vec<Session>,
     session_sel: Option<String>,
@@ -229,6 +231,7 @@ impl App {
             preview_tex: None,
             preview_info: String::new(),
             preview_rx: None,
+            picker: Default::default(),
             sessions: vec![],
             session_sel: None,
             session_files: vec![],
@@ -525,14 +528,6 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         }
     }
-
-    fn pick_folder(start: &str) -> Option<String> {
-        let mut d = rfd::FileDialog::new();
-        if Path::new(start).is_dir() {
-            d = d.set_directory(start);
-        }
-        d.pick_folder().map(|p| p.to_string_lossy().into_owned())
-    }
 }
 
 impl eframe::App for App {
@@ -673,7 +668,10 @@ impl App {
                     self.edit.open = true;
                 }
                 if ui.button("📤 Export…").clicked() {
-                    if let Some(dir) = Self::pick_folder("") {
+                    self.picker.open("export", "", ui.ctx());
+                }
+                if let Some(dir) = self.picker.take("export") {
+                    {
                         let ids: Vec<String> = self.selected.iter().cloned().collect();
                         let layout = if self.export_layout_by_object {
                             ExportLayout::ByObject
@@ -976,9 +974,10 @@ impl App {
                                 .desired_width(360.0),
                         );
                         if ui.button("Browse…").clicked() {
-                            if let Some(p) = Self::pick_folder(&self.scope.usb_path) {
-                                self.scope.usb_path = p;
-                            }
+                            self.picker.open("usb", &self.scope.usb_path, ui.ctx());
+                        }
+                        if let Some(p) = self.picker.take("usb") {
+                            self.scope.usb_path = p;
                         }
                     });
                 } else {
@@ -990,9 +989,10 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.scope.dest).desired_width(360.0));
                     if ui.button("Browse…").clicked() {
-                        if let Some(p) = Self::pick_folder(&self.scope.dest) {
-                            self.scope.dest = p;
-                        }
+                        self.picker.open("dest", &self.scope.dest, ui.ctx());
+                    }
+                    if let Some(p) = self.picker.take("dest") {
+                        self.scope.dest = p;
                     }
                 });
                 ui.end_row();
@@ -1182,7 +1182,10 @@ impl App {
                         });
                     }
                     if ui.button("📤 Export session…").clicked() {
-                        if let Some(dir) = Self::pick_folder("") {
+                        self.picker.open("export_session", "", ui.ctx());
+                    }
+                    if let Some(dir) = self.picker.take("export_session") {
+                        {
                             let ids: Vec<String> =
                                 self.session_files.iter().map(|f| f.id.clone()).collect();
                             self.spawn("Export session", move |conn, _, p| {
@@ -1331,7 +1334,10 @@ impl App {
                 });
             }
             if ui.button("📂 Register masters from folder…").clicked() {
-                if let Some(dir) = Self::pick_folder("") {
+                self.picker.open("masters", "", ui.ctx());
+            }
+            if let Some(dir) = self.picker.take("masters") {
+                {
                     self.spawn("Register masters", move |conn, cfg, p| {
                         let (n, errs) =
                             masters::register_folder(conn, cfg, Path::new(&dir), false, p)?;
@@ -1560,9 +1566,10 @@ impl App {
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut self.clean_dir).desired_width(360.0));
             if ui.button("Browse…").clicked() {
-                if let Some(p) = Self::pick_folder(&self.clean_dir) {
-                    self.clean_dir = p;
-                }
+                self.picker.open("clean", &self.clean_dir, ui.ctx());
+            }
+            if let Some(p) = self.picker.take("clean") {
+                self.clean_dir = p;
             }
             if ui.button("Preview").clicked() {
                 match batch::clean_previews(Path::new(&self.clean_dir), true) {
@@ -1782,11 +1789,16 @@ impl App {
     fn config_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let auto = self.auto_zoom(ctx);
         let c = &mut self.cfg_edit;
+        let picker = &mut self.picker;
         egui::Grid::new("cfg")
             .num_columns(3)
             .spacing([12.0, 8.0])
             .show(ui, |ui| {
-                let path_row = |ui: &mut egui::Ui, label: &str, hint: &str, p: &mut PathBuf| {
+                let mut path_row = |ui: &mut egui::Ui,
+                                    key: &'static str,
+                                    label: &str,
+                                    hint: &str,
+                                    p: &mut PathBuf| {
                     ui.label(label).on_hover_text(hint);
                     let mut s = p.to_string_lossy().to_string();
                     if ui
@@ -1796,20 +1808,23 @@ impl App {
                         *p = PathBuf::from(&s);
                     }
                     if ui.button("Browse…").clicked() {
-                        if let Some(x) = App::pick_folder(&s) {
-                            *p = PathBuf::from(x);
-                        }
+                        picker.open(key, &s, ui.ctx());
+                    }
+                    if let Some(x) = picker.take(key) {
+                        *p = PathBuf::from(x);
                     }
                     ui.end_row();
                 };
                 path_row(
                     ui,
+                    "cfg_repo",
                     "Repository",
                     "Where organised files are kept",
                     &mut c.repo,
                 );
                 path_row(
                     ui,
+                    "cfg_source",
                     "Incoming folder",
                     "Default folder for Load and telescope downloads",
                     &mut c.source,
@@ -1932,9 +1947,10 @@ impl App {
                             egui::TextEdit::singleline(&mut self.load.folder).desired_width(380.0),
                         );
                         if ui.button("Browse…").clicked() {
-                            if let Some(p) = Self::pick_folder(&self.load.folder) {
-                                self.load.folder = p;
-                            }
+                            self.picker.open("load", &self.load.folder, ui.ctx());
+                        }
+                        if let Some(p) = self.picker.take("load") {
+                            self.load.folder = p;
                         }
                     });
                     ui.add_space(6.0);
