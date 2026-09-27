@@ -49,6 +49,11 @@ enum Cmd {
         /// Write the full source -> destination plan to this CSV file
         #[arg(long)]
         plan: Option<PathBuf>,
+        /// When a different file already has the destination name: skip,
+        /// overwrite or keep-both (default: the on_conflict setting, "skip").
+        /// Empty or partly copied files are always replaced.
+        #[arg(long, value_parser = parse_conflict)]
+        on_conflict: Option<ingest::OnConflict>,
     },
     /// Catalogue files already in the repository without moving them
     Sync,
@@ -347,6 +352,7 @@ fn run(cli: Cli) -> Result<()> {
             no_move,
             dry_run,
             plan,
+            on_conflict,
         } => {
             let src = source.unwrap_or_else(|| cfg.source.clone());
             let placement = if no_move {
@@ -361,7 +367,11 @@ fn run(cli: Cli) -> Result<()> {
                 &mut conn,
                 &cfg,
                 &src,
-                ingest::IngestOptions { placement, dry_run },
+                ingest::IngestOptions {
+                    placement,
+                    dry_run,
+                    on_conflict: on_conflict.unwrap_or(cfg.on_conflict),
+                },
                 &bar,
             )?;
             bar.finish();
@@ -745,10 +755,21 @@ fn field_value(f: &db::FitsFile, field: &str) -> Option<String> {
     }
 }
 
+fn parse_conflict(s: &str) -> Result<ingest::OnConflict, String> {
+    ingest::OnConflict::parse(s).ok_or_else(|| "expected skip, overwrite or keep-both".into())
+}
+
 fn print_ingest(r: &ingest::IngestReport) {
     println!("{}", r.summary());
     for (p, existing) in r.duplicates.iter().take(10) {
         println!("  duplicate: {} (same as {existing})", p.display());
+    }
+    for (p, existing) in r.conflicts.iter().take(10) {
+        println!(
+            "  skipped: {} (a different file already exists at {}; use --on-conflict overwrite or keep-both)",
+            p.display(),
+            existing.display()
+        );
     }
     print_ingest_errors(r);
 }
@@ -782,6 +803,7 @@ fn config_cmd(cfg: &mut Config, action: Option<&ConfigCmd>) -> Result<()> {
             println!("dwarf_host:            {}", cfg.dwarf_host);
             println!("include_stacked:       {}", cfg.include_stacked);
             println!("ui_scale:              {}", cfg.ui_scale);
+            println!("on_conflict:           {}", cfg.on_conflict.key());
         }
         Some(ConfigCmd::Set { key, value }) => {
             let b = || matches!(value.to_lowercase().as_str(), "1" | "true" | "yes" | "on");
@@ -803,6 +825,9 @@ fn config_cmd(cfg: &mut Config, action: Option<&ConfigCmd>) -> Result<()> {
                 "dwarf_host" => cfg.dwarf_host = value.clone(),
                 "include_stacked" => cfg.include_stacked = b(),
                 "ui_scale" => cfg.ui_scale = value.to_lowercase(),
+                "on_conflict" => {
+                    cfg.on_conflict = parse_conflict(value).map_err(anyhow::Error::msg)?
+                }
                 other => bail!("unknown key '{other}'"),
             }
             cfg.save()?;

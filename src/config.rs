@@ -33,6 +33,8 @@ pub struct Config {
     pub include_stacked: bool,
     /// Interface size: "auto" or a factor relative to the desktop scaling (e.g. "1.5").
     pub ui_scale: String,
+    /// What to do when a different file already has a filed file's name.
+    pub on_conflict: crate::ingest::OnConflict,
     /// Where this config was loaded from / will be saved to.
     pub path: PathBuf,
 }
@@ -54,6 +56,7 @@ impl Default for Config {
             dwarf_host: "192.168.88.1".into(),
             include_stacked: true,
             ui_scale: "auto".into(),
+            on_conflict: Default::default(),
             path: default_config_path(),
         }
     }
@@ -145,6 +148,9 @@ impl Config {
         if let Some(v) = get("ui_scale").filter(|v| !v.is_empty()) {
             cfg.ui_scale = v.to_ascii_lowercase();
         }
+        if let Some(c) = get("on_conflict").and_then(|v| crate::ingest::OnConflict::parse(&v)) {
+            cfg.on_conflict = c;
+        }
         cfg.database = get("database").filter(|v| !v.is_empty()).map(PathBuf::from);
         Ok(cfg)
     }
@@ -168,6 +174,7 @@ impl Config {
                 },
             )
             .set("ui_scale", self.ui_scale.clone())
+            .set("on_conflict", self.on_conflict.key())
             .set("external_viewer", self.external_viewer.clone())
             .set("theme", self.theme.clone())
             .set("min_master_files", self.min_master_files.to_string())

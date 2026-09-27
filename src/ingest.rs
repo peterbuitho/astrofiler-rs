@@ -29,26 +29,77 @@ pub enum Placement {
     InPlace,
 }
 
+/// What happens when a *different* file already exists under the name a file
+/// is being filed as. Empty or partly written leftovers of an interrupted copy
+/// are always replaced, and identical files are always adopted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OnConflict {
+    /// Leave both files alone; the new one is not filed.
+    #[default]
+    Skip,
+    /// Replace the existing file (and its catalogue entry).
+    Overwrite,
+    /// File the new one as `name_001.fits`.
+    KeepBoth,
+}
+
+impl OnConflict {
+    pub const ALL: [Self; 3] = [Self::Skip, Self::Overwrite, Self::KeepBoth];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Skip => "skip",
+            Self::Overwrite => "overwrite",
+            Self::KeepBoth => "keep-both",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|c| c.key().eq_ignore_ascii_case(s.trim()))
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Skip => "Skip the new file",
+            Self::Overwrite => "Overwrite the existing file",
+            Self::KeepBoth => "Keep both (new one gets a _001 suffix)",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IngestOptions {
     pub placement: Placement,
     /// Work out where everything would go without touching files or catalogue.
     pub dry_run: bool,
+    pub on_conflict: OnConflict,
 }
 
 impl IngestOptions {
     pub const MOVE: Self = IngestOptions {
         placement: Placement::Move,
         dry_run: false,
+        on_conflict: OnConflict::Skip,
     };
     pub const COPY: Self = IngestOptions {
         placement: Placement::Copy,
         dry_run: false,
+        on_conflict: OnConflict::Skip,
     };
     pub const IN_PLACE: Self = IngestOptions {
         placement: Placement::InPlace,
         dry_run: false,
+        on_conflict: OnConflict::Skip,
     };
+
+    pub fn with_conflict(self, on_conflict: OnConflict) -> Self {
+        IngestOptions {
+            on_conflict,
+            ..self
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -62,6 +113,13 @@ pub struct IngestReport {
     /// Companion files (stack previews, DWARF shotsInfo.json) placed next to their frames.
     pub sidecars: usize,
     pub duplicates: Vec<(PathBuf, String)>,
+    /// Input -> existing file with the same name but different content, left
+    /// alone because of `OnConflict::Skip`.
+    pub conflicts: Vec<(PathBuf, PathBuf)>,
+    /// Existing files replaced because of `OnConflict::Overwrite`.
+    pub overwritten: usize,
+    /// Empty or partly written files (from an interrupted copy) replaced.
+    pub repaired: usize,
     pub errors: Vec<(PathBuf, String)>,
     pub new_ids: Vec<String>,
     /// Input path -> final (or, in a dry run, planned) path of each filed file.
@@ -89,6 +147,25 @@ impl IngestReport {
         if self.skipped > 0 {
             out.push_str(&format!(", {} skipped", self.skipped));
         }
+        let would = if self.dry_run { "would be " } else { "" };
+        if !self.conflicts.is_empty() {
+            out.push_str(&format!(
+                ", {} {would}skipped because a different file already has that name",
+                self.conflicts.len()
+            ));
+        }
+        if self.overwritten > 0 {
+            out.push_str(&format!(
+                ", {} existing files {would}overwritten",
+                self.overwritten
+            ));
+        }
+        if self.repaired > 0 {
+            out.push_str(&format!(
+                ", {} empty/incomplete files {would}replaced",
+                self.repaired
+            ));
+        }
         out.push_str(&format!(", {} errors", self.errors.len()));
         out
     }
@@ -104,6 +181,9 @@ impl IngestReport {
         }
         for (a, b) in &self.duplicates {
             writeln!(w, "duplicate,{},\"{}\"", q(a), b.replace('"', "\"\""))?;
+        }
+        for (a, b) in &self.conflicts {
+            writeln!(w, "conflict,{},{}", q(a), q(b))?;
         }
         for (a, e) in &self.errors {
             writeln!(w, "error,{},\"{}\"", q(a), e.replace('"', "\"\""))?;
@@ -268,14 +348,43 @@ fn place_sidecars(
             None if folder.is_empty() => name,
             None => format!("{folder}_{name}"),
         };
-        let target = dest_dir.join(file_name);
-        let identical =
-            target.exists() && std::fs::read(&target).ok() == std::fs::read(sidecar).ok();
-        if !opts.dry_run && !identical {
-            let r = if opts.placement == Placement::Move {
-                util::move_file(sidecar, &target)
-            } else {
-                util::copy_file(sidecar, &target).map(|_| ())
+        let mut target = dest_dir.join(file_name);
+        let existing = if !target.exists() {
+            Existing::Free
+        } else if std::fs::read(&target).ok() == std::fs::read(sidecar).ok() {
+            Existing::Identical
+        } else if std::fs::metadata(&target).is_ok_and(|m| m.len() == 0)
+            || is_prefix_of(&target, sidecar).unwrap_or(false)
+        {
+            Existing::Incomplete
+        } else {
+            Existing::Different
+        };
+        let action = match (existing, opts.on_conflict) {
+            (Existing::Free, _) => Action::Place,
+            (Existing::Identical, _) => Action::Adopt,
+            (Existing::Incomplete, _) | (Existing::Different, OnConflict::Overwrite) => {
+                Action::Replace
+            }
+            (Existing::Different, OnConflict::KeepBoth) => Action::KeepBoth,
+            (Existing::Different, OnConflict::Skip) => Action::Skip,
+        };
+        match action {
+            Action::Skip => {
+                report.conflicts.push((sidecar.clone(), target));
+                continue;
+            }
+            Action::Replace if existing == Existing::Incomplete => report.repaired += 1,
+            Action::Replace => report.overwritten += 1,
+            Action::KeepBoth => target = util::unique_path(&target),
+            _ => {}
+        }
+        let moving = opts.placement == Placement::Move;
+        if !opts.dry_run && action != Action::Adopt {
+            let r = match action {
+                Action::Replace => replace_file(sidecar, &target, moving),
+                _ if moving => util::move_file(sidecar, &target),
+                _ => util::copy_file(sidecar, &target).map(|_| ()),
             };
             if let Err(e) = r {
                 report
@@ -283,7 +392,7 @@ fn place_sidecars(
                     .push((sidecar.clone(), format!("placing companion file: {e:#}")));
                 continue;
             }
-        } else if !opts.dry_run && identical && opts.placement == Placement::Move {
+        } else if !opts.dry_run && moving {
             std::fs::remove_file(sidecar).ok();
         }
         report.sidecars += 1;
@@ -557,17 +666,50 @@ fn file_prepared(
                 opts.placement
             };
             let target = dest_dir.join(&new_name);
-            // A previous, interrupted run may already have put this exact
-            // file in place: adopt it instead of making a `_001` copy.
-            let adopt = placement != Placement::InPlace
-                && target != staged.path
-                && target.exists()
-                && util::sha256_file(&target).is_ok_and(|h| h == hash);
+            let existing = if placement == Placement::InPlace || target == staged.path {
+                Existing::Free
+            } else if state.planned.contains(&target) {
+                // Filed earlier in this run: two different frames that map to
+                // the same name are both new data, so always keep both.
+                Existing::Different
+            } else {
+                existing_file(&target, &staged.path, &hash)
+            };
+            let action = match existing {
+                Existing::Free => Action::Place,
+                // A previous, interrupted run already put this exact file in place.
+                Existing::Identical => Action::Adopt,
+                Existing::Incomplete => Action::Replace,
+                Existing::Different if state.planned.contains(&target) => Action::KeepBoth,
+                Existing::Different => match opts.on_conflict {
+                    OnConflict::Skip => Action::Skip,
+                    OnConflict::Overwrite => Action::Replace,
+                    OnConflict::KeepBoth => Action::KeepBoth,
+                },
+            };
+            if action == Action::Skip {
+                log::info!(
+                    "{}: not filed, a different file already exists at {}",
+                    staged.input.display(),
+                    target.display()
+                );
+                report.conflicts.push((staged.input, target));
+                if staged.temp {
+                    std::fs::remove_file(&staged.path).ok();
+                }
+                return Ok(());
+            }
+            if action == Action::Replace {
+                if existing == Existing::Incomplete {
+                    report.repaired += 1;
+                } else {
+                    report.overwritten += 1;
+                }
+            }
             if opts.dry_run {
-                let dest = match placement {
-                    Placement::InPlace => staged.path.clone(),
-                    _ if adopt || target == staged.path => target,
-                    _ => {
+                let dest = match (placement, action) {
+                    (Placement::InPlace, _) => staged.path.clone(),
+                    (_, Action::KeepBoth) => {
                         // Mirror unique_path() against files planned in this run.
                         let stem = Path::new(&new_name)
                             .file_stem()
@@ -580,38 +722,47 @@ fn file_prepared(
                             d = dest_dir.join(format!("{stem}_{k:03}.fits"));
                             k += 1;
                         }
-                        state.planned.insert(d.clone());
                         d
                     }
+                    _ => target,
                 };
+                state.planned.insert(dest.clone());
                 report.registered += 1;
                 report.placed.push((staged.input, dest));
                 return Ok(());
             }
             let final_path = if placement == Placement::InPlace || target == staged.path {
                 staged.path.clone()
-            } else if adopt {
+            } else if action == Action::Adopt {
                 if placement == Placement::Move || staged.temp {
                     std::fs::remove_file(&staged.path).ok();
                 }
                 target
             } else {
-                let dest = util::unique_path(&target);
-                let r = if placement == Placement::Move {
+                let dest = if action == Action::KeepBoth {
+                    util::unique_path(&target)
+                } else {
+                    target
+                };
+                let r = if action == Action::Replace {
+                    replace_file(&staged.path, &dest, placement == Placement::Move)
+                } else if placement == Placement::Move {
                     util::move_file(&staged.path, &dest)
                 } else {
-                    std::fs::create_dir_all(&dest_dir)
-                        .map_err(anyhow::Error::from)
-                        .and_then(|_| {
-                            util::copy_file(&staged.path, &dest)?;
-                            Ok(())
-                        })
+                    util::copy_file(&staged.path, &dest).map(|_| ())
                 };
                 if let Err(e) = r {
                     report
                         .errors
                         .push((staged.input, format!("filing into repository: {e:#}")));
                     return Ok(());
+                }
+                if action == Action::Replace {
+                    // The old file is gone; so is whatever the catalogue knew about it.
+                    conn.execute(
+                        "DELETE FROM fitsFile WHERE fitsFileName=?1",
+                        [util::normalize_path(&dest)],
+                    )?;
                 }
                 if rewrite {
                     if let Err(e) = fits::rewrite_primary_header(&dest, &header) {
@@ -623,12 +774,91 @@ fn file_prepared(
                 }
                 dest
             };
+            state.planned.insert(final_path.clone());
             let record = file_record(&header, &final_path, hash, &staged.input);
             record.insert(conn)?;
             report.new_ids.push(record.id);
             report.placed.push((staged.input, final_path));
             report.registered += 1;
         }
+    }
+    Ok(())
+}
+
+/// What is already at the path a file is about to be filed under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Existing {
+    Free,
+    /// Same content as the file being filed.
+    Identical,
+    /// Empty, or the beginning of the file being filed: left by a copy that
+    /// failed or was interrupted.
+    Incomplete,
+    Different,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    Place,
+    Adopt,
+    Replace,
+    KeepBoth,
+    Skip,
+}
+
+/// `hash` is the content hash the filed file will have (after any header
+/// rewrite); `source` is the file as it is now.
+fn existing_file(target: &Path, source: &Path, hash: &str) -> Existing {
+    let Ok(meta) = std::fs::metadata(target) else {
+        return Existing::Free;
+    };
+    if meta.len() == 0 {
+        return Existing::Incomplete;
+    }
+    let source_len = std::fs::metadata(source).map(|m| m.len()).unwrap_or(0);
+    if meta.len() < source_len && is_prefix_of(target, source).unwrap_or(false) {
+        return Existing::Incomplete;
+    }
+    if util::sha256_file(target).is_ok_and(|h| h == hash) {
+        Existing::Identical
+    } else {
+        Existing::Different
+    }
+}
+
+/// Whether the whole of `short` equals the start of `long`.
+fn is_prefix_of(short: &Path, long: &Path) -> Result<bool> {
+    use std::io::Read;
+    let mut a = std::fs::File::open(short)?;
+    let mut b = std::fs::File::open(long)?;
+    let (mut x, mut y) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+    loop {
+        let n = a.read(&mut x)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        b.read_exact(&mut y[..n])?;
+        if x[..n] != y[..n] {
+            return Ok(false);
+        }
+    }
+}
+
+/// Put `from` at `to`, replacing the file there. The new content is written
+/// next to it first, so the existing file survives a failed copy.
+fn replace_file(from: &Path, to: &Path, moving: bool) -> Result<()> {
+    let mut tmp = to.as_os_str().to_owned();
+    tmp.push(".astrofiler-tmp");
+    let tmp = PathBuf::from(tmp);
+    if moving {
+        util::move_file(from, &tmp)?;
+    } else {
+        util::copy_file(from, &tmp)?;
+    }
+    if std::fs::rename(&tmp, to).is_err() {
+        // Some network filesystems refuse to rename over an existing file.
+        std::fs::remove_file(to)?;
+        std::fs::rename(&tmp, to)?;
     }
     Ok(())
 }
@@ -1018,9 +1248,9 @@ fn file_record(h: &Header, path: &Path, hash: String, original: &Path) -> FitsFi
 pub(crate) mod tests {
     use super::*;
     use crate::fits::{write_image, ImageShape, OutType};
+    use crate::progress::NoProgress;
 
     #[allow(clippy::too_many_arguments)]
-
     pub fn make_frame(
         dir: &Path,
         name: &str,
@@ -1125,6 +1355,197 @@ pub(crate) mod tests {
         assert_eq!(dark.exptime.as_deref(), Some("300.0"));
         assert_eq!(dark.filter, None);
         assert_eq!(dark.image_type.as_deref(), Some("DARK FRAME"));
+    }
+
+    #[test]
+    fn name_conflicts() {
+        let light_rel = "Light/M_31/RedCat_51/ZWO_ASI2600MM/20241001/M_31-RedCat_51-ZWO_ASI2600MM-Ha-20241001210000-300.0s-1x1-t-10.0.fits";
+        let frame = |dir: &Path, name: &str, seed: f32| {
+            std::fs::create_dir_all(dir).unwrap();
+            let p = make_frame(
+                dir,
+                name,
+                "Light Frame",
+                Some("M 31"),
+                "2024-10-01T21:00:00",
+                300.0,
+                Some("Ha"),
+                seed,
+            );
+            std::fs::read(p).unwrap()
+        };
+        // Copies `new` (seed 1) into a repo whose destination already holds
+        // `existing`: None = a catalogued different frame, Some(bytes) = raw bytes.
+        let run = |existing: Option<Vec<u8>>, on_conflict: OnConflict| {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo = tmp.path().join("repo");
+            let light = repo.join(light_rel);
+            let cfg = Config {
+                repo: repo.clone(),
+                ..Default::default()
+            };
+            let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+            let opts = IngestOptions::COPY.with_conflict(on_conflict);
+            match existing {
+                Some(bytes) => {
+                    std::fs::create_dir_all(light.parent().unwrap()).unwrap();
+                    std::fs::write(&light, bytes).unwrap();
+                }
+                None => {
+                    let old = tmp.path().join("old");
+                    frame(&old, "x.fits", 9.0);
+                    let r = ingest_folder(&mut conn, &cfg, &old, opts, &NoProgress).unwrap();
+                    assert_eq!(r.registered, 1);
+                }
+            }
+            let src = tmp.path().join("incoming");
+            let new = frame(&src, "a.fits", 1.0);
+            let r = ingest_folder(&mut conn, &cfg, &src, opts, &NoProgress).unwrap();
+            let names: Vec<String> = db::all_files(&conn, false)
+                .unwrap()
+                .into_iter()
+                .map(|f| f.name)
+                .collect();
+            let kept_both = light.with_file_name(
+                light_rel
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .replace(".fits", "_001.fits"),
+            );
+            let content = std::fs::read(&light).unwrap();
+            (r, new, content, kept_both.exists(), names, tmp)
+        };
+        let other = frame(
+            &tempfile::tempdir().unwrap().path().join("o"),
+            "o.fits",
+            5.0,
+        );
+
+        // Leftovers of a failed copy are replaced whatever the setting.
+        for c in OnConflict::ALL {
+            let (r, new, content, both, names, _t) = run(Some(vec![]), c);
+            assert_eq!(
+                (r.registered, r.repaired, both),
+                (1, 1, false),
+                "{c:?} {r:?}"
+            );
+            assert_eq!(content, new);
+            assert_eq!(names.len(), 1);
+        }
+        let (r, new, content, both, _, _t) = run(Some(other[..4000].to_vec()), OnConflict::Skip);
+        assert_eq!(
+            content[..4000],
+            other[..4000],
+            "prefix of a different file is not ours"
+        );
+        assert_eq!((r.registered, r.conflicts.len(), both), (0, 1, false));
+        let (r, _, content, _, _, _t) = run(Some(new[..4000].to_vec()), OnConflict::Skip);
+        assert_eq!((r.registered, r.repaired), (1, 1));
+        assert_eq!(content, new);
+
+        // A different, uncatalogued file.
+        let (r, _, content, both, names, _t) = run(Some(other.clone()), OnConflict::Skip);
+        assert_eq!((r.registered, r.conflicts.len(), both), (0, 1, false));
+        assert_eq!(content, other, "existing file untouched");
+        assert!(names.is_empty());
+        let (r, new, content, both, names, _t) = run(Some(other.clone()), OnConflict::Overwrite);
+        assert_eq!((r.registered, r.overwritten, both), (1, 1, false));
+        assert_eq!(content, new);
+        assert_eq!(names.len(), 1);
+        let (r, _, content, both, _, _t) = run(Some(other.clone()), OnConflict::KeepBoth);
+        assert_eq!((r.registered, both), (1, true));
+        assert_eq!(content, other);
+
+        // A different, catalogued file: overwriting drops its old catalogue entry.
+        let (r, new, content, _, names, _t) = run(None, OnConflict::Overwrite);
+        assert_eq!((r.registered, r.overwritten), (1, 1));
+        assert_eq!(content, new);
+        assert_eq!(names.len(), 1, "{names:?}");
+        let (r, _, _, both, names, _t) = run(None, OnConflict::Skip);
+        assert_eq!(
+            (r.registered, r.conflicts.len(), both, names.len()),
+            (0, 1, false, 1)
+        );
+
+        // Dry runs report the same decisions without touching anything.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let light = repo.join(light_rel);
+        std::fs::create_dir_all(light.parent().unwrap()).unwrap();
+        std::fs::write(&light, &other).unwrap();
+        let src = tmp.path().join("incoming");
+        frame(&src, "a.fits", 1.0);
+        let cfg = Config {
+            repo,
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        let dry = IngestOptions {
+            dry_run: true,
+            ..IngestOptions::COPY
+        };
+        let r = ingest_folder(&mut conn, &cfg, &src, dry, &NoProgress).unwrap();
+        assert_eq!((r.registered, r.conflicts.len()), (0, 1));
+        let dry = dry.with_conflict(OnConflict::Overwrite);
+        let r = ingest_folder(&mut conn, &cfg, &src, dry, &NoProgress).unwrap();
+        assert_eq!((r.registered, r.overwritten), (1, 1));
+        assert_eq!(r.placed[0].1, light);
+        assert_eq!(std::fs::read(&light).unwrap(), other);
+    }
+
+    #[test]
+    fn companion_conflicts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp
+            .path()
+            .join("DWARF_RAW_TELE_M 31_EXP_300_GAIN_60_2024-10-01-21-00-00-000");
+        std::fs::create_dir_all(&folder).unwrap();
+        make_frame(
+            &folder,
+            "a.fits",
+            "Light Frame",
+            Some("M 31"),
+            "2024-10-01T21:00:00",
+            300.0,
+            Some("Ha"),
+            1.0,
+        );
+        std::fs::write(folder.join("shotsInfo.json"), b"{\"target\":\"M 31\"}").unwrap();
+        let cfg = Config {
+            repo: tmp.path().join("repo"),
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        let r = ingest_folder(&mut conn, &cfg, &folder, IngestOptions::COPY, &NoProgress).unwrap();
+        assert_eq!(r.sidecars, 1, "{r:?}");
+        let json = r
+            .placed
+            .iter()
+            .find(|(i, _)| i.ends_with("shotsInfo.json"))
+            .unwrap()
+            .1
+            .clone();
+        std::fs::write(&json, b"something else").unwrap();
+        let mut again = |c: OnConflict| {
+            ingest_folder(
+                &mut conn,
+                &cfg,
+                &folder,
+                IngestOptions::COPY.with_conflict(c),
+                &NoProgress,
+            )
+            .unwrap()
+        };
+        let r = again(OnConflict::Skip);
+        assert_eq!((r.sidecars, r.conflicts.len()), (0, 1), "{r:?}");
+        assert_eq!(std::fs::read(&json).unwrap(), b"something else");
+        let r = again(OnConflict::Overwrite);
+        assert_eq!((r.sidecars, r.overwritten), (1, 1), "{r:?}");
+        assert_eq!(std::fs::read(&json).unwrap(), b"{\"target\":\"M 31\"}");
+        std::fs::write(&json, b"").unwrap();
+        let r = again(OnConflict::Skip);
+        assert_eq!((r.sidecars, r.repaired), (1, 1), "{r:?}");
     }
 
     #[test]

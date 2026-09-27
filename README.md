@@ -24,6 +24,10 @@ and a command-line tool. No Python, no C libraries to install.
 
   You choose to **move**, **copy** (originals untouched) or **catalogue in place**,
   and a **dry run** shows exactly where every file would go first.
+  If a different file already has the same name in the repository, you choose to
+  **skip** (default), **overwrite** or **keep both** (`_001` suffix). Identical
+  files are never copied twice, and empty or half-copied leftovers of an
+  interrupted copy are always replaced.
 - **FITS and XISF**: `.fits/.fit/.fts`, gzip-compressed FITS, `.zip` archives, and
   PixInsight `.xisf` (zlib/LZ4/Zstd, byte-shuffled), which is converted to FITS on import.
 - **Smart telescopes**: ZWO **Seestar** and **DWARF**, over **Wi-Fi or USB-C**.
@@ -87,6 +91,7 @@ Add `--no-default-features` for a command-line-only build.
 ```sh
 astrofiler load --source /mnt/nas/astro --dry-run --plan plan.csv   # preview a reorganisation
 astrofiler load --source /mnt/nas/astro --copy                      # organised copies, originals untouched
+astrofiler load --source ~/incoming --on-conflict overwrite         # replace different files with the same name
 astrofiler load                                                     # move files from the incoming folder
 astrofiler load --source /mnt/nas/astro --no-move                   # catalogue in place (counts in stats)
 astrofiler sync                                                     # catalogue files already in the repository

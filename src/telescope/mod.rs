@@ -226,7 +226,13 @@ impl Session {
 
         progress.update(0, downloaded.len(), "Importing into repository...");
         let paths: Vec<PathBuf> = downloaded.iter().map(|(_, p)| p.clone()).collect();
-        let ingest = ingest::ingest_files(conn, cfg, paths, ingest::IngestOptions::MOVE, progress)?;
+        let ingest = ingest::ingest_files(
+            conn,
+            cfg,
+            paths,
+            ingest::IngestOptions::MOVE.with_conflict(cfg.on_conflict),
+            progress,
+        )?;
 
         if delete_on_scope {
             let safe: std::collections::HashSet<&Path> = ingest

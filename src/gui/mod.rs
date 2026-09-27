@@ -6,7 +6,7 @@ mod preview;
 use crate::batch::{self, EditOptions, ExportLayout};
 use crate::config::Config;
 use crate::db::{self, FitsFile, Mapping, Master, Session};
-use crate::ingest::{self, IngestOptions, Placement};
+use crate::ingest::{self, IngestOptions, OnConflict, Placement};
 use crate::progress::{JobState, Progress};
 use crate::stats::{self, Stats};
 use crate::telescope::{self, Found, Link, RemoteFile};
@@ -119,6 +119,7 @@ struct LoadDialog {
     folder: String,
     placement: Placement,
     dry_run: bool,
+    on_conflict: OnConflict,
 }
 
 struct ScopeUi {
@@ -222,6 +223,7 @@ impl App {
                 folder: cfg.source.to_string_lossy().into(),
                 placement: Placement::Move,
                 dry_run: false,
+                on_conflict: cfg.on_conflict,
             },
             preview_for: None,
             preview_tex: None,
@@ -1879,6 +1881,15 @@ impl App {
                     "Import the telescopes' own stacked results by default",
                 );
                 ui.end_row();
+                ui.label("Name conflicts");
+                egui::ComboBox::from_id_salt("on_conflict")
+                    .selected_text(c.on_conflict.label())
+                    .show_ui(ui, |ui| {
+                        for v in OnConflict::ALL {
+                            ui.selectable_value(&mut c.on_conflict, v, v.label());
+                        }
+                    });
+                ui.end_row();
             });
         ui.add_space(8.0);
         ui.label(format!("Config file: {}", self.cfg.path.display()));
@@ -1894,6 +1905,7 @@ impl App {
                         egui::Visuals::dark()
                     });
                     self.scope.include_stacked = self.cfg.include_stacked;
+                    self.load.on_conflict = self.cfg.on_conflict;
                     self.status = "Settings saved".into();
                 }
                 Err(e) => self.status = format!("Could not save settings: {e:#}"),
@@ -1941,6 +1953,15 @@ impl App {
                         Placement::InPlace,
                         "Catalogue in place (no renaming or moving)",
                     );
+                    ui.add_space(6.0);
+                    ui.label("If a different file already has the same name in the repository:");
+                    ui.horizontal(|ui| {
+                        for c in OnConflict::ALL {
+                            ui.radio_value(&mut self.load.on_conflict, c, c.label());
+                        }
+                    });
+                    ui.weak("Identical files are never copied twice, and empty or half-copied leftovers are always replaced.");
+                    ui.add_space(6.0);
                     ui.checkbox(
                         &mut self.load.dry_run,
                         "Dry run — only show what would happen (plan is written to the log)",
@@ -1951,6 +1972,7 @@ impl App {
                         let opts = IngestOptions {
                             placement: self.load.placement,
                             dry_run: self.load.dry_run,
+                            on_conflict: self.load.on_conflict,
                         };
                         self.spawn(
                             if opts.dry_run { "Dry run" } else { "Load" },
@@ -1963,6 +1985,13 @@ impl App {
                                 }
                                 for (a, e) in &r.errors {
                                     log::warn!("{}: {e}", a.display());
+                                }
+                                for (a, b) in &r.conflicts {
+                                    log::warn!(
+                                        "{}: skipped, a different file already exists at {}",
+                                        a.display(),
+                                        b.display()
+                                    );
                                 }
                                 Ok(r.summary())
                             },
