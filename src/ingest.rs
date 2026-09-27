@@ -55,7 +55,7 @@ impl IngestOptions {
 pub struct IngestReport {
     pub registered: usize,
     pub masters: usize,
-    /// Files deliberately not imported (e.g. DWARF `failed_*` frames).
+    /// Files a telescope module asked to skip.
     pub skipped: usize,
     /// Files whose content is already in the catalogue (e.g. loaded before).
     pub already_catalogued: usize,
@@ -74,15 +74,18 @@ impl IngestReport {
         } else {
             "registered"
         };
-        format!(
-            "{} {verb}, {} masters, {} already in catalogue, {} duplicate copies, {} rejected frames skipped, {} errors",
+        let mut out = format!(
+            "{} {verb}, {} masters, {} already in catalogue, {} duplicate copies",
             self.registered,
             self.masters,
             self.already_catalogued,
             self.duplicates.len() - self.already_catalogued,
-            self.skipped,
-            self.errors.len()
-        )
+        );
+        if self.skipped > 0 {
+            out.push_str(&format!(", {} skipped", self.skipped));
+        }
+        out.push_str(&format!(", {} errors", self.errors.len()));
+        out
     }
 
     /// Write the input -> destination plan as CSV.

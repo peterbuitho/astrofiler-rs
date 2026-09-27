@@ -133,8 +133,8 @@ folder; override it with the `database` key, `--db` or `$ASTROFILER_DB_PATH`.
 
 Header fixes are applied automatically: the Seestar target and mosaic flag are
 taken from the folder name, and DWARF files (which have no `IMAGETYP`) get their
-frame type, camera (TELE/WIDE) and temperature filled in. DWARF's own rejected
-`failed_*` frames are skipped.
+frame type, camera (TELE/WIDE) and temperature filled in. Frames DWARF marked
+`failed_*` are imported too, so you can decide for yourself whether to use them.
 
 If a telescope connects over USB as a *media device* (MTP) instead of a drive, it
 won't appear as a folder. In that case copy the files off with your OS first, or use Wi-Fi.
@@ -155,7 +155,7 @@ cloud sync, SEP quality metrics, and telescopes other than Seestar and DWARF.
 Improvements and fixes over the original:
 - copy mode, dry runs with a CSV plan, and duplicate checks before anything is moved;
 - DWARF files are recognised even outside the telescope's folder layout, and
-  `failed_*` frames are skipped instead of reported as errors;
+  `failed_*` frames are imported instead of reported as errors;
 - stacked results are kept apart from sub-frames;
 - header mappings are actually applied on import;
 - light sessions with interleaved filters group correctly;

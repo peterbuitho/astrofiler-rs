@@ -81,7 +81,7 @@ impl Telescope for Dwarf {
         {
             let dpath = join(root, &dir.name);
             for f in t.list(&dpath)? {
-                if f.is_dir || !is_fits(&f.name) || f.name.starts_with("failed_") {
+                if f.is_dir || !is_fits(&f.name) {
                     continue;
                 }
                 // stacked-<n>_*.fits is the telescope's own live stack.
@@ -138,12 +138,6 @@ impl Telescope for Dwarf {
         Ok(files)
     }
 
-    /// Frames the telescope itself rejected.
-    fn skip_file(&self, path: &Path) -> bool {
-        path.file_name().is_some_and(|n| n.to_string_lossy().starts_with("failed_"))
-            && path.components().any(|c| matches!(c, Component::Normal(s) if s.to_string_lossy().starts_with("DWARF_RAW")))
-    }
-
     fn claims(&self, h: &Header, path: &Path) -> bool {
         let telescop = h.get_str("TELESCOP").unwrap_or_default().to_uppercase();
         let in_raw = path.components().any(
@@ -161,9 +155,6 @@ impl Telescope for Dwarf {
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        if file.starts_with("failed_") {
-            bail!("ignoring failed DWARF image");
-        }
         let stem = Path::new(&file)
             .file_stem()
             .unwrap_or_default()
@@ -433,10 +424,12 @@ mod tests {
         let p = Path::new("/x/DWARF_RAW_TELE_M 52_EXP_15_GAIN_60_2026-09-27-03-55-25-891/stacked-16_M 52_15s60_Astro_20260927-035629162.fits");
         Dwarf.normalize_header(&mut h, p).unwrap();
         assert_eq!(h.get_f64("EXPTIME"), Some(2895.0));
-        assert!(Dwarf.skip_file(Path::new(
-            "/x/DWARF_RAW_TELE_M 52_EXP_15_GAIN_60_x/failed_1.fits"
-        )));
-        assert!(!Dwarf.skip_file(Path::new("/x/other/failed_1.fits")));
+        // Frames the telescope marked failed_ are imported like any other.
+        let failed = Path::new("/x/DWARF_RAW_TELE_M 52_EXP_15_GAIN_60_x/failed_1.fits");
+        assert!(!Dwarf.skip_file(failed));
+        let mut h = dwarf3_header();
+        Dwarf.normalize_header(&mut h, failed).unwrap();
+        assert_eq!(h.get_str("IMAGETYP").as_deref(), Some("LIGHT"));
     }
 
     #[test]
