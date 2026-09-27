@@ -238,10 +238,40 @@ pub fn human_size(bytes: u64) -> String {
     format!("{v:.1} {}", UNITS[i])
 }
 
-/// Per-session info files kept alongside the frames (DWARF `shotsInfo.json`).
+/// Non-FITS files kept alongside the frames they belong to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidecarKind {
+    /// DWARF `shotsInfo.json` session summary.
+    SessionInfo,
+    /// JPG/PNG render of a stacked result (Seestar `Stacked_*.jpg`, DWARF
+    /// `stacked.jpg` / `stacked-*.png` / AstroWizard output).
+    StackPreview,
+}
+
+/// Stacked-result previews worth keeping; thumbnails (`*_thn.jpg`,
+/// `*thumbnail*`) are not.
+pub fn is_stack_preview_name(name: &str) -> bool {
+    let n = name.to_lowercase();
+    let image = [".jpg", ".jpeg", ".png"].iter().any(|e| n.ends_with(e));
+    image
+        && !n.contains("thumbnail")
+        && !n.contains("_thn.")
+        && (n.starts_with("stacked") || n.contains("astrowizard"))
+}
+
+pub fn sidecar_kind(path: &Path) -> Option<SidecarKind> {
+    let name = path.file_name()?.to_string_lossy();
+    if name.eq_ignore_ascii_case("shotsInfo.json") {
+        Some(SidecarKind::SessionInfo)
+    } else if is_stack_preview_name(&name) {
+        Some(SidecarKind::StackPreview)
+    } else {
+        None
+    }
+}
+
 pub fn is_sidecar(path: &Path) -> bool {
-    path.file_name()
-        .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("shotsInfo.json"))
+    sidecar_kind(path).is_some()
 }
 
 /// File extensions the ingest pipeline understands.
@@ -312,6 +342,28 @@ mod tests {
             !dir.path().join("c").exists(),
             "no partial file left behind"
         );
+    }
+
+    #[test]
+    fn stack_previews() {
+        for keep in [
+            "Stacked_47_M 39_10.0s_IRCUT_20260927-033001.jpg",
+            "stacked.jpg",
+            "stacked-16_M 39_15s60_Astro_20260927-014732395.png",
+            "LDN 935_30s60_Astro_20260808-AstroWizard.png",
+        ] {
+            assert!(is_stack_preview_name(keep), "{keep}");
+        }
+        for skip in [
+            "Stacked_47_M 39_10.0s_IRCUT_20260927-033001_thn.jpg",
+            "stacked_thumbnail.jpg",
+            "img_reference.png",
+            "img_stacked_counter.png",
+            "Light_1.jpg",
+            "stacked.fits",
+        ] {
+            assert!(!is_stack_preview_name(skip), "{skip}");
+        }
     }
 
     #[test]

@@ -27,8 +27,9 @@ and a command-line tool. No Python, no C libraries to install.
 - **FITS and XISF**: `.fits/.fit/.fts`, gzip-compressed FITS, `.zip` archives, and
   PixInsight `.xisf` (zlib/LZ4/Zstd, byte-shuffled), which is converted to FITS on import.
 - **Smart telescopes**: ZWO **Seestar** and **DWARF**, over **Wi-Fi or USB-C**.
-  Only FITS files are transferred; the JPG/PNG previews, thumbnails and JSON
-  sidecars the telescopes create for their app album are left behind. Files can
+  FITS files are transferred together with the telescopes' stacked-result
+  previews (Seestar `Stacked_*.jpg`, DWARF `stacked.jpg` / `stacked-*.png`) and
+  DWARF's `shotsInfo.json`; per-frame previews and thumbnails are left behind. Files can
   optionally be deleted from the telescope, but only after they are safely catalogued.
 - **Catalogue**: a SQLite database that uses the same schema as the original
   AstroFiler, so an existing `astrofiler.db` can be opened directly.
@@ -42,7 +43,8 @@ and a command-line tool. No Python, no C libraries to install.
 - **Duplicates**: SHA-256 based detection and removal.
 - **Statistics**: integration time per object, filter, telescope and camera.
 - **Header mappings**: normalise inconsistent header values on import.
-- **Preview clean-up**: delete leftover telescope JPG/PNG previews from old backups.
+- **Preview clean-up**: delete leftover telescope JPG/PNG previews and thumbnails
+  from old backups (stacked-result previews are kept).
 
 ### Why Rust
 
@@ -128,14 +130,16 @@ folder; override it with the `database` key, `--db` or `$ASTROFILER_DB_PATH`.
 
 | Telescope | Wi-Fi | USB-C | Files imported |
 |-----------|-------|-------|----------------|
-| ZWO Seestar | SMB share `EMMC Images` (guest) | drive with `MyWorks/` | `<target>_sub/*.fit`, mosaics, optional `Stacked_*.fit` |
-| DWARF | FTP (`192.168.88.1` in hotspot mode) | drive with `DWARF_RAW_*` (optionally under `Astronomy/`) | `DWARF_RAW_*/*.fits`, optional `stacked-*.fits`, `CALI_FRAME`, `DWARF_DARK` |
+| ZWO Seestar | SMB share `EMMC Images` (guest) | drive with `MyWorks/` | `<target>_sub/*.fit`, mosaics, optional `Stacked_*.fit` + `.jpg` |
+| DWARF | FTP (`192.168.88.1` in hotspot mode) | drive with `DWARF_RAW_*` (optionally under `Astronomy/`) | `DWARF_RAW_*/*.fits`, `shotsInfo.json`, optional `stacked-*.fits` + `stacked.jpg` / `stacked-*.png`, `CALI_FRAME`, `DWARF_DARK` |
 
 Header fixes are applied automatically: the Seestar target and mosaic flag are
 taken from the folder name, and DWARF files (which have no `IMAGETYP`) get their
 frame type, camera (TELE/WIDE) and temperature filled in. DWARF's `shotsInfo.json` session summary is
 kept too: it is filed next to that session's frames as
-`<original folder name>_shotsInfo.json`. Frames DWARF marked
+`<original folder name>_shotsInfo.json`. Stacked-result previews are filed next
+to their stacked FITS, taking its new name when they share one (Seestar
+`Stacked_*.jpg`, DWARF `stacked-*.png`), otherwise prefixed with the folder name. Frames DWARF marked
 `failed_*` are imported too, so you can decide for yourself whether to use them.
 
 If a telescope connects over USB as a *media device* (MTP) instead of a drive, it

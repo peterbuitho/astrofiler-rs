@@ -82,17 +82,22 @@ impl Telescope for Dwarf {
             let dpath = join(root, &dir.name);
             for f in t.list(&dpath)? {
                 // shotsInfo.json: the session summary (target, exposure, frames, temperatures).
-                let info = crate::util::is_sidecar(std::path::Path::new(&f.name));
-                if f.is_dir || !(is_fits(&f.name) || info) {
+                let sidecar = crate::util::sidecar_kind(std::path::Path::new(&f.name));
+                let info = sidecar == Some(crate::util::SidecarKind::SessionInfo);
+                let preview = sidecar == Some(crate::util::SidecarKind::StackPreview);
+                if f.is_dir || !(is_fits(&f.name) || info || preview) {
                     continue;
                 }
-                // stacked-<n>_*.fits is the telescope's own live stack.
-                let stacked = f.name.to_lowercase().starts_with("stacked");
+                // stacked-<n>_*.fits is the telescope's own live stack, with
+                // stacked.jpg / stacked-<n>_*.png renders of it.
+                let stacked = preview || f.name.to_lowercase().starts_with("stacked");
                 if stacked && !opts.include_stacked {
                     continue;
                 }
                 let kind = if info {
                     "session info"
+                } else if preview {
+                    "stacked preview"
                 } else if stacked {
                     "stacked"
                 } else {

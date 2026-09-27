@@ -59,7 +59,7 @@ pub struct IngestReport {
     pub skipped: usize,
     /// Files whose content is already in the catalogue (e.g. loaded before).
     pub already_catalogued: usize,
-    /// Session info files (e.g. DWARF shotsInfo.json) placed next to their frames.
+    /// Companion files (stack previews, DWARF shotsInfo.json) placed next to their frames.
     pub sidecars: usize,
     pub duplicates: Vec<(PathBuf, String)>,
     pub errors: Vec<(PathBuf, String)>,
@@ -84,7 +84,7 @@ impl IngestReport {
             self.duplicates.len() - self.already_catalogued,
         );
         if self.sidecars > 0 {
-            out.push_str(&format!(", {} session info files", self.sidecars));
+            out.push_str(&format!(", {} previews/session info files", self.sidecars));
         }
         if self.skipped > 0 {
             out.push_str(&format!(", {} skipped", self.skipped));
@@ -162,9 +162,12 @@ pub fn ingest_folder(
     ingest_files(conn, cfg, files, opts, progress)
 }
 
-/// Put session info files (DWARF `shotsInfo.json`) next to the frames that
-/// came from the same folder, named after that folder so sessions filed into
-/// the same directory don't collide. Frames filed in an earlier run are found
+/// Place companion files next to the frames that came from the same folder:
+/// session info (DWARF `shotsInfo.json`) beside the light frames, stack
+/// previews (Seestar/DWARF stacked JPG/PNG) beside the stacked FITS. A preview
+/// with the same name as a stacked FITS takes over that file's new name;
+/// others are prefixed with their original folder name so sessions filed into
+/// one directory don't collide. Frames filed in an earlier run are found
 /// through their recorded original path.
 fn place_sidecars(
     conn: &Connection,
@@ -173,38 +176,43 @@ fn place_sidecars(
     report: &mut IngestReport,
 ) -> Result<()> {
     if opts.placement == Placement::InPlace {
-        return Ok(()); // frames stay where they are, and so does their info file
+        return Ok(()); // frames stay where they are, and so do their companions
     }
     for sidecar in sidecars {
-        let Some(src_dir) = sidecar.parent() else {
+        let (Some(kind), Some(src_dir)) = (util::sidecar_kind(sidecar), sidecar.parent()) else {
             continue;
         };
-        // Most common destination of this folder's light frames.
-        let mut counts: std::collections::HashMap<PathBuf, usize> =
-            std::collections::HashMap::new();
-        for (input, dest) in &report.placed {
-            if input.parent() == Some(src_dir)
-                && !dest.components().any(|c| c.as_os_str() == "Stacked")
-            {
-                if let Some(d) = dest.parent() {
-                    *counts.entry(d.to_path_buf()).or_default() += 1;
-                }
-            }
-        }
-        if counts.is_empty() {
+        let want_stacked = kind == util::SidecarKind::StackPreview;
+        let is_stacked_dest = |d: &Path| d.components().any(|c| c.as_os_str() == "Stacked");
+        // (original path, filed path) of this folder's matching frames.
+        let mut frames: Vec<(PathBuf, PathBuf)> = report
+            .placed
+            .iter()
+            .filter(|(i, d)| {
+                i.parent() == Some(src_dir)
+                    && util::is_fits_name(d)
+                    && is_stacked_dest(d) == want_stacked
+            })
+            .cloned()
+            .collect();
+        if frames.is_empty() {
             let prefix = format!("{}/", util::normalize_path(src_dir));
             let rows = db::files_where(
                 conn,
-                "substr(fitsFileOriginalFile, 1, length(?1)) = ?1 AND COALESCE(fitsFileStacked,0)=0",
-                &[&prefix],
+                "substr(fitsFileOriginalFile, 1, length(?1)) = ?1 AND COALESCE(fitsFileStacked,0) = ?2",
+                &[&prefix, &(want_stacked as i64)],
             )?;
-            for f in rows {
-                if let Some(d) = Path::new(&f.name).parent() {
-                    *counts.entry(d.to_path_buf()).or_default() += 1;
-                }
-            }
+            frames = rows
+                .into_iter()
+                .map(|f| {
+                    (
+                        PathBuf::from(f.original.unwrap_or_default()),
+                        PathBuf::from(f.name),
+                    )
+                })
+                .collect();
         }
-        if counts.is_empty() {
+        if frames.is_empty() && kind == util::SidecarKind::SessionInfo {
             // Frames catalogued without an original path (older runs, or a
             // database from the Python app): match the session by target
             // and start time instead.
@@ -215,34 +223,52 @@ fn place_sidecars(
                      AND COALESCE(fitsFileStacked,0)=0 AND COALESCE(fitsFileSoftDelete,0)=0",
                     &[&target, &start, &end],
                 )?;
-                for f in rows {
-                    if let Some(d) = Path::new(&f.name).parent() {
-                        *counts.entry(d.to_path_buf()).or_default() += 1;
-                    }
-                }
+                frames = rows
+                    .into_iter()
+                    .map(|f| (PathBuf::new(), PathBuf::from(f.name)))
+                    .collect();
+            }
+        }
+        // Most common destination directory.
+        let mut counts: std::collections::HashMap<PathBuf, usize> =
+            std::collections::HashMap::new();
+        for (_, d) in &frames {
+            if let Some(p) = d.parent() {
+                *counts.entry(p.to_path_buf()).or_default() += 1;
             }
         }
         let Some((dest_dir, _)) = counts.into_iter().max_by_key(|(_, n)| *n) else {
             log::info!(
-                "{}: no frames from this folder were filed; left in place",
+                "{}: no matching frames from this folder were filed; left in place",
                 sidecar.display()
             );
             continue;
         };
-        let folder = src_dir
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
         let name = sidecar
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        let target = dest_dir.join(if folder.is_empty() {
-            name
-        } else {
-            format!("{folder}_{name}")
-        });
+        let folder = src_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let ext = sidecar
+            .extension()
+            .map(|e| e.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let twin = frames
+            .iter()
+            .find(|(i, _)| i.file_stem().is_some() && i.file_stem() == sidecar.file_stem());
+        let file_name = match twin {
+            Some((_, filed)) => format!(
+                "{}.{ext}",
+                filed.file_stem().unwrap_or_default().to_string_lossy()
+            ),
+            None if folder.is_empty() => name,
+            None => format!("{folder}_{name}"),
+        };
+        let target = dest_dir.join(file_name);
         let identical =
             target.exists() && std::fs::read(&target).ok() == std::fs::read(sidecar).ok();
         if !opts.dry_run && !identical {
@@ -254,7 +280,7 @@ fn place_sidecars(
             if let Err(e) = r {
                 report
                     .errors
-                    .push((sidecar.clone(), format!("placing session info: {e:#}")));
+                    .push((sidecar.clone(), format!("placing companion file: {e:#}")));
                 continue;
             }
         } else if !opts.dry_run && identical && opts.placement == Placement::Move {

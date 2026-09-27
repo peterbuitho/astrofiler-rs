@@ -61,16 +61,27 @@ impl Telescope for Seestar {
             }
             let folder_path = join(base, &dir.name);
             for f in t.list(&folder_path)? {
-                if f.is_dir || !is_fits(&f.name) || (!subs && !f.name.starts_with("Stacked_")) {
+                // The target folder holds Stacked_*.fit plus its JPG render
+                // (kept) and a *_thn.jpg thumbnail (skipped).
+                let preview = !subs && crate::util::is_stack_preview_name(&f.name);
+                let stacked_fits = !subs && is_fits(&f.name) && f.name.starts_with("Stacked_");
+                if f.is_dir || !(preview || stacked_fits || (subs && is_fits(&f.name))) {
                     continue;
                 }
+                let kind = if preview {
+                    "stacked preview"
+                } else if subs {
+                    "light"
+                } else {
+                    "stacked"
+                };
                 files.push(RemoteFile {
                     path: join(&folder_path, &f.name),
                     name: f.name,
                     size: f.size,
                     folder: dir.name.clone(),
                     local_dir: dir.name.clone(),
-                    kind: if subs { "light" } else { "stacked" },
+                    kind,
                 });
             }
         }

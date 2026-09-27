@@ -370,6 +370,7 @@ fn is_preview(p: &Path) -> bool {
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
     matches!(ext.as_str(), "jpg" | "jpeg" | "png")
+        && !crate::util::is_stack_preview_name(&p.file_name().unwrap_or_default().to_string_lossy())
 }
 
 /// Find (and unless `dry_run`, delete) JPG/PNG preview images under `root`,
@@ -544,11 +545,12 @@ mod tests {
             std::fs::write(d.join(f), b"x").unwrap();
         }
         let (found, _) = clean_previews(tmp.path(), true).unwrap();
-        assert_eq!(found.len(), 3);
-        assert!(d.join("stacked.jpg").exists(), "dry run must not delete");
+        assert_eq!(found.len(), 2, "stacked previews are kept");
+        assert!(d.join("img.png").exists(), "dry run must not delete");
         clean_previews(tmp.path(), false).unwrap();
         assert!(d.join("a.fits").exists() && d.join("shotsInfo.json").exists());
-        assert!(!d.join("stacked.jpg").exists() && !d.join("Thumbnail").exists());
+        assert!(d.join("stacked.jpg").exists(), "stacked preview kept");
+        assert!(!d.join("img.png").exists() && !d.join("Thumbnail").exists());
     }
 
     #[test]

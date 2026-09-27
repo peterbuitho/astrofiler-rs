@@ -481,7 +481,11 @@ mod tests {
         let mut conn = crate::db::open(&tmp.path().join("t.db")).unwrap();
         let mut s = connect(&cfg, find("seestar").unwrap(), &Link::Usb(usb.clone())).unwrap();
         let files = s.scan(true).unwrap();
-        assert_eq!(files.len(), 2, "JPG previews must be skipped");
+        // 2 subs + the stacked JPG; not Light_1.jpg or the _thn.jpg thumbnail.
+        assert_eq!(files.len(), 3, "{files:?}");
+        assert!(files
+            .iter()
+            .any(|f| f.kind == "stacked preview" && !f.name.contains("_thn")));
         let r = s
             .import(&mut conn, &cfg, &files, &cfg.source, true, &NoProgress)
             .unwrap();
@@ -535,8 +539,9 @@ mod tests {
         assert!(dwarf.detect_usb(&usb));
         let mut s = connect(&Config::default(), dwarf, &Link::Usb(usb)).unwrap();
         let files = s.scan(true).unwrap();
-        // 0001.fits, failed_0002.fits, shotsInfo.json and the CALI_FRAME master; no previews.
-        assert_eq!(files.len(), 4);
+        // 0001.fits, failed_0002.fits, shotsInfo.json, stacked.jpg and the
+        // CALI_FRAME master; not the thumbnail or img_reference.png.
+        assert_eq!(files.len(), 5, "{files:?}");
         assert!(files.iter().any(|f| f.kind == "session info"));
         let master = files.iter().find(|f| f.kind == "master").unwrap();
         assert_eq!(master.local_dir, "CALI_FRAME/dark/cam_0");
