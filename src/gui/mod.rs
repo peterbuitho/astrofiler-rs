@@ -209,9 +209,7 @@ pub struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext, cfg: Config) -> Self {
-        // Labels must not grab clicks, or table rows can't be selected.
-        cc.egui_ctx
-            .style_mut(|s| s.interaction.selectable_labels = false);
+        cc.egui_ctx.style_mut(interaction_style);
         cc.egui_ctx.set_visuals(if cfg.theme == "light" {
             egui::Visuals::light()
         } else {
@@ -790,6 +788,13 @@ impl eframe::App for App {
     }
 }
 
+fn interaction_style(s: &mut egui::Style) {
+    // Labels must not grab clicks, or table rows can't be selected.
+    s.interaction.selectable_labels = false;
+    // Panel dividers are easier to catch (the default is 5 px either side).
+    s.interaction.resize_grab_radius_side = 8.0;
+}
+
 fn opt(s: &Option<String>) -> &str {
     s.as_deref().unwrap_or("")
 }
@@ -895,8 +900,12 @@ impl App {
             .resizable(true)
             .default_width((full_width * 0.3).clamp(240.0, 420.0))
             .min_width(200.0)
-            .max_width(full_width * 0.45)
+            .max_width(full_width * 0.7)
             .show_inside(ui, |ui| {
+                // egui remembers the panel width from its contents, so fill
+                // the width the divider was dragged to; otherwise a narrow
+                // (portrait) preview or an empty panel snaps it back.
+                ui.set_min_width(ui.available_width());
                 ui.heading("Preview");
                 if let Some(id) = self.preview_for.clone() {
                     if let Some(f) = self.files.iter().find(|f| f.id == id) {
@@ -935,13 +944,20 @@ impl App {
         let n = self.filtered.len();
         // The scroll area clips the table to the space left of the preview
         // and scrolls sideways when the columns don't fit.
+        // Dragging must not scroll: a drag that just misses the preview
+        // divider would move the table instead of the divider.
         egui::ScrollArea::horizontal()
             .id_salt("images_hscroll")
             .auto_shrink([false, false])
+            .drag_to_scroll(false)
+            // Keep the table's scrollbar clear of the preview divider, or a
+            // drag aimed at the divider grabs the scrollbar.
+            .max_width(ui.available_width() - 14.0)
             .show(ui, |ui| {
                 TableBuilder::new(ui)
                     .striped(true)
                     .resizable(true)
+                    .drag_to_scroll(false)
                     .sense(egui::Sense::click())
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                     .column(Column::initial(150.0).clip(true).at_least(60.0))
@@ -952,7 +968,13 @@ impl App {
                     .column(Column::initial(40.0).clip(true))
                     .column(Column::initial(50.0).clip(true))
                     .column(Column::initial(130.0).clip(true))
-                    .column(Column::remainder().clip(true).at_least(100.0))
+                    // No handle of its own next to the preview divider.
+                    .column(
+                        Column::remainder()
+                            .clip(true)
+                            .at_least(100.0)
+                            .resizable(false),
+                    )
                     .header(22.0, |mut h| {
                         let mut head =
                             |h: &mut egui_extras::TableRow, label: &str, key: Option<SortKey>| {
@@ -2192,7 +2214,7 @@ impl App {
                 Ok(()) => {
                     self.cfg = self.cfg_edit.clone();
                     self.check_layout(ctx);
-                    ctx.style_mut(|s| s.interaction.selectable_labels = false);
+                    ctx.style_mut(interaction_style);
                     ctx.set_visuals(if self.cfg.theme == "light" {
                         egui::Visuals::light()
                     } else {
