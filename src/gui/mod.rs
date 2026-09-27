@@ -238,7 +238,7 @@ impl App {
             load: LoadDialog {
                 open: false,
                 folder: cfg.source.to_string_lossy().into(),
-                placement: Placement::Move,
+                placement: Placement::Copy,
                 dry_run: false,
                 on_conflict: cfg.on_conflict,
             },
@@ -259,7 +259,7 @@ impl App {
             export_layout_by_object: true,
             scope: ScopeUi {
                 telescope: 0,
-                usb: false,
+                usb: true,
                 host: telescope::all()[0].default_host(&cfg),
                 usb_path: String::new(),
                 found: Arc::new(Mutex::new(vec![])),
@@ -280,6 +280,13 @@ impl App {
         let usb = telescope::find_usb();
         if let Some(f) = usb.first() {
             app.status = format!("Found {} — see the Telescopes tab", f.label);
+            if let Link::Usb(p) = &f.link {
+                app.scope.telescope = telescope::all()
+                    .iter()
+                    .position(|t| t.id() == f.telescope.id())
+                    .unwrap_or(0);
+                app.scope.usb_path = p.to_string_lossy().into();
+            }
         }
         *app.scope.found.lock().unwrap() = usb;
         app
@@ -2102,13 +2109,13 @@ impl App {
                     ui.add_space(6.0);
                     ui.radio_value(
                         &mut self.load.placement,
-                        Placement::Move,
-                        "Move into the repository (rename & organise)",
+                        Placement::Copy,
+                        "Copy into the repository, keep originals untouched",
                     );
                     ui.radio_value(
                         &mut self.load.placement,
-                        Placement::Copy,
-                        "Copy into the repository, keep originals untouched",
+                        Placement::Move,
+                        "Move into the repository (rename & organise)",
                     );
                     ui.radio_value(
                         &mut self.load.placement,
