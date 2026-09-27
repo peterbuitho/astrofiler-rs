@@ -47,6 +47,14 @@ pub fn run(cfg: Config) -> Result<()> {
     .map_err(|e| anyhow::anyhow!("GUI error: {e}"))
 }
 
+/// What a double-click or the right-click menu does with an image row.
+#[derive(Clone, Copy)]
+enum RowAction {
+    ShowFolder,
+    OpenViewer,
+    CopyPath,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Images,
@@ -903,8 +911,8 @@ impl App {
                                 }
                             }
                             if ui.button("Show folder").clicked() {
-                                if let Some(dir) = Path::new(&f.name).parent() {
-                                    let _ = util::open_external("", dir);
+                                if let Err(e) = util::show_in_folder(Path::new(&f.name)) {
+                                    self.status = format!("Could not open folder: {e:#}");
                                 }
                             }
                         });
@@ -922,7 +930,7 @@ impl App {
             });
 
         let mut clicked: Option<usize> = None;
-        let mut double: Option<usize> = None;
+        let mut row_action: Option<(usize, RowAction)> = None;
         let mut sort_click: Option<SortKey> = None;
         let n = self.filtered.len();
         // The scroll area clips the table to the space left of the preview
@@ -1021,9 +1029,26 @@ impl App {
                             if resp.clicked() {
                                 clicked = Some(i);
                             }
-                            if resp.double_clicked() {
-                                double = Some(i);
+                            // Right-clicking an unselected row selects it, as
+                            // in a file manager.
+                            if resp.secondary_clicked() && !self.selected.contains(&f.id) {
+                                clicked = Some(i);
                             }
+                            if resp.double_clicked() {
+                                row_action = Some((i, RowAction::ShowFolder));
+                            }
+                            resp.context_menu(|ui| {
+                                for (action, label) in [
+                                    (RowAction::ShowFolder, "🗁 Open containing folder"),
+                                    (RowAction::OpenViewer, "🖼 Open in viewer"),
+                                    (RowAction::CopyPath, "📋 Copy path"),
+                                ] {
+                                    if ui.button(label).clicked() {
+                                        row_action = Some((i, action));
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
                         });
                     });
             });
@@ -1058,10 +1083,19 @@ impl App {
             let f = self.files[self.filtered[i]].clone();
             self.request_preview(&f);
         }
-        if let Some(i) = double {
+        if let Some((i, action)) = row_action {
             let path = PathBuf::from(&self.files[self.filtered[i]].name);
-            if let Err(e) = util::open_external(&self.cfg.external_viewer, &path) {
-                self.status = format!("Could not open viewer: {e}");
+            let r = match action {
+                RowAction::ShowFolder => util::show_in_folder(&path),
+                RowAction::OpenViewer => util::open_external(&self.cfg.external_viewer, &path),
+                RowAction::CopyPath => {
+                    ui.ctx().copy_text(path.to_string_lossy().into_owned());
+                    self.status = format!("Copied {}", path.display());
+                    Ok(())
+                }
+            };
+            if let Err(e) = r {
+                self.status = format!("Could not open {}: {e:#}", path.display());
             }
         }
     }

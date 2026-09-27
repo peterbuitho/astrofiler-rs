@@ -317,8 +317,77 @@ pub fn open_external(viewer: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Open the folder containing `path` in the file manager, with the file
+/// highlighted where the file manager supports it.
+pub fn show_in_folder(path: &Path) -> Result<()> {
+    use std::process::Command;
+    let dir = path.parent().unwrap_or(path).to_path_buf();
+    if !path.exists() {
+        anyhow::bail!("{} no longer exists", path.display());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut arg = std::ffi::OsString::from("/select,");
+        arg.push(path);
+        Command::new("explorer").arg(arg).spawn()?;
+    }
+    #[cfg(target_os = "macos")]
+    Command::new("open").arg("-R").arg(path).spawn()?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // The freedesktop file-manager interface (Nautilus, Dolphin, Nemo…)
+        // selects the file; fall back to just opening the folder.
+        let uri = file_uri(path);
+        std::thread::spawn(move || {
+            let selected = Command::new("dbus-send")
+                .args([
+                    "--session",
+                    "--print-reply",
+                    "--dest=org.freedesktop.FileManager1",
+                    "--type=method_call",
+                    "/org/freedesktop/FileManager1",
+                    "org.freedesktop.FileManager1.ShowItems",
+                ])
+                .arg(format!("array:string:{uri}"))
+                .arg("string:")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            if !selected {
+                let _ = Command::new("xdg-open").arg(&dir).spawn();
+            }
+        });
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    let _ = dir;
+    Ok(())
+}
+
+/// `file://` URI for an absolute path, percent-encoding anything but
+/// unreserved characters and slashes.
+pub fn file_uri(path: &Path) -> String {
+    let mut out = String::from("file://");
+    for b in path.to_string_lossy().bytes() {
+        if b.is_ascii_alphanumeric() || b"/-_.~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn file_uris() {
+        assert_eq!(
+            super::file_uri(std::path::Path::new("/mnt/nas/M 76/Stacked_2,x.fit")),
+            "file:///mnt/nas/M%2076/Stacked_2%2Cx.fit"
+        );
+    }
+
     use super::*;
 
     #[test]
