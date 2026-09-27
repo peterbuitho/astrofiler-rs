@@ -409,10 +409,13 @@ pub fn is_gzip(path: &Path) -> bool {
 /// touches only the first few 2880-byte blocks of each file.
 pub fn read_primary_header(path: &Path) -> Result<Header> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut reader: Box<dyn Read> = if is_gzip(path) {
-        Box::new(GzDecoder::new(BufReader::new(file)))
+    // Sniff gzip from the same handle: every extra open is a round trip to a NAS.
+    let mut buffered = BufReader::with_capacity(BLOCK * 4, file);
+    let gzip = std::io::BufRead::fill_buf(&mut buffered)?.starts_with(&[0x1f, 0x8b]);
+    let mut reader: Box<dyn Read> = if gzip {
+        Box::new(GzDecoder::new(buffered))
     } else {
-        Box::new(BufReader::with_capacity(BLOCK * 4, file))
+        Box::new(buffered)
     };
     let (mut header, _) = read_header(&mut reader)?.ok_or_else(|| anyhow!("empty FITS file"))?;
     // Tile-compressed files keep their real metadata in the first extension.
@@ -470,13 +473,30 @@ impl Seek for Source {
 impl FitsFile {
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-        let mut source = if is_gzip(path) {
+        let mut buffered = BufReader::with_capacity(1 << 20, file);
+        let source = if std::io::BufRead::fill_buf(&mut buffered)?.starts_with(&[0x1f, 0x8b]) {
             let mut buf = Vec::new();
-            GzDecoder::new(BufReader::new(file)).read_to_end(&mut buf)?;
+            GzDecoder::new(buffered).read_to_end(&mut buf)?;
             Source::Mem(Cursor::new(buf))
         } else {
-            Source::File(BufReader::with_capacity(1 << 20, file))
+            Source::File(buffered)
         };
+        Self::parse(source, path)
+    }
+
+    /// A whole file already in memory (gzip or plain).
+    pub fn from_bytes(bytes: Vec<u8>, path: &Path) -> Result<Self> {
+        let bytes = if bytes.starts_with(&[0x1f, 0x8b]) {
+            let mut buf = Vec::new();
+            GzDecoder::new(&bytes[..]).read_to_end(&mut buf)?;
+            buf
+        } else {
+            bytes
+        };
+        Self::parse(Source::Mem(Cursor::new(bytes)), path)
+    }
+
+    fn parse(mut source: Source, path: &Path) -> Result<Self> {
         let mut hdus = Vec::new();
         let mut pos = 0u64;
         loop {
@@ -623,8 +643,12 @@ pub struct Image {
     pub data: Vec<f32>,
 }
 
+/// Read the first image of a file. The whole file is read up front (in
+/// parallel parts when big), which is much faster from a NAS.
 pub fn read_image(path: &Path) -> Result<Image> {
-    FitsFile::open(path)?.read_image()
+    let bytes =
+        crate::util::read_file(path).with_context(|| format!("opening {}", path.display()))?;
+    FitsFile::from_bytes(bytes, path)?.read_image()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

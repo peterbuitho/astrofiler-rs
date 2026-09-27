@@ -3,6 +3,126 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
+/// A folder in GNOME's network view (`/run/user/1000/gvfs/smb-share:server=
+/// nas.local,share=photo/...`) rewritten to the same place under a kernel
+/// SMB mount of that share (e.g. `/mnt/nas/photo/...`), when there is one.
+/// GVFS goes through a FUSE helper: copies through it have failed part-way
+/// and left empty files, and a dry-run load read 1.5x slower through it.
+/// Other paths, and GVFS paths without a matching mount, are returned
+/// unchanged.
+pub fn prefer_kernel_mount(path: &Path) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+        if let Some(p) = gvfs_to_mount(path, &mounts).filter(|p| p.exists()) {
+            return p;
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Whether `path` is inside GNOME's network view.
+pub fn is_gvfs(path: &Path) -> bool {
+    parse_gvfs_smb(path).is_some()
+}
+
+/// (server, share, path inside the share) of a GVFS SMB path.
+fn parse_gvfs_smb(path: &Path) -> Option<(String, String, PathBuf)> {
+    let mut comps = path.components();
+    let mut prefix = PathBuf::new();
+    for c in comps.by_ref() {
+        prefix.push(c);
+        if c.as_os_str() == "gvfs" {
+            break;
+        }
+    }
+    if !prefix.starts_with("/run/user") && !prefix.to_string_lossy().contains(".gvfs") {
+        return None;
+    }
+    let mount = comps.next()?.as_os_str().to_string_lossy().into_owned();
+    let params = mount.strip_prefix("smb-share:")?;
+    let mut server = None;
+    let mut share = None;
+    for kv in params.split(',') {
+        match kv.split_once('=') {
+            Some(("server", v)) => server = Some(percent_decode(v)),
+            Some(("share", v)) => share = Some(percent_decode(v)),
+            _ => {}
+        }
+    }
+    Some((server?, share?, comps.as_path().to_path_buf()))
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Undo the octal escapes (`\040` for a space) of /proc/mounts.
+fn unescape_mounts(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 3 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 4], 8) {
+                out.push(v);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn gvfs_to_mount(path: &Path, mounts: &str) -> Option<PathBuf> {
+    let (server, share, rest) = parse_gvfs_smb(path)?;
+    let host = |h: &str| {
+        h.trim()
+            .to_lowercase()
+            .trim_end_matches(".local")
+            .to_string()
+    };
+    for line in mounts.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 4 || !matches!(f[2], "cifs" | "smb3") {
+            continue;
+        }
+        let source = unescape_mounts(f[0]).replace('\\', "/");
+        let Some((m_server, m_path)) = source.trim_start_matches('/').split_once('/') else {
+            continue;
+        };
+        let addr = f[3].split(',').find_map(|o| o.strip_prefix("addr="));
+        if host(m_server) != host(&server) && addr != Some(server.as_str()) {
+            continue;
+        }
+        // The mount may be of a folder inside the share (//nas/photo/Astro).
+        let mut parts = m_path.split('/').filter(|p| !p.is_empty());
+        if !parts.next().is_some_and(|s| s.eq_ignore_ascii_case(&share)) {
+            continue;
+        }
+        let sub: PathBuf = parts.collect();
+        if let Ok(inner) = rest.strip_prefix(&sub) {
+            return Some(PathBuf::from(unescape_mounts(f[1])).join(inner));
+        }
+    }
+    None
+}
+
 /// Normalise a path to forward slashes, as the original stores paths.
 pub fn normalize_path(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
@@ -152,17 +272,135 @@ pub fn unique_path(path: &Path) -> PathBuf {
         .unwrap()
 }
 
+/// Files at least this big are read and copied in parallel parts. A NAS
+/// often serves one stream at a fraction of the link speed (seen: 17-60 MB/s
+/// alone, 117 MB/s with four parts in flight on gigabit); local disks don't
+/// mind either way.
+const PARALLEL_MIN: u64 = 8 << 20;
+const PARTS: u64 = 4;
+/// Whole-file reads into memory stop here (checksums stream beyond it).
+const IN_MEMORY_MAX: u64 = 512 << 20;
+
+fn read_at(f: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    return std::os::unix::fs::FileExt::read_at(f, buf, offset);
+    #[cfg(windows)]
+    return std::os::windows::fs::FileExt::seek_read(f, buf, offset);
+}
+
+fn write_at(f: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    return std::os::unix::fs::FileExt::write_at(f, buf, offset);
+    #[cfg(windows)]
+    return std::os::windows::fs::FileExt::seek_write(f, buf, offset);
+}
+
+fn read_exact_at(f: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match read_at(f, buf, offset)? {
+            0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            n => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_all_at(f: &std::fs::File, mut buf: &[u8], mut offset: u64) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match write_at(f, buf, offset)? {
+            0 => return Err(std::io::ErrorKind::WriteZero.into()),
+            n => {
+                buf = &buf[n..];
+                offset += n as u64;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run `work(offset, len)` over `len` bytes split into [`PARTS`] ranges, one
+/// thread each.
+fn in_parts(
+    len: u64,
+    work: impl Fn(u64, u64) -> std::io::Result<()> + Sync,
+) -> std::io::Result<()> {
+    let part = len.div_ceil(PARTS);
+    std::thread::scope(|s| {
+        let work = &work;
+        let threads: Vec<_> = (0..PARTS)
+            .map(|i| i * part)
+            .filter(|&off| off < len)
+            .map(|off| s.spawn(move || work(off, part.min(len - off))))
+            .collect();
+        threads.into_iter().try_for_each(|t| {
+            t.join()
+                .unwrap_or_else(|_| Err(std::io::Error::other("read thread panicked")))
+        })
+    })
+}
+
+/// Read a whole file into memory, big files in parallel parts.
+pub fn read_file(path: &Path) -> Result<Vec<u8>> {
+    read_whole(&std::fs::File::open(path)?)
+}
+
+fn read_whole(f: &std::fs::File) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let len = f.metadata()?.len();
+    if !(PARALLEL_MIN..=IN_MEMORY_MAX).contains(&len) {
+        let mut buf = Vec::with_capacity(len as usize);
+        let mut f = f;
+        f.read_to_end(&mut buf)?;
+        return Ok(buf);
+    }
+    let mut buf = vec![0u8; len as usize];
+    let part = len.div_ceil(PARTS) as usize;
+    std::thread::scope(|s| {
+        let threads: Vec<_> = buf
+            .chunks_mut(part)
+            .enumerate()
+            .map(|(i, chunk)| s.spawn(move || read_exact_at(f, chunk, (i * part) as u64)))
+            .collect();
+        threads.into_iter().try_for_each(|t| {
+            t.join()
+                .unwrap_or_else(|_| Err(std::io::Error::other("read thread panicked")))
+        })
+    })?;
+    Ok(buf)
+}
+
 /// Copy file contents only. Unlike `std::fs::copy` this never copies
 /// permissions, which network filesystems such as GNOME's GVFS reject with
-/// "Operation not supported". A partial destination is removed on failure.
+/// "Operation not supported". Big files are copied in parallel parts. A
+/// partial destination is removed on failure.
 pub fn copy_file(from: &Path, to: &Path) -> Result<u64> {
     use std::io::{Read, Write};
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let result = (|| -> Result<u64> {
-        let mut input = std::fs::File::open(from)?;
+        let input = std::fs::File::open(from)?;
+        let len = input.metadata()?.len();
         let mut output = std::fs::File::create(to)?;
+        if len >= PARALLEL_MIN {
+            output.set_len(len)?;
+            in_parts(len, |start, n| {
+                let mut buf = vec![0u8; (4 << 20).min(n as usize)];
+                let mut off = start;
+                while off < start + n {
+                    let k = buf.len().min((start + n - off) as usize);
+                    read_exact_at(&input, &mut buf[..k], off)?;
+                    write_all_at(&output, &buf[..k], off)?;
+                    off += k as u64;
+                }
+                Ok(())
+            })?;
+            return Ok(len);
+        }
+        let mut input = input;
         let mut buf = vec![0u8; 4 << 20];
         let mut total = 0u64;
         loop {
@@ -199,6 +437,10 @@ pub fn sha256_file(path: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    if (PARALLEL_MIN..=IN_MEMORY_MAX).contains(&len) {
+        return Ok(format!("{:x}", Sha256::digest(read_whole(&f)?)));
+    }
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
     loop {
@@ -411,6 +653,69 @@ mod tests {
             !dir.path().join("c").exists(),
             "no partial file left behind"
         );
+    }
+
+    #[test]
+    fn gvfs_paths_use_the_kernel_mount() {
+        let mounts = "\
+/dev/nvme0n1p2 / ext4 rw 0 0
+//nas.local/photo /mnt/nas/photo cifs rw,vers=3.0,addr=192.168.1.10 0 0
+//192.168.1.10/media /mnt/nas/my\\040media cifs rw,addr=192.168.1.10 0 0
+//other/stuff/Sub\\040Dir /mnt/sub cifs rw,addr=10.0.0.9 0 0
+";
+        let g = |p: &str| gvfs_to_mount(Path::new(p), mounts);
+        assert_eq!(
+            g("/run/user/1000/gvfs/smb-share:server=nas.local,share=photo/Astro/M 76 Barbell Nebula XISF"),
+            Some(PathBuf::from("/mnt/nas/photo/Astro/M 76 Barbell Nebula XISF"))
+        );
+        // Host names compare without case or ".local"; an IP matches addr=.
+        assert_eq!(
+            g("/run/user/1000/gvfs/smb-share:server=NAS,share=Photo/x"),
+            Some(PathBuf::from("/mnt/nas/photo/x"))
+        );
+        assert_eq!(
+            g("/run/user/1000/gvfs/smb-share:server=192.168.1.10,share=media"),
+            Some(PathBuf::from("/mnt/nas/my media"))
+        );
+        assert_eq!(
+            g("/run/user/1000/gvfs/smb-share:server=other,share=stuff/Sub Dir/a.fits"),
+            Some(PathBuf::from("/mnt/sub/a.fits"))
+        );
+        assert_eq!(
+            g("/run/user/1000/gvfs/smb-share:server=other,share=stuff/Elsewhere"),
+            None
+        );
+        assert_eq!(
+            g("/run/user/1000/gvfs/smb-share:server=nope,share=photo/x"),
+            None
+        );
+        assert_eq!(g("/mnt/nas/photo/Astro"), None);
+        assert!(is_gvfs(Path::new(
+            "/run/user/1000/gvfs/smb-share:server=a,share=b/c"
+        )));
+        assert!(!is_gvfs(Path::new("/mnt/nas/photo")));
+        assert_eq!(percent_decode("My%20Share"), "My Share");
+    }
+
+    #[test]
+    fn big_files_in_parts() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        // Above PARALLEL_MIN, and not a multiple of PARTS, so parts differ in size.
+        for len in [PARALLEL_MIN as usize - 1, PARALLEL_MIN as usize + 12_345] {
+            let a = dir.path().join(format!("a{len}.bin"));
+            let data: Vec<u8> = (0..len).map(|i| (i * 7 % 253) as u8).collect();
+            std::fs::write(&a, &data).unwrap();
+            assert!(read_file(&a).unwrap() == data, "read_file {len}");
+            let b = dir.path().join(format!("b{len}.bin"));
+            assert_eq!(copy_file(&a, &b).unwrap(), len as u64);
+            assert!(std::fs::read(&b).unwrap() == data, "copy_file {len}");
+            assert_eq!(
+                sha256_file(&a).unwrap(),
+                format!("{:x}", Sha256::digest(&data)),
+                "sha256_file {len}"
+            );
+        }
     }
 
     #[test]

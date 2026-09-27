@@ -220,6 +220,15 @@ pub fn ingest_folder(
     opts: IngestOptions,
     progress: &dyn Progress,
 ) -> Result<IngestReport> {
+    let fast = util::prefer_kernel_mount(source);
+    if fast != source {
+        log::info!(
+            "Reading {} through the kernel mount {} instead of GNOME's network view",
+            source.display(),
+            fast.display()
+        );
+    }
+    let source = fast.as_path();
     if !source.is_dir() {
         bail!("source folder {} does not exist", source.display());
     }
@@ -529,7 +538,9 @@ pub fn ingest_files(
     report.skipped = before - files.len();
     let total = files.len();
     // Scratch space for converted files, so sources are never written to
-    // when copying or doing a dry run.
+    // when copying or doing a dry run. It is inside the repository so that
+    // filing is a rename; converting there happens in parallel, which on a
+    // NAS measured faster than converting locally and copying one by one.
     remove_stale_work_dirs(&cfg.repo);
     let work = cfg.repo.join(format!(
         ".astrofiler-work-{}",

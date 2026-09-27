@@ -2254,6 +2254,18 @@ impl App {
                             self.load.folder = p;
                         }
                     });
+                    let folder = Path::new(&self.load.folder);
+                    if util::is_gvfs(folder) && util::prefer_kernel_mount(folder) == folder {
+                        ui.label(
+                            RichText::new(
+                                "This folder is in GNOME's network view, where big copies have \
+                                 failed part-way and left empty files. Mounting the share (e.g. \
+                                 in /etc/fstab) is more dependable.",
+                            )
+                            .small()
+                            .color(Color32::from_rgb(230, 150, 60)),
+                        );
+                    }
                     let also = ingest::seestar_companions(Path::new(&self.load.folder));
                     if !also.is_empty() {
                         let names: Vec<String> = also

@@ -58,7 +58,12 @@ impl FolderPicker {
         if let Some((key, rx)) = &self.pending {
             match rx.try_recv() {
                 Ok(chosen) => {
-                    self.done = chosen.map(|p| (*key, p));
+                    // A folder picked through GNOME's network view is read
+                    // through the kernel mount of the share, if there is one.
+                    self.done = chosen.map(|p| {
+                        let fast = crate::util::prefer_kernel_mount(Path::new(&p));
+                        (*key, fast.to_string_lossy().into_owned())
+                    });
                     self.pending = None;
                 }
                 Err(TryRecvError::Empty) => {}
