@@ -193,6 +193,8 @@ pub struct App {
     scope: ScopeUi,
     clean_dir: String,
     cfg_edit: Config,
+    /// Seestar files still in the old `<serial>/Seestar_S50` folders.
+    old_seestar: Arc<Mutex<usize>>,
 }
 
 impl App {
@@ -269,9 +271,11 @@ impl App {
             },
             clean_dir: String::new(),
             cfg_edit: cfg.clone(),
+            old_seestar: Arc::new(Mutex::new(0)),
             cfg,
         };
         app.reload();
+        app.check_seestar_layout(&cc.egui_ctx);
         // Offer USB telescopes straight away.
         let usb = telescope::find_usb();
         if let Some(f) = usb.first() {
@@ -279,6 +283,49 @@ impl App {
         }
         *app.scope.found.lock().unwrap() = usb;
         app
+    }
+
+    /// Count, in the background, Seestar files filed under the old layout.
+    fn check_seestar_layout(&self, ctx: &egui::Context) {
+        let (repo, count, ctx) = (self.cfg.repo.clone(), self.old_seestar.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            *count.lock().unwrap() = batch::old_seestar_layout(&repo).len();
+            ctx.request_repaint();
+        });
+    }
+
+    fn seestar_banner(&mut self, ctx: &egui::Context) {
+        let n = *self.old_seestar.lock().unwrap();
+        if n == 0 || self.job_active("Update Seestar folders") {
+            return;
+        }
+        egui::TopBottomPanel::top("seestar_layout").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!(
+                    "{n} Seestar files are still in the old layout, with a folder named after the \
+                     telescope's serial number above Seestar_S50. New files go straight into Seestar_S50."
+                ));
+                if ui.button("Move them to the new folders").clicked() {
+                    let count = self.old_seestar.clone();
+                    self.spawn("Update Seestar folders", move |conn, cfg, p| {
+                        let r = batch::migrate_seestar_layout(conn, cfg, false, p)?;
+                        for (f, e) in &r.errors {
+                            log::warn!("Not moved: {} ({e})", f.display());
+                        }
+                        *count.lock().unwrap() = r.errors.len();
+                        Ok(format!(
+                            "{} Seestar files moved to the new folders{}",
+                            r.moved.len(),
+                            if r.errors.is_empty() {
+                                String::new()
+                            } else {
+                                format!(", {} not moved (see Log)", r.errors.len())
+                            }
+                        ))
+                    });
+                }
+            });
+        });
     }
 
     fn conn(&self) -> Result<rusqlite::Connection> {
@@ -667,6 +714,7 @@ impl eframe::App for App {
             }
         });
 
+        self.seestar_banner(ctx);
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Images => self.images_tab(ui, ctx),
             Tab::Telescopes => self.telescopes_tab(ui),
@@ -1998,6 +2046,7 @@ impl App {
             match self.cfg_edit.save() {
                 Ok(()) => {
                     self.cfg = self.cfg_edit.clone();
+                    self.check_seestar_layout(ctx);
                     ctx.style_mut(|s| s.interaction.selectable_labels = false);
                     ctx.set_visuals(if self.cfg.theme == "light" {
                         egui::Visuals::light()
@@ -2038,6 +2087,18 @@ impl App {
                             self.load.folder = p;
                         }
                     });
+                    let also = ingest::seestar_companions(Path::new(&self.load.folder));
+                    if !also.is_empty() {
+                        let names: Vec<String> = also
+                            .iter()
+                            .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
+                            .collect();
+                        ui.label(
+                            RichText::new(format!("Also loads: {}", names.join(", ")))
+                                .small()
+                                .weak(),
+                        );
+                    }
                     ui.add_space(6.0);
                     ui.radio_value(
                         &mut self.load.placement,

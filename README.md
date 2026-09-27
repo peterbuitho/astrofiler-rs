@@ -22,6 +22,15 @@ and a command-line tool. No Python, no C libraries to install.
     Masters/                                   (master calibration frames)
   ```
 
+  A Seestar writes its serial number as the telescope ("S50_1a2b3c4d") and its
+  model as the camera, so its files get a single `Seestar_S50` level instead:
+  `Light/M_2/Seestar_S50/20260926/M_2-Seestar_S50-IRCUT-…fits`. Files filed with
+  the older two-level layout are moved with one click (the app offers it), or
+  with `astrofiler migrate-seestar`.
+
+  A Seestar keeps each target in two folders on its drive: `M 2` (stacked results
+  and previews) and `M 2_sub` (the sub-frames). Loading either one brings in the other.
+
   You choose to **move**, **copy** (originals untouched) or **catalogue in place**,
   and a **dry run** shows exactly where every file would go first.
   If a different file already has the same name in the repository, you choose to
@@ -110,6 +119,7 @@ astrofiler export ~/stack-me --session <session-id> --by-object
 astrofiler duplicates --remove
 astrofiler verify --hash
 astrofiler clean-previews /mnt/nas/astro --dry-run
+astrofiler migrate-seestar --dry-run     # preview moving Seestar files to the current layout
 astrofiler stats
 astrofiler mapping add TELESCOP "S50_1a2b3c4d" "Seestar S50"
 astrofiler header some-file.fits

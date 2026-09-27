@@ -154,6 +154,13 @@ enum Cmd {
         #[arg(long)]
         prune: bool,
     },
+    /// Move Seestar files out of the old `<serial>/Seestar_S50` folders into
+    /// the current `Seestar_S50` layout
+    MigrateSeestar {
+        /// Only show what would be moved
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Delete JPG/PNG preview images (and empty Thumbnail folders) under a folder
     CleanPreviews {
         dir: PathBuf,
@@ -667,6 +674,26 @@ fn run(cli: Cli) -> Result<()> {
                     batch::remove_missing(&mut conn, &NoProgress)?
                 );
             }
+        }
+        Cmd::MigrateSeestar { dry_run } => {
+            let r = batch::migrate_seestar_layout(&mut conn, &cfg, dry_run, &bar)?;
+            bar.finish();
+            for (old, new) in r.moved.iter().take(10) {
+                println!("{}\n  -> {}", old.display(), new.display());
+            }
+            if r.moved.len() > 10 {
+                println!("... and {} more", r.moved.len() - 10);
+            }
+            for (f, e) in &r.errors {
+                println!("not moved: {} ({e})", f.display());
+            }
+            let verb = if dry_run { "would move" } else { "moved" };
+            println!(
+                "{verb} {} files ({} catalogued), {} not moved",
+                r.moved.len(),
+                r.catalogued,
+                r.errors.len()
+            );
         }
         Cmd::Stats => {
             let s = stats::compute(&conn)?;

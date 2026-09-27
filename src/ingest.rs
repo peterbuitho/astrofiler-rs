@@ -233,13 +233,49 @@ pub fn ingest_folder(
     } else {
         MANAGED_DIRS.iter().map(|d| cfg.repo.join(d)).collect()
     };
-    let files = collect_files(source, &excluded);
+    let mut files = collect_files(source, &excluded);
     log::info!(
         "Found {} candidate files in {}",
         files.len(),
         source.display()
     );
+    for other in seestar_companions(source) {
+        let more = collect_files(&other, &excluded);
+        log::info!(
+            "Also loading {} files from {} (the other half of this Seestar target)",
+            more.len(),
+            other.display()
+        );
+        files.extend(more);
+    }
     ingest_files(conn, cfg, files, opts, progress)
+}
+
+/// A Seestar keeps each target in two sibling folders: `M 2` (stacked
+/// results and previews) and `M 2_sub` (sub-frames), plus `M 2_mosaic_sub`
+/// for mosaics. Loading any one of them brings in the others.
+pub fn seestar_companions(source: &Path) -> Vec<PathBuf> {
+    let (Some(parent), Some(name)) = (source.parent(), source.file_name()) else {
+        return vec![];
+    };
+    let name = name.to_string_lossy();
+    let base = name
+        .strip_suffix("_mosaic_sub")
+        .or_else(|| name.strip_suffix("_sub"))
+        .unwrap_or(&name);
+    if base.is_empty() {
+        return vec![];
+    }
+    [
+        base.to_string(),
+        format!("{base}_sub"),
+        format!("{base}_mosaic_sub"),
+    ]
+    .into_iter()
+    .filter(|n| *n != name)
+    .map(|n| parent.join(n))
+    .filter(|p| p.is_dir())
+    .collect()
 }
 
 /// Place companion files next to the frames that came from the same folder:
@@ -1134,6 +1170,27 @@ pub fn is_stacked(h: &Header) -> bool {
             || val(h, "IMAGETYP", "").to_uppercase().contains("MASTER"))
 }
 
+/// Whether a camera name is a Seestar smart telescope.
+pub fn is_seestar(instrument: &str) -> bool {
+    instrument.to_lowercase().starts_with("seestar")
+}
+
+/// The telescope/camera part of file names ("RedCat_51-ZWO_ASI2600MM") and
+/// folders (`RedCat_51/ZWO_ASI2600MM`). A Seestar is one unit that writes its
+/// serial number as TELESCOP ("S50_1a2b3c4d") and its model as INSTRUME
+/// ("Seestar S50"), so it gets just the model: "Seestar_S50".
+fn device_folder(h: &Header) -> (String, PathBuf) {
+    let telescope = sanitize(&val(h, "TELESCOP", "Unknown"));
+    let instrument = sanitize(&val(h, "INSTRUME", "Unknown"));
+    if is_seestar(&instrument) {
+        return (instrument.clone(), PathBuf::from(instrument));
+    }
+    (
+        format!("{telescope}-{instrument}"),
+        Path::new(&telescope).join(instrument),
+    )
+}
+
 /// Descriptive file name and repository folder (same scheme as the original).
 pub fn destination(h: &Header, repo: &Path) -> Result<(String, PathBuf)> {
     let imagetyp = val(h, "IMAGETYP", "");
@@ -1143,8 +1200,7 @@ pub fn destination(h: &Header, repo: &Path) -> Result<(String, PathBuf)> {
         .or_else(|| h.get("EXPOSURE"))
         .map(|v| v.to_py_string())
         .unwrap_or_default();
-    let telescope = sanitize(&val(h, "TELESCOP", "Unknown"));
-    let instrument = sanitize(&val(h, "INSTRUME", "Unknown"));
+    let (device, device_dir) = device_folder(h);
     let xbin = val(h, "XBINNING", "1");
     let ybin = val(h, "YBINNING", "1");
     let temp = val(h, "CCD-TEMP", "0");
@@ -1157,47 +1213,37 @@ pub fn destination(h: &Header, repo: &Path) -> Result<(String, PathBuf)> {
             .get_i64("STACKCNT")
             .or_else(|| h.get_i64("NCOMBINE"))
             .unwrap_or(0);
-        let name = format!(
-            "Stacked-{object}-{telescope}-{instrument}-{filter}-{stamp}-{count}x{exposure}s.fits"
-        );
-        return Ok((
-            name,
-            repo.join("Stacked")
-                .join(&object)
-                .join(&telescope)
-                .join(&instrument),
-        ));
+        let name = format!("Stacked-{object}-{device}-{filter}-{stamp}-{count}x{exposure}s.fits");
+        return Ok((name, repo.join("Stacked").join(&object).join(&device_dir)));
     }
     let name = match kind {
         FrameKind::Light => format!(
-            "{}-{telescope}-{instrument}-{filter}-{stamp}-{exposure}s-{xbin}x{ybin}-t{temp}.fits",
+            "{}-{device}-{filter}-{stamp}-{exposure}s-{xbin}x{ybin}-t{temp}.fits",
             sanitize(&val(h, "OBJECT", ""))
         ),
-        FrameKind::Flat => format!(
-            "Flat-{telescope}-{instrument}-{filter}-{stamp}-{exposure}s-{xbin}x{ybin}-t{temp}.fits"
-        ),
-        FrameKind::FlatDark => format!(
-            "FlatDark-{telescope}-{instrument}-{stamp}-{exposure}s-{xbin}x{ybin}-t{temp}.fits"
-        ),
+        FrameKind::Flat => {
+            format!("Flat-{device}-{filter}-{stamp}-{exposure}s-{xbin}x{ybin}-t{temp}.fits")
+        }
+        FrameKind::FlatDark => {
+            format!("FlatDark-{device}-{stamp}-{exposure}s-{xbin}x{ybin}-t{temp}.fits")
+        }
         FrameKind::Dark => {
-            format!("Dark-{telescope}-{instrument}-{stamp}-{exposure}s-{xbin}x{ybin}-t{temp}.fits")
+            format!("Dark-{device}-{stamp}-{exposure}s-{xbin}x{ybin}-t{temp}.fits")
         }
         FrameKind::Bias => {
-            format!("Bias-{telescope}-{instrument}-{stamp}-{xbin}x{ybin}-t{temp}.fits")
+            format!("Bias-{device}-{stamp}-{xbin}x{ybin}-t{temp}.fits")
         }
     };
     let dir = match kind {
         FrameKind::Light => repo
             .join("Light")
             .join(sanitize(&val(h, "OBJECT", "Unknown")))
-            .join(&telescope)
-            .join(&instrument)
+            .join(&device_dir)
             .join(day),
         other => repo
             .join("Calibrate")
             .join(other.object_name().to_uppercase())
-            .join(&telescope)
-            .join(&instrument),
+            .join(&device_dir),
     };
     Ok((name, dir))
 }
@@ -1287,6 +1333,74 @@ pub(crate) mod tests {
         let p = dir.join(name);
         write_image(&p, &h, shape, &data, OutType::U16).unwrap();
         p
+    }
+
+    /// Turn a test frame into one written by a Seestar S50.
+    pub fn make_seestar(path: &Path, stack: Option<i64>) {
+        let mut h = fits::read_primary_header(path).unwrap();
+        h.set("TELESCOP", Value::Str("S50_1a2b3c4d".into()));
+        h.set("INSTRUME", Value::Str("Seestar S50".into()));
+        if let Some(n) = stack {
+            h.set("STACKCNT", Value::Int(n));
+        }
+        fits::rewrite_primary_header(path, &h).unwrap();
+    }
+
+    #[test]
+    fn seestar_target_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let works = tmp.path().join("MyWorks");
+        let (stacked, subs) = (works.join("M 2"), works.join("M 2_sub"));
+        std::fs::create_dir_all(&stacked).unwrap();
+        std::fs::create_dir_all(&subs).unwrap();
+        std::fs::create_dir_all(works.join("M 3_sub")).unwrap();
+        for (i, t) in ["22:00:00", "22:00:10"].iter().enumerate() {
+            let p = make_frame(
+                &subs,
+                &format!("Light_{i}.fit"),
+                "Light",
+                Some("M 2"),
+                &format!("2024-08-01T{t}"),
+                10.0,
+                Some("IRCUT"),
+                i as f32,
+            );
+            make_seestar(&p, None);
+        }
+        let p = make_frame(
+            &stacked,
+            "Stacked_2_M 2_10.0s_IRCUT_20240801-221000.fit",
+            "Light",
+            Some("M 2"),
+            "2024-08-01T22:10:00",
+            10.0,
+            Some("IRCUT"),
+            9.0,
+        );
+        make_seestar(&p, Some(2));
+
+        assert_eq!(seestar_companions(&stacked), vec![subs.clone()]);
+        assert_eq!(seestar_companions(&subs), vec![stacked.clone()]);
+        assert!(seestar_companions(&works).is_empty());
+
+        let repo = tmp.path().join("repo");
+        let cfg = Config {
+            repo: repo.clone(),
+            source: tmp.path().join("incoming"),
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        // Pointing at the subs folder brings in the stacked result too.
+        let r = ingest_folder(&mut conn, &cfg, &subs, IngestOptions::COPY, &NoProgress).unwrap();
+        assert_eq!(r.registered, 3, "{r:?}");
+        assert!(repo
+            .join("Light/M_2/Seestar_S50/20240801/M_2-Seestar_S50-IRCUT-20240801220000-10.0s-1x1-t-10.0.fits")
+            .exists());
+        assert!(repo
+            .join(
+                "Stacked/M_2/Seestar_S50/Stacked-M_2-Seestar_S50-IRCUT-20240801221000-2x10.0s.fits"
+            )
+            .exists());
     }
 
     #[test]
