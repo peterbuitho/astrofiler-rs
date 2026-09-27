@@ -12,11 +12,11 @@ use crate::progress::{JobState, Progress};
 use crate::stats::{self, Stats};
 use crate::telescope::{self, Found, Link, RemoteFile};
 use crate::util::{self, FrameKind};
-use crate::{logging, masters, sessions};
+use crate::{logging, masters, names, sessions};
 use anyhow::Result;
 use eframe::egui::{self, Align2, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc, Mutex};
@@ -496,7 +496,35 @@ impl App {
         }
         self.filter_key = key;
         let q = self.search.to_lowercase();
-        let terms: Vec<&str> = q.split_whitespace().collect();
+        let mut terms: Vec<&str> = q.split_whitespace().collect();
+        // Common names, looked up once per object rather than once per file.
+        let objects: HashSet<&str> = self
+            .files
+            .iter()
+            .filter_map(|f| f.object.as_deref())
+            .collect();
+        let common: HashMap<&str, String> = objects
+            .into_iter()
+            .map(|o| {
+                (
+                    o,
+                    names::common_name(o, &self.cfg.object_names).unwrap_or_default(),
+                )
+            })
+            .collect();
+        // A search starting with an object ("M 76", "m76", "NGC 7000 Ha")
+        // shows exactly that object; matching "m" and "76" as separate words
+        // would also find every file with 76 in its time or temperature.
+        let object_keys: HashSet<String> = common.keys().map(|o| names::key(o)).collect();
+        let mut object = None;
+        for n in (1..=terms.len()).rev() {
+            let k = names::key(&terms[..n].join(" "));
+            if object_keys.contains(&k) {
+                object = Some(k);
+                terms.drain(..n);
+                break;
+            }
+        }
         let mut idx: Vec<usize> = self
             .files
             .iter()
@@ -509,10 +537,15 @@ impl App {
                     TypeFilter::Calibration => !matches!(kind, Some(FrameKind::Light) | None),
                     TypeFilter::Stacked => f.stacked,
                 };
-                type_ok && {
+                let object_ok = object
+                    .as_ref()
+                    .is_none_or(|k| names::key(f.object.as_deref().unwrap_or("")) == *k);
+                type_ok && object_ok && {
+                    let object = f.object.as_deref().unwrap_or("");
                     let hay = format!(
-                        "{} {} {} {} {} {}",
-                        f.object.as_deref().unwrap_or(""),
+                        "{} {} {} {} {} {} {}",
+                        object,
+                        common.get(object).map(String::as_str).unwrap_or(""),
                         f.filter.as_deref().unwrap_or(""),
                         f.telescope.as_deref().unwrap_or(""),
                         f.instrument.as_deref().unwrap_or(""),
@@ -785,7 +818,7 @@ impl App {
             ui.separator();
             ui.add(
                 egui::TextEdit::singleline(&mut self.search)
-                    .hint_text("Search object, filter, telescope, date…")
+                    .hint_text("Search: M 76, M 76 LP, Barbell, 2026-09-27…")
                     .desired_width(260.0),
             );
             for (f, label) in [
