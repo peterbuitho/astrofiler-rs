@@ -1002,7 +1002,14 @@ fn prepare(st: Staged, cfg: &Config, mappings: &[Mapping]) -> Result<Prepared> {
     }
     // Header fixes read folder names, so use the original location.
     let modified = normalize_header(&mut header, &st.input, mappings)?;
-    let (new_name, dest_dir) = destination(&header, &cfg.repo)?;
+    let (mut new_name, dest_dir) = destination(&header, cfg)?;
+    if is_stacked(&header) {
+        // Stacked results keep the name the telescope or stacking program
+        // gave them (converted XISF files end in .fits).
+        if let Some(n) = st.path.file_name() {
+            new_name = n.to_string_lossy().into_owned();
+        }
+    }
     let rewrite = modified && cfg.save_modified_headers && !fits::is_gzip(&st.path);
     // The stored hash is of the file as it will be written, so re-loading the
     // same original later is still recognised as a duplicate.
@@ -1192,7 +1199,10 @@ fn device_folder(h: &Header) -> (String, PathBuf) {
 }
 
 /// Descriptive file name and repository folder (same scheme as the original).
-pub fn destination(h: &Header, repo: &Path) -> Result<(String, PathBuf)> {
+pub fn destination(h: &Header, cfg: &Config) -> Result<(String, PathBuf)> {
+    let repo = &cfg.repo;
+    let object_dir =
+        || crate::names::object_folder(&val(h, "OBJECT", "Unknown"), &cfg.object_names);
     let imagetyp = val(h, "IMAGETYP", "");
     let (stamp, day) = parse_date_obs(&val(h, "DATE-OBS", ""))?;
     let exposure = h
@@ -1214,7 +1224,10 @@ pub fn destination(h: &Header, repo: &Path) -> Result<(String, PathBuf)> {
             .or_else(|| h.get_i64("NCOMBINE"))
             .unwrap_or(0);
         let name = format!("Stacked-{object}-{device}-{filter}-{stamp}-{count}x{exposure}s.fits");
-        return Ok((name, repo.join("Stacked").join(&object).join(&device_dir)));
+        return Ok((
+            name,
+            repo.join("Stacked").join(object_dir()).join(&device_dir),
+        ));
     }
     let name = match kind {
         FrameKind::Light => format!(
@@ -1237,7 +1250,7 @@ pub fn destination(h: &Header, repo: &Path) -> Result<(String, PathBuf)> {
     let dir = match kind {
         FrameKind::Light => repo
             .join("Light")
-            .join(sanitize(&val(h, "OBJECT", "Unknown")))
+            .join(object_dir())
             .join(&device_dir)
             .join(day),
         other => repo
@@ -1397,9 +1410,7 @@ pub(crate) mod tests {
             .join("Light/M_2/Seestar_S50/20240801/M_2-Seestar_S50-IRCUT-20240801220000-10.0s-1x1-t-10.0.fits")
             .exists());
         assert!(repo
-            .join(
-                "Stacked/M_2/Seestar_S50/Stacked-M_2-Seestar_S50-IRCUT-20240801221000-2x10.0s.fits"
-            )
+            .join("Stacked/M_2/Seestar_S50/Stacked_2_M 2_10.0s_IRCUT_20240801-221000.fit")
             .exists());
     }
 
@@ -1458,7 +1469,7 @@ pub(crate) mod tests {
         assert_eq!(r.registered, 2, "{r:?}");
         assert_eq!(r.duplicates.len(), 1);
         assert_eq!(r.errors.len(), 1);
-        let light = repo.join("Light/M_31/RedCat_51/ZWO_ASI2600MM/20241001/M_31-RedCat_51-ZWO_ASI2600MM-Ha-20241001210000-300.0s-1x1-t-10.0.fits");
+        let light = repo.join("Light/M_31_Andromeda_Galaxy/RedCat_51/ZWO_ASI2600MM/20241001/M_31-RedCat_51-ZWO_ASI2600MM-Ha-20241001210000-300.0s-1x1-t-10.0.fits");
         assert!(light.exists());
         assert!(repo.join("Calibrate/DARK/RedCat_51/ZWO_ASI2600MM/Dark-RedCat_51-ZWO_ASI2600MM-20241002080000-300.0s-1x1-t-10.0.fits").exists());
         let files = db::all_files(&conn, false).unwrap();
@@ -1473,7 +1484,7 @@ pub(crate) mod tests {
 
     #[test]
     fn name_conflicts() {
-        let light_rel = "Light/M_31/RedCat_51/ZWO_ASI2600MM/20241001/M_31-RedCat_51-ZWO_ASI2600MM-Ha-20241001210000-300.0s-1x1-t-10.0.fits";
+        let light_rel = "Light/M_31_Andromeda_Galaxy/RedCat_51/ZWO_ASI2600MM/20241001/M_31-RedCat_51-ZWO_ASI2600MM-Ha-20241001210000-300.0s-1x1-t-10.0.fits";
         let frame = |dir: &Path, name: &str, seed: f32| {
             std::fs::create_dir_all(dir).unwrap();
             let p = make_frame(
@@ -1795,7 +1806,7 @@ pub(crate) mod tests {
         assert_eq!(r.sidecars, 1, "{r:?}");
         let placed = cfg
             .repo
-            .join("Light/C_13/RedCat_51/ZWO_ASI2600MM/20260926")
+            .join("Light/C_13_Owl_Cluster/RedCat_51/ZWO_ASI2600MM/20260926")
             .join(format!("{folder}_shotsInfo.json"));
         assert!(placed.exists(), "{placed:?}");
         assert!(!src.join("shotsInfo.json").exists(), "moved");

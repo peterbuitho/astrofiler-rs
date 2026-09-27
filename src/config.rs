@@ -35,6 +35,9 @@ pub struct Config {
     pub ui_scale: String,
     /// What to do when a different file already has a filed file's name.
     pub on_conflict: crate::ingest::OnConflict,
+    /// Common names for objects, added to their folder names; they take
+    /// precedence over the built-in list (`[object_names]` section).
+    pub object_names: std::collections::BTreeMap<String, String>,
     /// Where this config was loaded from / will be saved to.
     pub path: PathBuf,
 }
@@ -57,6 +60,7 @@ impl Default for Config {
             include_stacked: true,
             ui_scale: "auto".into(),
             on_conflict: Default::default(),
+            object_names: Default::default(),
             path: default_config_path(),
         }
     }
@@ -151,6 +155,13 @@ impl Config {
         if let Some(c) = get("on_conflict").and_then(|v| crate::ingest::OnConflict::parse(&v)) {
             cfg.on_conflict = c;
         }
+        if let Some(sec) = ini.section(Some("object_names")) {
+            cfg.object_names = sec
+                .iter()
+                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                .filter(|(k, _)| !k.is_empty())
+                .collect();
+        }
         cfg.database = get("database").filter(|v| !v.is_empty()).map(PathBuf::from);
         Ok(cfg)
     }
@@ -198,6 +209,11 @@ impl Config {
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_default(),
             );
+        ini.delete(Some("object_names"));
+        for (object, name) in &self.object_names {
+            ini.with_section(Some("object_names"))
+                .set(object.clone(), name.clone());
+        }
         if let Some(parent) = self.path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;

@@ -12,6 +12,7 @@ pub mod fits;
 pub mod ingest;
 pub mod logging;
 pub mod masters;
+pub mod names;
 pub mod progress;
 pub mod sessions;
 pub mod stats;

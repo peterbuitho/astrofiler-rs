@@ -11,7 +11,7 @@ use crate::util::{self, FrameKind};
 use anyhow::{bail, Result};
 use rayon::prelude::*;
 use rusqlite::{params, Connection};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -124,7 +124,14 @@ fn edit_file(
     }
     let mut new_path = path.to_path_buf();
     if opts.refile && path.starts_with(&cfg.repo) {
-        let (name, dir) = ingest::destination(&header, &cfg.repo)?;
+        let (mut name, dir) = ingest::destination(&header, cfg)?;
+        if ingest::is_stacked(&header) {
+            name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+        }
         let target = dir.join(name);
         if target != path {
             let target = util::unique_path(&target);
@@ -163,7 +170,7 @@ pub fn merge_objects(
 }
 
 #[derive(Debug, Default)]
-pub struct SeestarMigration {
+pub struct LayoutMigration {
     /// Old path -> new path of every file moved (or, in a dry run, to move).
     pub moved: Vec<(PathBuf, PathBuf)>,
     /// Catalogue rows updated.
@@ -171,74 +178,158 @@ pub struct SeestarMigration {
     pub errors: Vec<(PathBuf, String)>,
 }
 
-/// Seestar files filed before the layout dropped the serial-number level:
-/// `<top>/<object>/S50_1a2b3c4d/Seestar_S50/...` and names with
-/// `-S50_1a2b3c4d-Seestar_S50-` in them. Returns (old, new) paths.
-pub fn old_seestar_layout(repo: &Path) -> Vec<(PathBuf, PathBuf)> {
-    let dirs = |p: &Path| -> Vec<PathBuf> {
-        std::fs::read_dir(p)
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .map(|e| e.path())
-                    .filter(|p| p.is_dir())
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    let name = |p: &Path| {
-        p.file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned()
-    };
+/// The name a stacked result is kept under: its original file name, with
+/// converted XISF files ending in .fits and gzip files unpacked.
+fn kept_name(original: &str) -> Option<String> {
+    let name = original.rsplit(['/', '\\']).next()?;
+    let lower = name.to_lowercase();
+    if lower.ends_with(".zip") || name.is_empty() {
+        return None; // the name inside the archive wasn't recorded
+    }
+    Some(if lower.ends_with(".xisf") {
+        format!("{}.fits", &name[..name.len() - 5])
+    } else if lower.ends_with(".gz") {
+        name[..name.len() - 3].to_string()
+    } else {
+        name.to_string()
+    })
+}
+
+/// Files filed under an older repository layout, with where they belong now
+/// (companions such as previews move with their frames):
+/// - Seestar files under `<object>/S50_1a2b3c4d/Seestar_S50/`, with the serial
+///   number in their names too;
+/// - object folders without the object's common name (`M_76` becomes
+///   `M_76_Barbell_Nebula`), or with a common name that has since changed;
+/// - stacked results renamed by earlier versions (`Stacked-M_2-…fits`), which
+///   get their original name back.
+pub fn layout_plan(conn: &Connection, cfg: &Config) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let repo = &cfg.repo;
+    let prefix = format!("{}/", util::normalize_path(repo));
+    let files = db::files_where(conn, "substr(fitsFileName, 1, length(?1)) = ?1", &[&prefix])?;
+    // Object of each object folder, and new names of stacked results and of
+    // the companions that share their name.
+    let mut objects: HashMap<PathBuf, String> = HashMap::new();
+    let mut renames: HashMap<PathBuf, String> = HashMap::new();
+    let mut stem_renames: HashMap<(PathBuf, String), String> = HashMap::new();
+    for f in &files {
+        let path = PathBuf::from(&f.name);
+        let Ok(rel) = path.strip_prefix(repo) else {
+            continue;
+        };
+        let mut comps = rel.components();
+        if let (Some(top), Some(object_dir), Some(object)) = (comps.next(), comps.next(), &f.object)
+        {
+            if matches!(top.as_os_str().to_str(), Some("Light" | "Stacked")) {
+                objects
+                    .entry(repo.join(top).join(object_dir))
+                    .or_insert_with(|| object.clone());
+            }
+        }
+        if !f.stacked {
+            continue;
+        }
+        let Some(kept) = f.original.as_deref().and_then(kept_name) else {
+            continue;
+        };
+        let (Some(dir), Some(old_stem), Some(new_stem)) = (
+            path.parent(),
+            path.file_stem(),
+            Path::new(&kept).file_stem(),
+        ) else {
+            continue;
+        };
+        stem_renames.insert(
+            (dir.to_path_buf(), old_stem.to_string_lossy().into_owned()),
+            new_stem.to_string_lossy().into_owned(),
+        );
+        renames.insert(path.clone(), kept);
+    }
+
     let mut out = Vec::new();
     for top in ["Light", "Stacked", "Calibrate"] {
-        for object in dirs(&repo.join(top)) {
-            for telescope in dirs(&object) {
-                for camera in dirs(&telescope) {
-                    let (tel, cam) = (name(&telescope), name(&camera));
-                    if !ingest::is_seestar(&cam) || ingest::is_seestar(&tel) {
-                        continue;
-                    }
-                    let old_part = format!("-{tel}-{cam}-");
-                    let new_part = format!("-{cam}-");
-                    for e in walkdir::WalkDir::new(&camera)
-                        .into_iter()
-                        .filter_map(|e| e.ok())
-                    {
-                        if !e.file_type().is_file() {
-                            continue;
-                        }
-                        let rel = e.path().strip_prefix(&camera).unwrap_or(e.path());
-                        let mut new = object.join(&cam).join(rel);
-                        new.set_file_name(
-                            e.file_name()
-                                .to_string_lossy()
-                                .replace(&old_part, &new_part),
-                        );
-                        out.push((e.path().to_path_buf(), new));
-                    }
+        let top_dir = repo.join(top);
+        let entries = walkdir::WalkDir::new(&top_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file());
+        for e in entries {
+            let old = e.path().to_path_buf();
+            let Ok(rel) = old.strip_prefix(&top_dir) else {
+                continue;
+            };
+            let mut parts: Vec<String> = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            let Some(mut name) = parts.pop() else {
+                continue;
+            };
+            if parts.is_empty() {
+                continue;
+            }
+            let object_dir = top_dir.join(&parts[0]);
+            let stem_key = |p: &Path| -> Option<(PathBuf, String)> {
+                Some((
+                    p.parent()?.to_path_buf(),
+                    p.file_stem()?.to_string_lossy().into_owned(),
+                ))
+            };
+            let renamed = if let Some(kept) = renames.get(&old) {
+                name = kept.clone();
+                true
+            } else if let Some(stem) = stem_key(&old).and_then(|k| stem_renames.get(&k)) {
+                name = match old.extension() {
+                    Some(ext) => format!("{stem}.{}", ext.to_string_lossy()),
+                    None => stem.clone(),
+                };
+                true
+            } else {
+                false
+            };
+            // Seestar: <object>/<serial>/<Seestar model>/... -> <object>/<model>/...
+            if parts.len() >= 3 && ingest::is_seestar(&parts[2]) && !ingest::is_seestar(&parts[1]) {
+                let (serial, model) = (parts[1].clone(), parts[2].clone());
+                if !renamed {
+                    name = name.replace(&format!("-{serial}-{model}-"), &format!("-{model}-"));
                 }
+                parts.remove(1);
+            }
+            if top != "Calibrate" {
+                let object = objects
+                    .get(&object_dir)
+                    .cloned()
+                    .unwrap_or_else(|| parts[0].clone());
+                let base = util::sanitize(&object);
+                // Only add or update the common name; never move files to a
+                // different object.
+                if parts[0] == base || parts[0].starts_with(&format!("{base}_")) {
+                    parts[0] = crate::names::object_folder(&object, &cfg.object_names);
+                }
+            }
+            let new = top_dir.join(parts.iter().collect::<PathBuf>()).join(name);
+            if new != old {
+                out.push((old, new));
             }
         }
     }
-    out
+    Ok(out)
 }
 
-/// Move Seestar files (and their previews and other companions) out of the
-/// old serial-number folders into the current layout, updating the catalogue.
-/// A file whose new name is already taken is left where it is.
-pub fn migrate_seestar_layout(
+/// Move files filed under an older layout (see [`layout_plan`]) to where
+/// they belong now, updating the catalogue. A file whose new name is already
+/// taken is left where it is.
+pub fn migrate_layout(
     conn: &mut Connection,
     cfg: &Config,
     dry_run: bool,
     progress: &dyn Progress,
-) -> Result<SeestarMigration> {
-    let mut report = SeestarMigration::default();
-    let plan = old_seestar_layout(&cfg.repo);
+) -> Result<LayoutMigration> {
+    let mut report = LayoutMigration::default();
+    let plan = layout_plan(conn, cfg)?;
     let tx = conn.transaction()?;
     for (i, (old, new)) in plan.iter().enumerate() {
-        progress.update(i + 1, plan.len(), "Moving Seestar files");
+        progress.update(i + 1, plan.len(), "Moving files to the current layout");
         if progress.cancelled() {
             break;
         }
@@ -571,17 +662,25 @@ mod tests {
     use crate::progress::NoProgress;
 
     #[test]
-    fn seestar_layout_migration() {
+    fn layout_migration() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        let old_dir = repo.join("Light/M_2/S50_1a2b3c4d/Seestar_S50/20240801");
+        let cfg = Config {
+            repo: repo.clone(),
+            source: tmp.path().join("incoming"),
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+
+        // A Seestar sub filed by 0.2.0-: serial-number folder, no common name.
+        let old_dir = repo.join("Light/M_76/S50_1a2b3c4d/Seestar_S50/20240801");
         std::fs::create_dir_all(&old_dir).unwrap();
-        let name = "M_2-S50_1a2b3c4d-Seestar_S50-IRCUT-20240801220000-10.0s-1x1-t-10.0";
+        let name = "M_76-S50_1a2b3c4d-Seestar_S50-IRCUT-20240801220000-10.0s-1x1-t-10.0";
         let p = make_frame(
             &old_dir,
             &format!("{name}.fits"),
             "Light",
-            Some("M 2"),
+            Some("M 76"),
             "2024-08-01T22:00:00",
             10.0,
             Some("IRCUT"),
@@ -589,12 +688,6 @@ mod tests {
         );
         make_seestar(&p, None);
         std::fs::write(old_dir.join(format!("{name}.jpg")), b"jpg").unwrap();
-        let cfg = Config {
-            repo: repo.clone(),
-            source: tmp.path().join("incoming"),
-            ..Default::default()
-        };
-        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
         ingest::ingest_folder(
             &mut conn,
             &cfg,
@@ -604,26 +697,72 @@ mod tests {
         )
         .unwrap();
 
-        let dry = migrate_seestar_layout(&mut conn, &cfg, true, &NoProgress).unwrap();
-        assert_eq!((dry.moved.len(), dry.catalogued), (2, 1), "{dry:?}");
+        // A stacked result renamed by 0.2.0, loaded from the telescope's drive.
+        let drive = tmp.path().join("MyWorks/M 2");
+        std::fs::create_dir_all(&drive).unwrap();
+        let original = "Stacked_2_M 2_10.0s_IRCUT_20240801-221000";
+        let st = make_frame(
+            &drive,
+            &format!("{original}.fit"),
+            "Light",
+            Some("M 2"),
+            "2024-08-01T22:10:00",
+            10.0,
+            Some("IRCUT"),
+            9.0,
+        );
+        make_seestar(&st, Some(2));
+        ingest::ingest_folder(
+            &mut conn,
+            &cfg,
+            &drive,
+            ingest::IngestOptions::COPY,
+            &NoProgress,
+        )
+        .unwrap();
+        let stacked_dir = repo.join("Stacked/M_2/Seestar_S50");
+        let kept = stacked_dir.join(format!("{original}.fit"));
+        assert!(kept.exists(), "stacked results keep their name");
+        let renamed = "Stacked-M_2-Seestar_S50-IRCUT-20240801221000-2x10.0s";
+        let renamed_fits = stacked_dir.join(format!("{renamed}.fits"));
+        std::fs::rename(&kept, &renamed_fits).unwrap();
+        std::fs::write(stacked_dir.join(format!("{renamed}.jpg")), b"jpg").unwrap();
+        conn.execute(
+            "UPDATE fitsFile SET fitsFileName=?1 WHERE fitsFileName=?2",
+            params![
+                util::normalize_path(&renamed_fits),
+                util::normalize_path(&kept)
+            ],
+        )
+        .unwrap();
+
+        let dry = migrate_layout(&mut conn, &cfg, true, &NoProgress).unwrap();
+        assert_eq!((dry.moved.len(), dry.catalogued), (4, 2), "{dry:?}");
         assert!(p.exists());
 
-        let r = migrate_seestar_layout(&mut conn, &cfg, false, &NoProgress).unwrap();
+        let r = migrate_layout(&mut conn, &cfg, false, &NoProgress).unwrap();
         assert_eq!(
             (r.moved.len(), r.catalogued, r.errors.len()),
-            (2, 1, 0),
+            (4, 2, 0),
             "{r:?}"
         );
-        let new_dir = repo.join("Light/M_2/Seestar_S50/20240801");
-        let new = new_dir.join("M_2-Seestar_S50-IRCUT-20240801220000-10.0s-1x1-t-10.0.fits");
+        let new_dir = repo.join("Light/M_76_Barbell_Nebula/Seestar_S50/20240801");
+        let new = new_dir.join("M_76-Seestar_S50-IRCUT-20240801220000-10.0s-1x1-t-10.0.fits");
         assert!(new.exists());
         assert!(new_dir
-            .join("M_2-Seestar_S50-IRCUT-20240801220000-10.0s-1x1-t-10.0.jpg")
+            .join("M_76-Seestar_S50-IRCUT-20240801220000-10.0s-1x1-t-10.0.jpg")
             .exists());
-        assert!(!repo.join("Light/M_2/S50_1a2b3c4d").exists());
-        let files = db::all_files(&conn, false).unwrap();
-        assert_eq!(files[0].name, util::normalize_path(&new));
-        assert!(old_seestar_layout(&repo).is_empty());
+        assert!(!repo.join("Light/M_76").exists());
+        assert!(kept.exists());
+        assert!(stacked_dir.join(format!("{original}.jpg")).exists());
+        let names: Vec<String> = db::all_files(&conn, false)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        assert!(names.contains(&util::normalize_path(&new)), "{names:?}");
+        assert!(names.contains(&util::normalize_path(&kept)), "{names:?}");
+        assert!(layout_plan(&conn, &cfg).unwrap().is_empty());
     }
 
     #[test]
@@ -681,7 +820,11 @@ mod tests {
         let files = db::all_files(&conn, false).unwrap();
         assert!(files.iter().all(|f| f.object.as_deref() == Some("M 31")));
         for f in &files {
-            assert!(f.name.contains("/Light/M_31/"), "{}", f.name);
+            assert!(
+                f.name.contains("/Light/M_31_Andromeda_Galaxy/"),
+                "{}",
+                f.name
+            );
             assert_eq!(
                 fits::read_primary_header(Path::new(&f.name))
                     .unwrap()

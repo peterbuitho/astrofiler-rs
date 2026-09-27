@@ -154,9 +154,10 @@ enum Cmd {
         #[arg(long)]
         prune: bool,
     },
-    /// Move Seestar files out of the old `<serial>/Seestar_S50` folders into
-    /// the current `Seestar_S50` layout
-    MigrateSeestar {
+    /// Move files filed by older versions to the current layout: common names
+    /// in object folders, one `Seestar_S50` folder, original stacked file names
+    #[command(alias = "migrate-seestar")]
+    MigrateLayout {
         /// Only show what would be moved
         #[arg(long)]
         dry_run: bool,
@@ -675,14 +676,16 @@ fn run(cli: Cli) -> Result<()> {
                 );
             }
         }
-        Cmd::MigrateSeestar { dry_run } => {
-            let r = batch::migrate_seestar_layout(&mut conn, &cfg, dry_run, &bar)?;
+        Cmd::MigrateLayout { dry_run } => {
+            let r = batch::migrate_layout(&mut conn, &cfg, dry_run, &bar)?;
             bar.finish();
-            for (old, new) in r.moved.iter().take(10) {
+            // A dry run lists everything; a real run just samples.
+            let shown = if dry_run { r.moved.len() } else { 10 };
+            for (old, new) in r.moved.iter().take(shown) {
                 println!("{}\n  -> {}", old.display(), new.display());
             }
-            if r.moved.len() > 10 {
-                println!("... and {} more", r.moved.len() - 10);
+            if r.moved.len() > shown {
+                println!("... and {} more", r.moved.len() - shown);
             }
             for (f, e) in &r.errors {
                 println!("not moved: {} ({e})", f.display());

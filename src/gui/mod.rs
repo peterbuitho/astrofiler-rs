@@ -193,8 +193,10 @@ pub struct App {
     scope: ScopeUi,
     clean_dir: String,
     cfg_edit: Config,
-    /// Seestar files still in the old `<serial>/Seestar_S50` folders.
-    old_seestar: Arc<Mutex<usize>>,
+    /// Files still filed under an older layout (see `batch::layout_plan`).
+    old_layout: Arc<Mutex<usize>>,
+    /// Object and common name being added in the settings.
+    new_object_name: (String, String),
 }
 
 impl App {
@@ -271,11 +273,12 @@ impl App {
             },
             clean_dir: String::new(),
             cfg_edit: cfg.clone(),
-            old_seestar: Arc::new(Mutex::new(0)),
+            old_layout: Arc::new(Mutex::new(0)),
+            new_object_name: Default::default(),
             cfg,
         };
         app.reload();
-        app.check_seestar_layout(&cc.egui_ctx);
+        app.check_layout(&cc.egui_ctx);
         // Offer USB telescopes straight away.
         let usb = telescope::find_usb();
         if let Some(f) = usb.first() {
@@ -292,36 +295,41 @@ impl App {
         app
     }
 
-    /// Count, in the background, Seestar files filed under the old layout.
-    fn check_seestar_layout(&self, ctx: &egui::Context) {
-        let (repo, count, ctx) = (self.cfg.repo.clone(), self.old_seestar.clone(), ctx.clone());
+    /// Count, in the background, files filed under an older layout.
+    fn check_layout(&self, ctx: &egui::Context) {
+        let (cfg, db_path) = (self.cfg.clone(), self.db_path.clone());
+        let (count, ctx) = (self.old_layout.clone(), ctx.clone());
         std::thread::spawn(move || {
-            *count.lock().unwrap() = batch::old_seestar_layout(&repo).len();
+            let n = db::open(&db_path)
+                .and_then(|conn| batch::layout_plan(&conn, &cfg))
+                .map(|plan| plan.len())
+                .unwrap_or(0);
+            *count.lock().unwrap() = n;
             ctx.request_repaint();
         });
     }
 
-    fn seestar_banner(&mut self, ctx: &egui::Context) {
-        let n = *self.old_seestar.lock().unwrap();
-        if n == 0 || self.job_active("Update Seestar folders") {
+    fn layout_banner(&mut self, ctx: &egui::Context) {
+        let n = *self.old_layout.lock().unwrap();
+        if n == 0 || self.job_active("Update folders") {
             return;
         }
-        egui::TopBottomPanel::top("seestar_layout").show(ctx, |ui| {
+        egui::TopBottomPanel::top("old_layout").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(format!(
-                    "{n} Seestar files are still in the old layout, with a folder named after the \
-                     telescope's serial number above Seestar_S50. New files go straight into Seestar_S50."
+                    "{n} files in the repository are filed the old way: object folders without \
+                     the object's name, Seestar serial-number folders or renamed stacked results."
                 ));
-                if ui.button("Move them to the new folders").clicked() {
-                    let count = self.old_seestar.clone();
-                    self.spawn("Update Seestar folders", move |conn, cfg, p| {
-                        let r = batch::migrate_seestar_layout(conn, cfg, false, p)?;
+                if ui.button("Move them to the current layout").clicked() {
+                    let count = self.old_layout.clone();
+                    self.spawn("Update folders", move |conn, cfg, p| {
+                        let r = batch::migrate_layout(conn, cfg, false, p)?;
                         for (f, e) in &r.errors {
                             log::warn!("Not moved: {} ({e})", f.display());
                         }
                         *count.lock().unwrap() = r.errors.len();
                         Ok(format!(
-                            "{} Seestar files moved to the new folders{}",
+                            "{} files moved to the current layout{}",
                             r.moved.len(),
                             if r.errors.is_empty() {
                                 String::new()
@@ -721,7 +729,7 @@ impl eframe::App for App {
             }
         });
 
-        self.seestar_banner(ctx);
+        self.layout_banner(ctx);
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Images => self.images_tab(ui, ctx),
             Tab::Telescopes => self.telescopes_tab(ui),
@@ -731,7 +739,9 @@ impl eframe::App for App {
             Tab::Duplicates => self.duplicates_tab(ui),
             Tab::Mappings => self.mappings_tab(ui),
             Tab::Stats => self.stats_tab(ui),
-            Tab::Config => self.config_tab(ui, ctx),
+            Tab::Config => {
+                egui::ScrollArea::vertical().show(ui, |ui| self.config_tab(ui, ctx));
+            }
             Tab::Log => log_tab(ui),
         });
 
@@ -2047,13 +2057,68 @@ impl App {
                 ui.end_row();
             });
         ui.add_space(8.0);
+        ui.collapsing("Object names in folder names", |ui| {
+            ui.label(
+                "Well-known objects get their common name in the folder name, e.g. \
+                 Light/M_76_Barbell_Nebula. Add names here, or change a built-in one; \
+                 leave the name empty to use just the catalogue number.",
+            );
+            let mut remove = None;
+            egui::Grid::new("object_names")
+                .num_columns(3)
+                .spacing([12.0, 4.0])
+                .show(ui, |ui| {
+                    for (object, name) in c.object_names.iter_mut() {
+                        ui.label(object.as_str());
+                        ui.add(egui::TextEdit::singleline(name).desired_width(260.0));
+                        if ui.small_button("✖").on_hover_text("Remove").clicked() {
+                            remove = Some(object.clone());
+                        }
+                        ui.end_row();
+                    }
+                    let (object, name) = &mut self.new_object_name;
+                    ui.add(
+                        egui::TextEdit::singleline(object)
+                            .hint_text("M 76")
+                            .desired_width(100.0),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(name)
+                            .hint_text("Barbell Nebula")
+                            .desired_width(260.0),
+                    );
+                    if ui
+                        .add_enabled(!object.trim().is_empty(), egui::Button::new("Add"))
+                        .clicked()
+                    {
+                        c.object_names
+                            .insert(object.trim().to_string(), name.trim().to_string());
+                        object.clear();
+                        name.clear();
+                    }
+                    ui.end_row();
+                });
+            if let Some(o) = remove {
+                c.object_names.remove(&o);
+            }
+            let (object, _) = &self.new_object_name;
+            if !object.trim().is_empty() {
+                let current = crate::names::common_name(object, &Default::default());
+                ui.weak(match current {
+                    Some(n) => format!("Built-in name: {n}"),
+                    None => "No built-in name".to_string(),
+                });
+            }
+            ui.weak("Save the settings, then use the bar at the top to rename existing folders.");
+        });
+        ui.add_space(8.0);
         ui.label(format!("Config file: {}", self.cfg.path.display()));
         ui.label(format!("Database: {}", self.db_path.display()));
         if ui.button("💾 Save settings").clicked() {
             match self.cfg_edit.save() {
                 Ok(()) => {
                     self.cfg = self.cfg_edit.clone();
-                    self.check_seestar_layout(ctx);
+                    self.check_layout(ctx);
                     ctx.style_mut(|s| s.interaction.selectable_labels = false);
                     ctx.set_visuals(if self.cfg.theme == "light" {
                         egui::Visuals::light()

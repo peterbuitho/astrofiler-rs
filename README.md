@@ -18,15 +18,24 @@ and a command-line tool. No Python, no C libraries to install.
   Repository/
     Light/<Object>/<Telescope>/<Camera>/<YYYYMMDD>/M_31-RedCat_51-ASI2600MM-Ha-20241001210000-300.0s-1x1-t-10.0.fits
     Calibrate/<DARK|FLAT|BIAS|FLATDARK>/<Telescope>/<Camera>/
-    Stacked/<Object>/<Telescope>/<Camera>/     (the telescopes' own stacked results)
+    Stacked/<Object>/<Telescope>/<Camera>/     (stacked results, under their original names)
     Masters/                                   (master calibration frames)
   ```
 
+  Object folders of well-known objects include the common name, e.g.
+  `Light/M_31_Andromeda_Galaxy/` or `Light/M_76_Barbell_Nebula/` (Messier,
+  Caldwell and popular NGC/IC objects). You can add names or change them in
+  Settings, or in the `[object_names]` section of the config file.
+
   A Seestar writes its serial number as the telescope ("S50_1a2b3c4d") and its
   model as the camera, so its files get a single `Seestar_S50` level instead:
-  `Light/M_2/Seestar_S50/20260926/M_2-Seestar_S50-IRCUT-…fits`. Files filed with
-  the older two-level layout are moved with one click (the app offers it), or
-  with `astrofiler migrate-seestar`.
+  `Light/M_2/Seestar_S50/20260926/M_2-Seestar_S50-IRCUT-…fits`.
+
+  Stacked results (Seestar `Stacked_*.fit`, DWARF `stacked-*.fits`, PixInsight
+  masters) keep the name they were given, and so do their previews.
+
+  Files filed by older versions are moved to this layout with one click (the app
+  offers it), or with `astrofiler migrate-layout`.
 
   A Seestar keeps each target in two folders on its drive: `M 2` (stacked results
   and previews) and `M 2_sub` (the sub-frames). Loading either one brings in the other.
@@ -119,7 +128,7 @@ astrofiler export ~/stack-me --session <session-id> --by-object
 astrofiler duplicates --remove
 astrofiler verify --hash
 astrofiler clean-previews /mnt/nas/astro --dry-run
-astrofiler migrate-seestar --dry-run     # preview moving Seestar files to the current layout
+astrofiler migrate-layout --dry-run      # list files an older version filed differently
 astrofiler stats
 astrofiler mapping add TELESCOP "S50_1a2b3c4d" "Seestar S50"
 astrofiler header some-file.fits
