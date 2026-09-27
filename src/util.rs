@@ -238,8 +238,17 @@ pub fn human_size(bytes: u64) -> String {
     format!("{v:.1} {}", UNITS[i])
 }
 
+/// Per-session info files kept alongside the frames (DWARF `shotsInfo.json`).
+pub fn is_sidecar(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("shotsInfo.json"))
+}
+
 /// File extensions the ingest pipeline understands.
 pub fn is_supported_file(path: &Path) -> bool {
+    if is_sidecar(path) {
+        return true;
+    }
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_lowercase())

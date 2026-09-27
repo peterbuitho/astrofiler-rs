@@ -81,7 +81,9 @@ impl Telescope for Dwarf {
         {
             let dpath = join(root, &dir.name);
             for f in t.list(&dpath)? {
-                if f.is_dir || !is_fits(&f.name) {
+                // shotsInfo.json: the session summary (target, exposure, frames, temperatures).
+                let info = crate::util::is_sidecar(std::path::Path::new(&f.name));
+                if f.is_dir || !(is_fits(&f.name) || info) {
                     continue;
                 }
                 // stacked-<n>_*.fits is the telescope's own live stack.
@@ -89,7 +91,13 @@ impl Telescope for Dwarf {
                 if stacked && !opts.include_stacked {
                     continue;
                 }
-                let kind = if stacked { "stacked" } else { "light" };
+                let kind = if info {
+                    "session info"
+                } else if stacked {
+                    "stacked"
+                } else {
+                    "light"
+                };
                 files.push(RemoteFile {
                     path: join(&dpath, &f.name),
                     name: f.name,

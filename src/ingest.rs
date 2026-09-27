@@ -59,6 +59,8 @@ pub struct IngestReport {
     pub skipped: usize,
     /// Files whose content is already in the catalogue (e.g. loaded before).
     pub already_catalogued: usize,
+    /// Session info files (e.g. DWARF shotsInfo.json) placed next to their frames.
+    pub sidecars: usize,
     pub duplicates: Vec<(PathBuf, String)>,
     pub errors: Vec<(PathBuf, String)>,
     pub new_ids: Vec<String>,
@@ -81,6 +83,9 @@ impl IngestReport {
             self.already_catalogued,
             self.duplicates.len() - self.already_catalogued,
         );
+        if self.sidecars > 0 {
+            out.push_str(&format!(", {} session info files", self.sidecars));
+        }
         if self.skipped > 0 {
             out.push_str(&format!(", {} skipped", self.skipped));
         }
@@ -157,6 +162,130 @@ pub fn ingest_folder(
     ingest_files(conn, cfg, files, opts, progress)
 }
 
+/// Put session info files (DWARF `shotsInfo.json`) next to the frames that
+/// came from the same folder, named after that folder so sessions filed into
+/// the same directory don't collide. Frames filed in an earlier run are found
+/// through their recorded original path.
+fn place_sidecars(
+    conn: &Connection,
+    sidecars: &[PathBuf],
+    opts: IngestOptions,
+    report: &mut IngestReport,
+) -> Result<()> {
+    if opts.placement == Placement::InPlace {
+        return Ok(()); // frames stay where they are, and so does their info file
+    }
+    for sidecar in sidecars {
+        let Some(src_dir) = sidecar.parent() else {
+            continue;
+        };
+        // Most common destination of this folder's light frames.
+        let mut counts: std::collections::HashMap<PathBuf, usize> =
+            std::collections::HashMap::new();
+        for (input, dest) in &report.placed {
+            if input.parent() == Some(src_dir)
+                && !dest.components().any(|c| c.as_os_str() == "Stacked")
+            {
+                if let Some(d) = dest.parent() {
+                    *counts.entry(d.to_path_buf()).or_default() += 1;
+                }
+            }
+        }
+        if counts.is_empty() {
+            let prefix = format!("{}/", util::normalize_path(src_dir));
+            let rows = db::files_where(
+                conn,
+                "substr(fitsFileOriginalFile, 1, length(?1)) = ?1 AND COALESCE(fitsFileStacked,0)=0",
+                &[&prefix],
+            )?;
+            for f in rows {
+                if let Some(d) = Path::new(&f.name).parent() {
+                    *counts.entry(d.to_path_buf()).or_default() += 1;
+                }
+            }
+        }
+        if counts.is_empty() {
+            // Frames catalogued without an original path (older runs, or a
+            // database from the Python app): match the session by target
+            // and start time instead.
+            if let Some((target, start, end)) = sidecar_session(sidecar) {
+                let rows = db::files_where(
+                    conn,
+                    "fitsFileObject = ?1 AND fitsFileDate >= ?2 AND fitsFileDate <= ?3 \
+                     AND COALESCE(fitsFileStacked,0)=0 AND COALESCE(fitsFileSoftDelete,0)=0",
+                    &[&target, &start, &end],
+                )?;
+                for f in rows {
+                    if let Some(d) = Path::new(&f.name).parent() {
+                        *counts.entry(d.to_path_buf()).or_default() += 1;
+                    }
+                }
+            }
+        }
+        let Some((dest_dir, _)) = counts.into_iter().max_by_key(|(_, n)| *n) else {
+            log::info!(
+                "{}: no frames from this folder were filed; left in place",
+                sidecar.display()
+            );
+            continue;
+        };
+        let folder = src_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let name = sidecar
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let target = dest_dir.join(if folder.is_empty() {
+            name
+        } else {
+            format!("{folder}_{name}")
+        });
+        let identical =
+            target.exists() && std::fs::read(&target).ok() == std::fs::read(sidecar).ok();
+        if !opts.dry_run && !identical {
+            let r = if opts.placement == Placement::Move {
+                util::move_file(sidecar, &target)
+            } else {
+                util::copy_file(sidecar, &target).map(|_| ())
+            };
+            if let Err(e) = r {
+                report
+                    .errors
+                    .push((sidecar.clone(), format!("placing session info: {e:#}")));
+                continue;
+            }
+        } else if !opts.dry_run && identical && opts.placement == Placement::Move {
+            std::fs::remove_file(sidecar).ok();
+        }
+        report.sidecars += 1;
+        report.placed.push((sidecar.clone(), target));
+    }
+    Ok(())
+}
+
+/// Target name and session time window for a DWARF `shotsInfo.json`: the
+/// target comes from the file, the start time from its folder name
+/// (`..._2026-09-26-23-37-24-900`). The window runs 18 hours from the start.
+fn sidecar_session(sidecar: &Path) -> Option<(String, String, String)> {
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(sidecar).ok()?).ok()?;
+    let target = json.get("target")?.as_str()?.trim().to_string();
+    let folder = sidecar.parent()?.file_name()?.to_string_lossy().to_string();
+    let start = folder.split('_').find_map(|t| {
+        t.get(..19)
+            .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d-%H-%M-%S").ok())
+    })?;
+    let end = start + chrono::Duration::hours(18);
+    let fmt = "%Y-%m-%dT%H:%M:%S";
+    Some((
+        target,
+        start.format(fmt).to_string(),
+        end.format(fmt).to_string(),
+    ))
+}
+
 /// Remove scratch folders left behind by an interrupted load (older than
 /// ten minutes, so a load running in another window is left alone).
 fn remove_stale_work_dirs(repo: &Path) {
@@ -219,6 +348,8 @@ pub fn ingest_files(
         dry_run: opts.dry_run,
         ..Default::default()
     };
+    let (sidecars, files): (Vec<PathBuf>, Vec<PathBuf>) =
+        files.into_iter().partition(|p| util::is_sidecar(p));
     let before = files.len();
     let files: Vec<PathBuf> = files
         .into_iter()
@@ -238,6 +369,7 @@ pub fn ingest_files(
         std::fs::remove_dir_all(&work).ok();
     }
     result?;
+    place_sidecars(conn, &sidecars, opts, &mut report)?;
     progress.update(total, total, "Done");
     log::info!("Ingest finished: {}", report.summary());
     Ok(report)
@@ -465,7 +597,7 @@ fn file_prepared(
                 }
                 dest
             };
-            let record = file_record(&header, &final_path, hash);
+            let record = file_record(&header, &final_path, hash, &staged.input);
             record.insert(conn)?;
             report.new_ids.push(record.id);
             report.placed.push((staged.input, final_path));
@@ -814,7 +946,7 @@ pub fn destination(h: &Header, repo: &Path) -> Result<(String, PathBuf)> {
     Ok((name, dir))
 }
 
-fn file_record(h: &Header, path: &Path, hash: String) -> FitsFile {
+fn file_record(h: &Header, path: &Path, hash: String, original: &Path) -> FitsFile {
     let imagetyp = val(h, "IMAGETYP", "").to_uppercase();
     let telescope = val(h, "TELESCOP", "Unknown");
     let instrument = val(h, "INSTRUME", "Unknown");
@@ -852,6 +984,7 @@ fn file_record(h: &Header, path: &Path, hash: String) -> FitsFile {
         calibrated: precalibrated,
         soft_delete: false,
         stacked: is_stacked(h),
+        original: Some(util::normalize_path(original)),
     }
 }
 
@@ -966,6 +1099,145 @@ pub(crate) mod tests {
         assert_eq!(dark.exptime.as_deref(), Some("300.0"));
         assert_eq!(dark.filter, None);
         assert_eq!(dark.image_type.as_deref(), Some("DARK FRAME"));
+    }
+
+    #[test]
+    fn shots_info_follows_its_frames() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = "DWARF_RAW_TELE_M 39_EXP_15_GAIN_60_2026-09-27-01-46-25-216";
+        let src = tmp.path().join("in").join(folder);
+        std::fs::create_dir_all(&src).unwrap();
+        make_frame(
+            &src,
+            "a.fits",
+            "Light",
+            Some("M 39"),
+            "2026-09-27T01:47:46",
+            15.0,
+            Some("Astro"),
+            1.0,
+        );
+        make_frame(
+            &src,
+            "b.fits",
+            "Light",
+            Some("M 39"),
+            "2026-09-27T01:48:01",
+            15.0,
+            Some("Astro"),
+            2.0,
+        );
+        let cfg = Config {
+            repo: tmp.path().join("repo"),
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        let src_root = tmp.path().join("in");
+
+        // First load: frames only (as if the json had been added later).
+        let r = ingest_folder(
+            &mut conn,
+            &cfg,
+            &src_root,
+            IngestOptions::COPY,
+            &crate::progress::NoProgress,
+        )
+        .unwrap();
+        assert_eq!((r.registered, r.sidecars), (2, 0));
+
+        // Second load finds the json and puts it beside the frames filed earlier.
+        std::fs::write(
+            src.join("shotsInfo.json"),
+            br#"{"target": "M 39", "shotsTaken": 204}"#,
+        )
+        .unwrap();
+        let r = ingest_folder(
+            &mut conn,
+            &cfg,
+            &src_root,
+            IngestOptions::COPY,
+            &crate::progress::NoProgress,
+        )
+        .unwrap();
+        assert_eq!(
+            (r.registered, r.sidecars, r.errors.len()),
+            (0, 1, 0),
+            "{r:?}"
+        );
+        let frame_dir = cfg.repo.join("Light/M_39/RedCat_51/ZWO_ASI2600MM/20260927");
+        let placed = frame_dir.join(format!("{folder}_shotsInfo.json"));
+        assert!(placed.exists(), "{placed:?}");
+        assert!(
+            src.join("shotsInfo.json").exists(),
+            "copy mode keeps the original"
+        );
+
+        // Running again doesn't create a second copy.
+        ingest_folder(
+            &mut conn,
+            &cfg,
+            &src_root,
+            IngestOptions::COPY,
+            &crate::progress::NoProgress,
+        )
+        .unwrap();
+        let jsons = std::fs::read_dir(&frame_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .count();
+        assert_eq!(jsons, 1);
+    }
+
+    #[test]
+    fn shots_info_found_by_target_and_time() {
+        // Frames catalogued without an original path (older runs, or the
+        // Python app's database) are matched by target and start time.
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = "DWARF_RAW_TELE_C 13_EXP_15_GAIN_60_2026-09-26-23-37-24-900";
+        let src = tmp.path().join("in").join(folder);
+        std::fs::create_dir_all(&src).unwrap();
+        make_frame(
+            &src,
+            "a.fits",
+            "Light",
+            Some("C 13"),
+            "2026-09-26T23:38:00",
+            15.0,
+            Some("Astro"),
+            1.0,
+        );
+        let cfg = Config {
+            repo: tmp.path().join("repo"),
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        ingest_folder(
+            &mut conn,
+            &cfg,
+            &tmp.path().join("in"),
+            IngestOptions::MOVE,
+            &crate::progress::NoProgress,
+        )
+        .unwrap();
+        conn.execute("UPDATE fitsFile SET fitsFileOriginalFile = NULL", [])
+            .unwrap();
+        std::fs::write(src.join("shotsInfo.json"), br#"{"target": "C 13"}"#).unwrap();
+        let r = ingest_folder(
+            &mut conn,
+            &cfg,
+            &tmp.path().join("in"),
+            IngestOptions::MOVE,
+            &crate::progress::NoProgress,
+        )
+        .unwrap();
+        assert_eq!(r.sidecars, 1, "{r:?}");
+        let placed = cfg
+            .repo
+            .join("Light/C_13/RedCat_51/ZWO_ASI2600MM/20260926")
+            .join(format!("{folder}_shotsInfo.json"));
+        assert!(placed.exists(), "{placed:?}");
+        assert!(!src.join("shotsInfo.json").exists(), "moved");
     }
 
     #[test]

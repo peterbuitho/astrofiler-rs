@@ -231,12 +231,14 @@ pub struct FitsFile {
     pub soft_delete: bool,
     /// A stacked result (e.g. Seestar `Stacked_*.fit`) rather than a sub-frame.
     pub stacked: bool,
+    /// Where the file was loaded from (used to place sidecars like shotsInfo.json).
+    pub original: Option<String>,
 }
 
 pub const FILE_SELECT: &str = "SELECT fitsFileId, fitsFileName, fitsFileDate, fitsFileType, fitsFileObject, \
     fitsFileExpTime, fitsFileXBinning, fitsFileYBinning, fitsFileCCDTemp, fitsFileTelescop, fitsFileInstrument, \
     fitsFileGain, fitsFileOffset, fitsFileFilter, fitsFileObserver, fitsFileNotes, fitsFileHash, fitsFileSession, \
-    COALESCE(fitsFileCalibrated,0), COALESCE(fitsFileSoftDelete,0), COALESCE(fitsFileStacked,0) FROM fitsFile";
+    COALESCE(fitsFileCalibrated,0), COALESCE(fitsFileSoftDelete,0), COALESCE(fitsFileStacked,0), fitsFileOriginalFile FROM fitsFile";
 
 /// Read a column that the Python app may have stored as TEXT, INTEGER or REAL.
 fn loose_text(row: &Row, idx: usize) -> rusqlite::Result<Option<String>> {
@@ -277,6 +279,7 @@ impl FitsFile {
             calibrated: loose_bool(r, 18)?,
             soft_delete: loose_bool(r, 19)?,
             stacked: loose_bool(r, 20)?,
+            original: loose_text(r, 21)?,
         })
     }
 
@@ -285,12 +288,12 @@ impl FitsFile {
             "INSERT INTO fitsFile (fitsFileId, fitsFileName, fitsFileDate, fitsFileType, fitsFileObject, \
              fitsFileExpTime, fitsFileXBinning, fitsFileYBinning, fitsFileCCDTemp, fitsFileTelescop, \
              fitsFileInstrument, fitsFileGain, fitsFileOffset, fitsFileFilter, fitsFileObserver, fitsFileNotes, \
-             fitsFileHash, fitsFileSession, fitsFileCalibrated, fitsFileSoftDelete, fitsFileStacked) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,0,?20)",
+             fitsFileHash, fitsFileSession, fitsFileCalibrated, fitsFileSoftDelete, fitsFileStacked, fitsFileOriginalFile) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,0,?20,?21)",
             params![
                 self.id, self.name, self.date, self.image_type, self.object, self.exptime, self.xbin, self.ybin,
                 self.ccd_temp, self.telescope, self.instrument, self.gain, self.offset, self.filter, self.observer,
-                self.notes, self.hash, self.session, self.calibrated as i64, self.stacked as i64
+                self.notes, self.hash, self.session, self.calibrated as i64, self.stacked as i64, self.original
             ],
         )?;
         Ok(())

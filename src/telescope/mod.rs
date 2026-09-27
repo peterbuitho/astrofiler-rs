@@ -535,8 +535,9 @@ mod tests {
         assert!(dwarf.detect_usb(&usb));
         let mut s = connect(&Config::default(), dwarf, &Link::Usb(usb)).unwrap();
         let files = s.scan(true).unwrap();
-        // 0001.fits, failed_0002.fits and the CALI_FRAME master; no previews.
-        assert_eq!(files.len(), 3);
+        // 0001.fits, failed_0002.fits, shotsInfo.json and the CALI_FRAME master; no previews.
+        assert_eq!(files.len(), 4);
+        assert!(files.iter().any(|f| f.kind == "session info"));
         let master = files.iter().find(|f| f.kind == "master").unwrap();
         assert_eq!(master.local_dir, "CALI_FRAME/dark/cam_0");
     }

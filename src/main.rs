@@ -428,11 +428,7 @@ fn run(cli: Cli) -> Result<()> {
             let mut session = telescope::connect(&cfg, scope, &link)?;
             let files = session.scan(cfg.include_stacked && !no_stacked)?;
             let size: u64 = files.iter().map(|f| f.size).sum();
-            println!(
-                "{} FITS files ({}) found",
-                files.len(),
-                util::human_size(size)
-            );
+            println!("{} files ({}) found", files.len(), util::human_size(size));
             if list {
                 for f in &files {
                     println!("  [{}] {} ({})", f.kind, f.path, util::human_size(f.size));

@@ -133,7 +133,9 @@ folder; override it with the `database` key, `--db` or `$ASTROFILER_DB_PATH`.
 
 Header fixes are applied automatically: the Seestar target and mosaic flag are
 taken from the folder name, and DWARF files (which have no `IMAGETYP`) get their
-frame type, camera (TELE/WIDE) and temperature filled in. Frames DWARF marked
+frame type, camera (TELE/WIDE) and temperature filled in. DWARF's `shotsInfo.json` session summary is
+kept too: it is filed next to that session's frames as
+`<original folder name>_shotsInfo.json`. Frames DWARF marked
 `failed_*` are imported too, so you can decide for yourself whether to use them.
 
 If a telescope connects over USB as a *media device* (MTP) instead of a drive, it

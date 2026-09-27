@@ -899,7 +899,7 @@ impl App {
     fn telescopes_tab(&mut self, ui: &mut egui::Ui) {
         let scopes = telescope::all();
         ui.heading("Import from a smart telescope");
-        ui.label("Only FITS files are transferred — the telescope's JPG/PNG previews and thumbnails are skipped.");
+        ui.label("FITS files and DWARF session info (shotsInfo.json) are transferred — the telescope's JPG/PNG previews and thumbnails are skipped.");
         ui.add_space(6.0);
 
         let found = self.scope.found.lock().unwrap().clone();
@@ -1027,7 +1027,7 @@ impl App {
                     let n = files.len();
                     let size: u64 = files.iter().map(|f| f.size).sum();
                     *slot.lock().unwrap() = files;
-                    Ok(format!("{n} FITS files ({})", util::human_size(size)))
+                    Ok(format!("{n} files ({})", util::human_size(size)))
                 });
             }
         });
