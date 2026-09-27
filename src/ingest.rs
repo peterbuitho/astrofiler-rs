@@ -75,6 +75,10 @@ pub struct IngestOptions {
     /// Work out where everything would go without touching files or catalogue.
     pub dry_run: bool,
     pub on_conflict: OnConflict,
+    /// Skip the checksum of files that are only renamed into place (a Move
+    /// within one drive or share), so nothing but their header is read. The
+    /// checksums are filled in later by [`crate::batch::fill_checksums`].
+    pub quick: bool,
 }
 
 impl IngestOptions {
@@ -82,17 +86,24 @@ impl IngestOptions {
         placement: Placement::Move,
         dry_run: false,
         on_conflict: OnConflict::Skip,
+        quick: false,
     };
     pub const COPY: Self = IngestOptions {
         placement: Placement::Copy,
         dry_run: false,
         on_conflict: OnConflict::Skip,
+        quick: false,
     };
     pub const IN_PLACE: Self = IngestOptions {
         placement: Placement::InPlace,
         dry_run: false,
         on_conflict: OnConflict::Skip,
+        quick: false,
     };
+
+    pub fn quick(self, quick: bool) -> Self {
+        IngestOptions { quick, ..self }
+    }
 
     pub fn with_conflict(self, on_conflict: OnConflict) -> Self {
         IngestOptions {
@@ -120,6 +131,8 @@ pub struct IngestReport {
     pub overwritten: usize,
     /// Empty or partly written files (from an interrupted copy) replaced.
     pub repaired: usize,
+    /// Files filed without a checksum (quick move); fill them in afterwards.
+    pub unhashed: usize,
     pub errors: Vec<(PathBuf, String)>,
     pub new_ids: Vec<String>,
     /// Input path -> final (or, in a dry run, planned) path of each filed file.
@@ -164,6 +177,17 @@ impl IngestReport {
             out.push_str(&format!(
                 ", {} empty/incomplete files {would}replaced",
                 self.repaired
+            ));
+        }
+        if self.unhashed > 0 {
+            out.push_str(&format!(
+                ", {} checksums {}to fill in",
+                self.unhashed,
+                if self.dry_run {
+                    "would be left "
+                } else {
+                    "left "
+                }
             ));
         }
         out.push_str(&format!(", {} errors", self.errors.len()));
@@ -508,7 +532,8 @@ enum Prepared {
         header: Header,
         new_name: String,
         dest_dir: PathBuf,
-        hash: String,
+        /// None when skipped for a quick move.
+        hash: Option<String>,
         rewrite: bool,
     },
     Master {
@@ -624,7 +649,7 @@ fn ingest_inner(
         let prepared: Vec<(PathBuf, Result<Prepared>)> = pool.install(|| {
             staged
                 .into_par_iter()
-                .map(|st| (st.input.clone(), prepare(st, cfg, &mappings)))
+                .map(|st| (st.input.clone(), prepare(st, cfg, opts, &mappings)))
                 .collect()
         });
 
@@ -705,26 +730,36 @@ fn file_prepared(
             hash,
             rewrite,
         } => {
-            if let Some(existing) = db::hash_exists(conn, &hash)? {
-                // Already catalogued. When syncing in place this is the same file.
-                if !paths_equal(Path::new(&existing), &staged.path) {
-                    report.already_catalogued += 1;
-                    report.duplicates.push((staged.input, existing));
+            let target = dest_dir.join(&new_name);
+            // A skipped checksum is needed after all when the name is taken:
+            // that is how a file loaded before is recognised.
+            let hash = match hash {
+                None if target.exists() || state.planned.contains(&target) => {
+                    Some(util::sha256_file(&staged.path)?)
                 }
-                return Ok(());
-            }
-            if !state.seen.insert(hash.clone()) {
-                report
-                    .duplicates
-                    .push((staged.input, "another file in this batch".into()));
-                return Ok(());
+                h => h,
+            };
+            if let Some(hash) = &hash {
+                if let Some(existing) = db::hash_exists(conn, hash)? {
+                    // Already catalogued. When syncing in place this is the same file.
+                    if !paths_equal(Path::new(&existing), &staged.path) {
+                        report.already_catalogued += 1;
+                        report.duplicates.push((staged.input, existing));
+                    }
+                    return Ok(());
+                }
+                if !state.seen.insert(hash.clone()) {
+                    report
+                        .duplicates
+                        .push((staged.input, "another file in this batch".into()));
+                    return Ok(());
+                }
             }
             let placement = if staged.temp && opts.placement == Placement::Copy {
                 Placement::Move
             } else {
                 opts.placement
             };
-            let target = dest_dir.join(&new_name);
             let existing = if placement == Placement::InPlace || target == staged.path {
                 Existing::Free
             } else if state.planned.contains(&target) {
@@ -732,8 +767,31 @@ fn file_prepared(
                 // the same name are both new data, so always keep both.
                 Existing::Different
             } else {
-                existing_file(&target, &staged.path, &hash)
+                existing_file(&target, &staged.path, hash.as_deref().unwrap_or_default())
             };
+            if existing == Existing::Identical && !opts.dry_run {
+                // The same file, catalogued by a quick move whose checksum
+                // isn't filled in yet: it is already catalogued, not a
+                // leftover to adopt. Record the checksum while we have it.
+                let name = util::normalize_path(&target);
+                let updated = conn.execute(
+                    "UPDATE fitsFile SET fitsFileHash=?1 WHERE fitsFileName=?2 AND fitsFileHash IS NULL",
+                    rusqlite::params![hash, name],
+                )?;
+                let known: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM fitsFile WHERE fitsFileName=?1)",
+                    [&name],
+                    |r| r.get(0),
+                )?;
+                if updated > 0 || known {
+                    if staged.temp {
+                        std::fs::remove_file(&staged.path).ok();
+                    }
+                    report.already_catalogued += 1;
+                    report.duplicates.push((staged.input, name));
+                    return Ok(());
+                }
+            }
             let action = match existing {
                 Existing::Free => Action::Place,
                 // A previous, interrupted run already put this exact file in place.
@@ -834,6 +892,9 @@ fn file_prepared(
                 dest
             };
             state.planned.insert(final_path.clone());
+            if hash.is_none() {
+                report.unhashed += 1;
+            }
             let record = file_record(&header, &final_path, hash, &staged.input);
             record.insert(conn)?;
             report.new_ids.push(record.id);
@@ -1009,7 +1070,12 @@ fn is_master_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn prepare(st: Staged, cfg: &Config, mappings: &[Mapping]) -> Result<Prepared> {
+fn prepare(
+    st: Staged,
+    cfg: &Config,
+    opts: IngestOptions,
+    mappings: &[Mapping],
+) -> Result<Prepared> {
     let mut header = fits::read_primary_header(&st.path)?;
     let imagetyp = header
         .get_str("IMAGETYP")
@@ -1036,10 +1102,17 @@ fn prepare(st: Staged, cfg: &Config, mappings: &[Mapping]) -> Result<Prepared> {
     let rewrite = modified && cfg.save_modified_headers && !fits::is_gzip(&st.path);
     // The stored hash is of the file as it will be written, so re-loading the
     // same original later is still recognised as a duplicate.
-    let hash = if rewrite {
-        fits::sha256_with_header(&st.path, &header)?
+    // A quick move renames files without reading them; their checksums are
+    // filled in afterwards. Anything that has to be copied is read anyway.
+    let renamed = (opts.placement == Placement::Move || st.temp)
+        && !opts.dry_run
+        && util::same_filesystem(&st.path, &cfg.repo);
+    let hash = if opts.quick && renamed && !rewrite {
+        None
+    } else if rewrite {
+        Some(fits::sha256_with_header(&st.path, &header)?)
     } else {
-        util::sha256_file(&st.path)?
+        Some(util::sha256_file(&st.path)?)
     };
     Ok(Prepared::Frame {
         staged: st,
@@ -1284,7 +1357,7 @@ pub fn destination(h: &Header, cfg: &Config) -> Result<(String, PathBuf)> {
     Ok((name, dir))
 }
 
-fn file_record(h: &Header, path: &Path, hash: String, original: &Path) -> FitsFile {
+fn file_record(h: &Header, path: &Path, hash: Option<String>, original: &Path) -> FitsFile {
     let imagetyp = val(h, "IMAGETYP", "").to_uppercase();
     let telescope = val(h, "TELESCOP", "Unknown");
     let instrument = val(h, "INSTRUME", "Unknown");
@@ -1317,7 +1390,7 @@ fn file_record(h: &Header, path: &Path, hash: String, original: &Path) -> FitsFi
         },
         observer: h.get_truthy("OBSERVER"),
         notes: None,
-        hash: Some(hash),
+        hash,
         session: None,
         calibrated: precalibrated,
         soft_delete: false,
@@ -1435,6 +1508,72 @@ pub(crate) mod tests {
         assert!(repo
             .join("Stacked/M_2/Seestar_S50/Stacked_2_M 2_10.0s_IRCUT_20240801-221000.fit")
             .exists());
+    }
+
+    #[test]
+    fn quick_move_fills_checksums_later() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("archive");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&src).unwrap();
+        let frame = |dir: &Path, name: &str, t: &str, seed: f32| {
+            make_frame(
+                dir,
+                name,
+                "Light",
+                Some("M 2"),
+                t,
+                10.0,
+                Some("IRCUT"),
+                seed,
+            )
+        };
+        frame(&src, "a.fits", "2024-08-01T22:00:00", 1.0);
+        let b = frame(&src, "b.fits", "2024-08-01T22:00:10", 2.0);
+        let b_copy = std::fs::read(&b).unwrap();
+        let cfg = Config {
+            repo: repo.clone(),
+            source: src.clone(),
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        let quick = IngestOptions::MOVE.quick(true);
+        let r = ingest_folder(&mut conn, &cfg, &src, quick, &NoProgress).unwrap();
+        assert_eq!((r.registered, r.unhashed), (2, 2), "{r:?}");
+        let files = db::all_files(&conn, false).unwrap();
+        assert!(files
+            .iter()
+            .all(|f| f.hash.is_none() && Path::new(&f.name).exists()));
+
+        // The same frame again, before the checksums are filled in: it is
+        // recognised by its name and content, not catalogued twice.
+        std::fs::write(src.join("b-again.fits"), &b_copy).unwrap();
+        let r = ingest_folder(&mut conn, &cfg, &src, quick, &NoProgress).unwrap();
+        assert_eq!((r.registered, r.already_catalogued), (0, 1), "{r:?}");
+        assert_eq!(db::all_files(&conn, false).unwrap().len(), 2);
+
+        let f = crate::batch::fill_checksums(&mut conn, &NoProgress).unwrap();
+        assert_eq!((f.filled, f.duplicates, f.errors.len()), (1, 0, 0), "{f:?}");
+        for file in db::all_files(&conn, false).unwrap() {
+            assert_eq!(
+                file.hash.as_deref(),
+                Some(util::sha256_file(Path::new(&file.name)).unwrap().as_str())
+            );
+        }
+
+        // Copies are read anyway, so they always get a checksum.
+        let src2 = tmp.path().join("more");
+        std::fs::create_dir_all(&src2).unwrap();
+        frame(&src2, "c.fits", "2024-08-01T22:00:20", 3.0);
+        let r = ingest_folder(
+            &mut conn,
+            &cfg,
+            &src2,
+            IngestOptions::COPY.quick(true),
+            &NoProgress,
+        )
+        .unwrap();
+        assert_eq!((r.registered, r.unhashed), (1, 0), "{r:?}");
     }
 
     #[test]

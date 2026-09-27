@@ -473,6 +473,92 @@ pub fn export_files(
 }
 
 #[derive(Debug, Default)]
+pub struct FillReport {
+    pub filled: usize,
+    /// Files that turned out to be copies of other catalogued files.
+    pub duplicates: usize,
+    pub errors: Vec<(String, String)>,
+}
+
+impl FillReport {
+    pub fn summary(&self) -> String {
+        let mut s = format!("{} checksums filled in", self.filled);
+        if self.duplicates > 0 {
+            s.push_str(&format!(
+                ", {} files are copies of others (see Duplicates)",
+                self.duplicates
+            ));
+        }
+        if !self.errors.is_empty() {
+            s.push_str(&format!(
+                ", {} could not be read (see Log)",
+                self.errors.len()
+            ));
+        }
+        s
+    }
+}
+
+/// Compute the checksums a quick move skipped. Until then those files
+/// can't be recognised as duplicates, so any copies found are reported.
+pub fn fill_checksums(conn: &mut Connection, progress: &dyn Progress) -> Result<FillReport> {
+    let files = db::files_where(
+        conn,
+        "fitsFileHash IS NULL AND COALESCE(fitsFileSoftDelete,0)=0",
+        &[],
+    )?;
+    let done = AtomicUsize::new(0);
+    let total = files.len();
+    let first = files
+        .first()
+        .map(|f| PathBuf::from(&f.name))
+        .unwrap_or_default();
+    let hashes: Vec<(&FitsFile, Option<Result<String>>)> = util::with_io_pool(&[&first], || {
+        files
+            .par_iter()
+            .map(|f| {
+                if progress.cancelled() {
+                    return (f, None);
+                }
+                let h = util::sha256_file(Path::new(&f.name));
+                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                progress.update(d, total, "Filling in checksums");
+                (f, Some(h))
+            })
+            .collect()
+    });
+    let mut r = FillReport::default();
+    let tx = conn.transaction()?;
+    for (f, h) in hashes {
+        match h {
+            Some(Ok(h)) => {
+                tx.execute(
+                    "UPDATE fitsFile SET fitsFileHash=?1 WHERE fitsFileId=?2",
+                    params![h, f.id],
+                )?;
+                let copies: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM fitsFile WHERE fitsFileHash=?1 \
+                     AND COALESCE(fitsFileSoftDelete,0)=0",
+                    [&h],
+                    |row| row.get(0),
+                )?;
+                if copies > 1 {
+                    r.duplicates += 1;
+                }
+                r.filled += 1;
+            }
+            Some(Err(e)) => {
+                log::warn!("{}: {e:#}", f.name);
+                r.errors.push((f.name.clone(), format!("{e:#}")));
+            }
+            None => {}
+        }
+    }
+    tx.commit()?;
+    Ok(r)
+}
+
+#[derive(Debug, Default)]
 pub struct VerifyReport {
     pub checked: usize,
     pub missing: Vec<FitsFile>,

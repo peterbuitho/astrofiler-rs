@@ -54,7 +54,13 @@ enum Cmd {
         /// Empty or partly copied files are always replaced.
         #[arg(long, value_parser = parse_conflict)]
         on_conflict: Option<ingest::OnConflict>,
+        /// With a move: skip checksums of files that are only renamed (within
+        /// one drive or NAS share); fill them in later with `checksums`
+        #[arg(long)]
+        quick: bool,
     },
+    /// Fill in checksums skipped by `load --quick`
+    Checksums,
     /// Catalogue files already in the repository without moving them
     Sync,
     /// Rebuild the catalogue from scratch by rescanning the repository
@@ -361,6 +367,7 @@ fn run(cli: Cli) -> Result<()> {
             dry_run,
             plan,
             on_conflict,
+            quick,
         } => {
             let src = source.unwrap_or_else(|| cfg.source.clone());
             let placement = if no_move {
@@ -379,6 +386,7 @@ fn run(cli: Cli) -> Result<()> {
                     placement,
                     dry_run,
                     on_conflict: on_conflict.unwrap_or(cfg.on_conflict),
+                    quick,
                 },
                 &bar,
             )?;
@@ -400,6 +408,14 @@ fn run(cli: Cli) -> Result<()> {
             }
             print_ingest(&r);
             println!("done in {:.1}s", t.elapsed().as_secs_f64());
+            if r.unhashed > 0 && !dry_run {
+                println!("run `astrofiler checksums` to fill in the skipped checksums");
+            }
+        }
+        Cmd::Checksums => {
+            let r = batch::fill_checksums(&mut conn, &bar)?;
+            bar.finish();
+            println!("{}", r.summary());
         }
         Cmd::Sync => {
             let r = ingest::ingest_folder(

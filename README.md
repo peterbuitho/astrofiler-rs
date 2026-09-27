@@ -40,6 +40,12 @@ and a command-line tool. No Python, no C libraries to install.
   A Seestar keeps each target in two folders on its drive: `M 2` (stacked results
   and previews) and `M 2_sub` (the sub-frames). Loading either one brings in the other.
 
+  Reorganising files that are already on the NAS is quickest with **Move** and
+  **Quick move**: files are renamed on the NAS rather than copied (like moving
+  them in the NAS's web interface), and only their headers are read. Their
+  checksums, used to spot duplicates, are filled in by a background task
+  afterwards (`astrofiler load --quick`, then `astrofiler checksums`).
+
   You choose to **move**, **copy** (originals untouched) or **catalogue in place**,
   and a **dry run** shows exactly where every file would go first.
   If a different file already has the same name in the repository, you choose to

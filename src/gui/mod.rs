@@ -140,6 +140,8 @@ struct LoadDialog {
     placement: Placement,
     dry_run: bool,
     on_conflict: OnConflict,
+    /// Skip checksums of files that are only renamed; fill them in afterwards.
+    quick: bool,
 }
 
 struct ScopeUi {
@@ -249,6 +251,7 @@ impl App {
                 placement: Placement::Copy,
                 dry_run: false,
                 on_conflict: cfg.on_conflict,
+                quick: true,
             },
             preview_for: None,
             preview_tex: None,
@@ -2289,6 +2292,20 @@ impl App {
                         Placement::Move,
                         "Move into the repository (rename & organise)",
                     );
+                    if self.load.placement == Placement::Move {
+                        ui.indent("quick", |ui| {
+                            ui.checkbox(
+                                &mut self.load.quick,
+                                "Quick move: fill in checksums afterwards",
+                            )
+                            .on_hover_text(
+                                "Files moved within one drive or NAS share are just renamed, \
+                                 like moving them in the NAS's web interface. Their checksums \
+                                 (used to spot duplicates) are filled in by a background task \
+                                 right after the load.",
+                            );
+                        });
+                    }
                     ui.radio_value(
                         &mut self.load.placement,
                         Placement::InPlace,
@@ -2314,6 +2331,7 @@ impl App {
                             placement: self.load.placement,
                             dry_run: self.load.dry_run,
                             on_conflict: self.load.on_conflict,
+                            quick: self.load.quick && self.load.placement == Placement::Move,
                         };
                         self.submit(
                             if opts.dry_run { "Dry run" } else { "Load" },
@@ -2338,6 +2356,15 @@ impl App {
                                 Ok(r.summary())
                             }),
                         );
+                        if opts.quick && !opts.dry_run {
+                            // Queued behind the load; does nothing if every
+                            // file had to be read anyway.
+                            self.submit(
+                                "Fill checksums",
+                                true,
+                                Box::new(|conn, _, p| Ok(batch::fill_checksums(conn, p)?.summary())),
+                            );
+                        }
                         self.load.open = false;
                     }
                 });

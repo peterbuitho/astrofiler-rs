@@ -123,6 +123,27 @@ fn gvfs_to_mount(path: &Path, mounts: &str) -> Option<PathBuf> {
     None
 }
 
+/// Whether `a` and `b` are on the same filesystem, so a file can be renamed
+/// from one to the other. `b` may not exist yet (its nearest existing folder
+/// counts). Unknown means no.
+pub fn same_filesystem(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let dev = |p: &Path| {
+            p.ancestors()
+                .find_map(|q| std::fs::metadata(q).ok())
+                .map(|m| m.dev())
+        };
+        matches!((dev(a), dev(b)), (Some(x), Some(y)) if x == y)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a, b);
+        false
+    }
+}
+
 /// Whether `path` is on a network filesystem (SMB, NFS, GVFS, sshfs...).
 pub fn is_network_path(path: &Path) -> bool {
     #[cfg(target_os = "linux")]
