@@ -16,7 +16,7 @@ use crate::{logging, masters, sessions};
 use anyhow::Result;
 use eframe::egui::{self, Align2, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc, Mutex};
@@ -95,6 +95,17 @@ enum SortKey {
 struct Job {
     name: String,
     state: Arc<JobState>,
+    /// Changes the catalogue. Only one such task runs at a time (SQLite has a
+    /// single writer); read-only tasks run alongside it.
+    writes: bool,
+}
+
+type Work = Box<dyn FnOnce(&mut rusqlite::Connection, &Config, &JobState) -> Result<String> + Send>;
+
+/// A catalogue-changing task waiting for the running one to finish.
+struct Queued {
+    name: String,
+    work: Work,
 }
 
 /// Something the user must confirm before it happens.
@@ -147,7 +158,8 @@ pub struct App {
     db_path: PathBuf,
     tab: Tab,
     status: String,
-    job: Option<Job>,
+    jobs: Vec<Job>,
+    queued: VecDeque<Queued>,
     confirm: Option<Confirm>,
 
     files: Vec<FitsFile>,
@@ -202,7 +214,8 @@ impl App {
             db_path,
             tab: Tab::Images,
             status: String::new(),
-            job: None,
+            jobs: Vec::new(),
+            queued: VecDeque::new(),
             confirm: None,
             files: vec![],
             filtered: vec![],
@@ -294,15 +307,44 @@ impl App {
         *self.stats.lock().unwrap() = None;
     }
 
-    /// Run `work` on a background thread with its own DB connection.
+    /// Run a task that changes the catalogue on a background thread with its
+    /// own DB connection. It waits in a queue while another such task runs.
     fn spawn<F>(&mut self, name: &str, work: F)
     where
         F: FnOnce(&mut rusqlite::Connection, &Config, &JobState) -> Result<String> + Send + 'static,
     {
-        if self.job.is_some() {
-            self.status = "Another task is still running".into();
+        self.submit(name, true, Box::new(work));
+    }
+
+    /// Run a task that only reads the catalogue; it starts straight away.
+    fn spawn_read<F>(&mut self, name: &str, work: F)
+    where
+        F: FnOnce(&mut rusqlite::Connection, &Config, &JobState) -> Result<String> + Send + 'static,
+    {
+        self.submit(name, false, Box::new(work));
+    }
+
+    fn submit(&mut self, name: &str, writes: bool, work: Work) {
+        if self.job_active(name) {
+            self.status = format!("{name} is already running");
             return;
         }
+        if writes && self.jobs.iter().any(|j| j.writes) {
+            self.status = format!("{name} will start when the current task finishes");
+            self.queued.push_back(Queued {
+                name: name.to_string(),
+                work,
+            });
+            return;
+        }
+        self.start(name, writes, work);
+    }
+
+    fn job_active(&self, name: &str) -> bool {
+        self.jobs.iter().any(|j| j.name == name) || self.queued.iter().any(|q| q.name == name)
+    }
+
+    fn start(&mut self, name: &str, writes: bool, work: Work) {
         let state = Arc::new(JobState::default());
         let st = state.clone();
         let cfg = self.cfg.clone();
@@ -325,44 +367,58 @@ impl App {
             }
             st.finish(r.map_err(|e| format!("{e:#}")));
         });
-        self.job = Some(Job {
+        self.jobs.push(Job {
             name: name.to_string(),
             state,
+            writes,
         });
     }
 
-    fn poll_job(&mut self, ctx: &egui::Context) {
-        let Some(job) = &self.job else { return };
-        if job.state.done.load(Ordering::SeqCst) {
+    fn poll_jobs(&mut self, ctx: &egui::Context) {
+        let (finished, running): (Vec<Job>, Vec<Job>) = std::mem::take(&mut self.jobs)
+            .into_iter()
+            .partition(|j| j.state.done.load(Ordering::SeqCst));
+        self.jobs = running;
+        let mut reload = false;
+        for job in finished {
             let result = job.state.result.lock().unwrap().take();
             self.status = match result {
                 Some(Ok(msg)) => format!("{}: {msg}", job.name),
                 Some(Err(e)) => format!("{} failed: {e}", job.name),
                 None => String::new(),
             };
-            let was_stats = job.name == "Statistics";
-            self.job = None;
             // Stats jobs only read; reloading would clear the result and loop.
-            if !was_stats {
-                self.reload();
-            }
-            if self.tab == Tab::Telescopes {
+            reload |= job.name != "Statistics";
+            if job.name == "Scanning telescope" {
                 let n = self.scope.files.lock().unwrap().len();
                 self.scope.selected = vec![true; n];
             }
-        } else {
-            // Loads commit in batches, so show new files as they arrive.
-            if self.last_refresh.elapsed() > Duration::from_secs(3) && job.name != "Statistics" {
-                self.last_refresh = std::time::Instant::now();
-                if let Ok(files) = self.conn().and_then(|c| db::all_files(&c, false)) {
-                    if files.len() != self.files.len() {
-                        self.files = files;
-                        self.filter_key.4 = usize::MAX;
-                    }
+        }
+        if reload {
+            self.reload();
+        }
+        if !self.jobs.iter().any(|j| j.writes) {
+            if let Some(q) = self.queued.pop_front() {
+                self.start(&q.name, true, q.work);
+            }
+        }
+        if self.jobs.is_empty() {
+            return;
+        }
+        // Loads commit in batches, so show new files as they arrive.
+        if self.jobs.iter().any(|j| j.writes)
+            && self.last_refresh.elapsed() > Duration::from_secs(3)
+        {
+            self.last_refresh = std::time::Instant::now();
+            if let Ok(files) = self.conn().and_then(|c| db::all_files(&c, false)) {
+                if files.len() != self.files.len() {
+                    self.files = files;
+                    self.filter_key.4 = usize::MAX;
+                    *self.stats.lock().unwrap() = None;
                 }
             }
-            ctx.request_repaint_after(Duration::from_millis(100));
         }
+        ctx.request_repaint_after(Duration::from_millis(100));
     }
 
     fn refilter(&mut self) {
@@ -532,10 +588,12 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_job(ctx);
+        self.poll_jobs(ctx);
         self.poll_preview(ctx);
         self.apply_ui_scale(ctx);
-        if ctx.input(|i| i.viewport().close_requested()) && self.job.is_some() && !self.allow_close
+        if ctx.input(|i| i.viewport().close_requested())
+            && !(self.jobs.is_empty() && self.queued.is_empty())
+            && !self.allow_close
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm = Some(Confirm::QuitDuringJob);
@@ -556,8 +614,10 @@ impl eframe::App for App {
         });
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if let Some(job) = &self.job {
+            let mut unqueue = None;
+            for (i, job) in self.jobs.iter().enumerate() {
+                let last = i + 1 == self.jobs.len();
+                ui.horizontal(|ui| {
                     let (done, total, msg) = job.state.snapshot();
                     ui.spinner();
                     ui.label(RichText::new(&job.name).strong());
@@ -579,18 +639,32 @@ impl eframe::App for App {
                     if ui.button("Cancel").clicked() {
                         job.state.cancel.store(true, Ordering::SeqCst);
                     }
-                } else {
-                    ui.label(&self.status);
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(format!(
-                        "{} files · {} sessions · {} masters",
-                        self.files.len(),
-                        self.sessions.len(),
-                        self.masters.len()
-                    ));
+                    if last && self.queued.is_empty() {
+                        self.status_counts(ui);
+                    }
                 });
-            });
+            }
+            if !self.queued.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.label("Waiting:");
+                    for (i, q) in self.queued.iter().enumerate() {
+                        ui.label(&q.name);
+                        if ui.small_button("✖").on_hover_text("Don't run").clicked() {
+                            unqueue = Some(i);
+                        }
+                    }
+                    self.status_counts(ui);
+                });
+            }
+            if let Some(i) = unqueue {
+                self.queued.remove(i);
+            }
+            if self.jobs.is_empty() && self.queued.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.label(&self.status);
+                    self.status_counts(ui);
+                });
+            }
         });
 
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
@@ -678,7 +752,7 @@ impl App {
                         } else {
                             ExportLayout::Flat
                         };
-                        self.spawn("Export", move |conn, _, p| {
+                        self.spawn_read("Export", move |conn, _, p| {
                             Ok(format!(
                                 "{} files exported",
                                 batch::export_files(conn, &ids, Path::new(&dir), layout, false, p)?
@@ -931,7 +1005,7 @@ impl App {
             }
             if ui.button("📡 Scan Wi-Fi").clicked() {
                 let slot = self.scope.found.clone();
-                self.spawn("Network scan", move |_, cfg, p| {
+                self.spawn_read("Network scan", move |_, cfg, p| {
                     let mut all = telescope::find_usb();
                     for t in telescope::all() {
                         all.extend(telescope::find_network(cfg, *t, p));
@@ -1022,7 +1096,7 @@ impl App {
                 let slot = self.scope.files.clone();
                 let link = link.clone();
                 let stacked = self.scope.include_stacked;
-                self.spawn("Scanning telescope", move |_, cfg, p| {
+                self.spawn_read("Scanning telescope", move |_, cfg, p| {
                     p.update(0, 0, &format!("Connecting to {} ({link})…", t.name()));
                     let mut s = telescope::connect(cfg, t, &link)?;
                     let files = s.scan(stacked)?;
@@ -1188,7 +1262,7 @@ impl App {
                         {
                             let ids: Vec<String> =
                                 self.session_files.iter().map(|f| f.id.clone()).collect();
-                            self.spawn("Export session", move |conn, _, p| {
+                            self.spawn_read("Export session", move |conn, _, p| {
                                 Ok(format!(
                                     "{} files exported",
                                     batch::export_files(
@@ -1504,7 +1578,7 @@ impl App {
                 .on_hover_text("Check every catalogued file still exists")
                 .clicked()
             {
-                self.spawn("Verify", |conn, _, p| {
+                self.spawn_read("Verify", |conn, _, p| {
                     let r = batch::verify(conn, false, p)?;
                     Ok(format!(
                         "{} checked, {} missing",
@@ -1518,7 +1592,7 @@ impl App {
                 .on_hover_text("Re-hash every file (slower)")
                 .clicked()
             {
-                self.spawn("Verify checksums", |conn, _, p| {
+                self.spawn_read("Verify checksums", |conn, _, p| {
                     let r = batch::verify(conn, true, p)?;
                     for f in &r.mismatched {
                         log::warn!("changed: {}", f.name);
@@ -1588,7 +1662,7 @@ impl App {
                 .clicked()
             {
                 let dir = self.clean_dir.clone();
-                self.spawn("Clean previews", move |_, _, _| {
+                self.spawn_read("Clean previews", move |_, _, _| {
                     let (f, b) = batch::clean_previews(Path::new(&dir), false)?;
                     Ok(format!(
                         "{} files deleted, {} freed",
@@ -1695,12 +1769,23 @@ impl App {
 
     // ------------------------------------------------------------ Stats
 
+    fn status_counts(&self, ui: &mut egui::Ui) {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(format!(
+                "{} files · {} sessions · {} masters",
+                self.files.len(),
+                self.sessions.len(),
+                self.masters.len()
+            ));
+        });
+    }
+
     fn stats_tab(&mut self, ui: &mut egui::Ui) {
         let snapshot = self.stats.lock().unwrap().clone();
         let Some(s) = snapshot else {
-            if self.job.is_none() {
+            if !self.job_active("Statistics") {
                 let slot = self.stats.clone();
-                self.spawn("Statistics", move |conn, _, _| {
+                self.spawn_read("Statistics", move |conn, _, _| {
                     *slot.lock().unwrap() = Some(stats::compute(conn)?);
                     Ok("updated".into())
                 });
@@ -1990,9 +2075,10 @@ impl App {
                             dry_run: self.load.dry_run,
                             on_conflict: self.load.on_conflict,
                         };
-                        self.spawn(
+                        self.submit(
                             if opts.dry_run { "Dry run" } else { "Load" },
-                            move |conn, cfg, p| {
+                            !opts.dry_run,
+                            Box::new(move |conn, cfg, p| {
                                 let r = ingest::ingest_folder(conn, cfg, &src, opts, p)?;
                                 if opts.dry_run {
                                     for (a, b) in &r.placed {
@@ -2010,7 +2096,7 @@ impl App {
                                     );
                                 }
                                 Ok(r.summary())
-                            },
+                            }),
                         );
                         self.load.open = false;
                     }
@@ -2136,7 +2222,8 @@ impl App {
                     }
                     Confirm::ImportWithDelete => self.start_import(true),
                     Confirm::QuitDuringJob => {
-                        if let Some(job) = &self.job {
+                        self.queued.clear();
+                        for job in &self.jobs {
                             job.state.cancel.store(true, Ordering::SeqCst);
                         }
                         self.allow_close = true;
