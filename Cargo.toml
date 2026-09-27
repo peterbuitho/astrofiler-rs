@@ -1,0 +1,61 @@
+[package]
+name = "astrofiler"
+version = "0.1.0"
+edition = "2021"
+description = "Fast astronomical FITS image filing, cataloguing and calibration (Rust port of AstroFiler)"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/peterbuitho/astrofiler-rs"
+readme = "README.md"
+keywords = ["astronomy", "fits", "astrophotography", "calibration"]
+categories = ["science", "command-line-utilities"]
+
+[features]
+default = ["gui"]
+gui = ["dep:eframe", "dep:egui_extras", "dep:rfd"]
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = "0.4"
+clap = { version = "4.5", features = ["derive"] }
+dirs = "5"
+dns-lookup = "2"
+flate2 = "1"
+indicatif = "0.17"
+log = { version = "0.4", features = ["std"] }
+lz4_flex = "0.11"
+md-5 = "0.10"
+smb2 = "0.26"
+tokio = { version = "1", features = ["rt", "net", "time", "io-util"] }
+rayon = "1.10"
+roxmltree = "0.20"
+rusqlite = { version = "0.32", features = ["bundled"] }
+rust-ini = "0.21"
+sha2 = "0.10"
+suppaftp = "6"
+uuid = { version = "1", features = ["v4"] }
+walkdir = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+zstd = "0.13"
+
+eframe = { version = "0.29", optional = true }
+egui_extras = { version = "0.29", optional = true }
+rfd = { version = "0.15", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[[bin]]
+name = "astrofiler"
+path = "src/main.rs"
+
+[[bin]]
+name = "astrofiler-gui"
+path = "src/bin/astrofiler-gui.rs"
+required-features = ["gui"]
