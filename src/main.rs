@@ -714,7 +714,11 @@ fn run(cli: Cli) -> Result<()> {
             );
             println!("\nTop objects by integration:");
             for (o, n, e) in s.by_object.iter().take(15) {
-                println!("  {o:<24} {n:>6} frames  {}", stats::hours(*e));
+                let o = match astrofiler::names::common_name(o, &cfg.object_names) {
+                    Some(name) => format!("{o} {name}"),
+                    None => o.clone(),
+                };
+                println!("  {o:<32} {n:>6} frames  {}", stats::hours(*e));
             }
             println!("\nIntegration by filter:");
             for (f, e) in &s.by_filter {

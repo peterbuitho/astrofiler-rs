@@ -1967,7 +1967,13 @@ impl App {
                     s.by_object
                         .iter()
                         .take(25)
-                        .map(|(o, n, e)| (format!("{o} ({n})"), *e))
+                        .map(|(o, n, e)| {
+                            let label = match names::common_name(o, &self.cfg.object_names) {
+                                Some(name) => format!("{o} {name} ({n})"),
+                                None => format!("{o} ({n})"),
+                            };
+                            (label, *e)
+                        })
                         .collect(),
                     true,
                 );
@@ -2443,7 +2449,15 @@ fn bar_list(ui: &mut egui::Ui, title: &str, rows: Vec<(String, f64)>, as_hours: 
     let accent = ui.visuals().selection.bg_fill;
     for (label, v) in rows {
         ui.horizontal(|ui| {
-            ui.add_sized([160.0, 18.0], egui::Label::new(label).truncate());
+            ui.allocate_ui_with_layout(
+                egui::vec2(220.0, 18.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.set_width(220.0);
+                    ui.add(egui::Label::new(&label).truncate())
+                        .on_hover_text(&label);
+                },
+            );
             let width = 220.0;
             let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 14.0), egui::Sense::hover());
             let w = (v / max) as f32 * width;
