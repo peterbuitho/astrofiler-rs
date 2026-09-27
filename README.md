@@ -165,3 +165,8 @@ Improvements and fixes over the original:
 
 GPL-3.0-or-later, matching the original project's `LICENSE`. Based on
 [AstroFiler](https://github.com/gordtulloch/astrofiler-gui) by Gord Tulloch.
+
+App icon: the original AstroFiler telescope (telescope icon created by
+[Freepik - Flaticon](https://www.flaticon.com/free-icons/telescope)) framed in a
+rust-orange gear as a nod to Rust. It is not the Rust logo, and this project is
+not affiliated with the Rust Foundation.

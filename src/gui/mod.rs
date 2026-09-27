@@ -23,10 +23,19 @@ use std::time::Duration;
 
 pub fn run(cfg: Config) -> Result<()> {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1400.0, 880.0])
-            .with_min_inner_size([900.0, 600.0])
-            .with_title("AstroFiler"),
+        viewport: {
+            // The app id ties the window to astrofiler.desktop on Wayland; the
+            // icon is used on X11, Windows and macOS.
+            let vb = egui::ViewportBuilder::default()
+                .with_inner_size([1400.0, 880.0])
+                .with_min_inner_size([900.0, 600.0])
+                .with_title("AstroFiler")
+                .with_app_id("astrofiler");
+            match eframe::icon_data::from_png_bytes(include_bytes!("../../assets/astrofiler.png")) {
+                Ok(icon) => vb.with_icon(icon),
+                Err(_) => vb,
+            }
+        },
         ..Default::default()
     };
     eframe::run_native(
