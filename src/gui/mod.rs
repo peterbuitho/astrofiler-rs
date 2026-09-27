@@ -93,6 +93,7 @@ enum Confirm {
     RemoveDuplicates,
     ClearSessions,
     ImportWithDelete,
+    QuitDuringJob,
 }
 
 #[derive(Default)]
@@ -126,6 +127,10 @@ struct ScopeUi {
 
 pub struct App {
     cfg: Config,
+    last_refresh: std::time::Instant,
+    allow_close: bool,
+    /// Zoom last applied from the interface-size setting (None = not yet).
+    applied_zoom: Option<f32>,
     db_path: PathBuf,
     tab: Tab,
     status: String,
@@ -176,6 +181,9 @@ impl App {
         });
         let db_path = cfg.database_path();
         let mut app = App {
+            last_refresh: std::time::Instant::now(),
+            allow_close: false,
+            applied_zoom: None,
             db_path,
             tab: Tab::Images,
             status: String::new(),
@@ -284,7 +292,17 @@ impl App {
         let db_path = self.db_path.clone();
         let label = name.to_string();
         std::thread::spawn(move || {
-            let r = db::open(&db_path).and_then(|mut conn| work(&mut conn, &cfg, &st));
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                db::open(&db_path).and_then(|mut conn| work(&mut conn, &cfg, &st))
+            }))
+            .unwrap_or_else(|panic| {
+                let msg = panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "unknown error".into());
+                Err(anyhow::anyhow!("internal error (please report): {msg}"))
+            });
             if let Err(e) = &r {
                 log::error!("{label}: {e:#}");
             }
@@ -316,6 +334,16 @@ impl App {
                 self.scope.selected = vec![true; n];
             }
         } else {
+            // Loads commit in batches, so show new files as they arrive.
+            if self.last_refresh.elapsed() > Duration::from_secs(3) && job.name != "Statistics" {
+                self.last_refresh = std::time::Instant::now();
+                if let Ok(files) = self.conn().and_then(|c| db::all_files(&c, false)) {
+                    if files.len() != self.files.len() {
+                        self.files = files;
+                        self.filter_key.4 = usize::MAX;
+                    }
+                }
+            }
             ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
@@ -431,6 +459,45 @@ impl App {
         }
     }
 
+    /// Zoom picked by "Auto": the desktop scaling, raised so text stays
+    /// readable on high-resolution screens (4K at 100% -> 150%).
+    fn auto_zoom(ctx: &egui::Context) -> f32 {
+        let native = ctx.native_pixels_per_point().unwrap_or(1.0);
+        let Some(monitor) = ctx.input(|i| i.viewport().monitor_size) else {
+            return 1.0;
+        };
+        let physical_height = monitor.y * native;
+        let wanted = ((physical_height / 1440.0) * 4.0).round() / 4.0;
+        (wanted.max(native) / native).clamp(1.0, 3.0)
+    }
+
+    fn wanted_zoom(&self, ctx: &egui::Context) -> f32 {
+        match self.cfg_edit.ui_scale.parse::<f32>() {
+            Ok(z) => z.clamp(0.75, 3.0),
+            Err(_) => Self::auto_zoom(ctx),
+        }
+    }
+
+    /// Apply the interface-size setting when it (or the screen) changes;
+    /// Ctrl +/- zooming in between is left alone.
+    fn apply_ui_scale(&mut self, ctx: &egui::Context) {
+        let zoom = self.wanted_zoom(ctx);
+        if self.applied_zoom == Some(zoom) {
+            return;
+        }
+        let first = self.applied_zoom.is_none();
+        ctx.set_zoom_factor(zoom);
+        self.applied_zoom = Some(zoom);
+        if first && zoom > 1.0 {
+            // Grow the window with the interface, within the screen.
+            let mut size = egui::vec2(1400.0, 880.0) * zoom;
+            if let Some(m) = ctx.input(|i| i.viewport().monitor_size) {
+                size = size.min(m * 0.9);
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        }
+    }
+
     fn pick_folder(start: &str) -> Option<String> {
         let mut d = rfd::FileDialog::new();
         if Path::new(start).is_dir() {
@@ -444,6 +511,12 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_job(ctx);
         self.poll_preview(ctx);
+        self.apply_ui_scale(ctx);
+        if ctx.input(|i| i.viewport().close_requested()) && self.job.is_some() && !self.allow_close
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm = Some(Confirm::QuitDuringJob);
+        }
 
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.add_space(4.0);
@@ -1716,7 +1789,22 @@ impl App {
                     "Write normalised headers into the filed FITS files",
                 );
                 ui.end_row();
-                ui.label("Theme");
+                ui.label("Interface size");
+            ui.horizontal(|ui| {
+                let auto = Self::auto_zoom(ctx);
+                let label = |v: &str| match v.parse::<f32>() {
+                    Ok(z) => format!("{:.0}%", z * 100.0),
+                    Err(_) => format!("Auto ({:.0}%)", auto * 100.0),
+                };
+                egui::ComboBox::from_id_salt("ui_scale").selected_text(label(&c.ui_scale)).show_ui(ui, |ui| {
+                    for v in ["auto", "1", "1.25", "1.5", "1.75", "2", "2.5"] {
+                        ui.selectable_value(&mut c.ui_scale, v.to_string(), label(v));
+                    }
+                });
+                ui.weak("Auto follows your screen resolution and desktop scaling. Ctrl +/- zooms, Ctrl 0 resets.");
+            });
+            ui.end_row();
+            ui.label("Theme");
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut c.theme, "dark".to_string(), "Dark");
                     ui.selectable_value(&mut c.theme, "light".to_string(), "Light");
@@ -1920,6 +2008,7 @@ impl App {
             }
             Confirm::ClearSessions => "Remove all sessions? Files are kept; you can re-create sessions any time.".to_string(),
             Confirm::ImportWithDelete => "Files will be DELETED from the telescope after they are safely catalogued. Continue?".to_string(),
+            Confirm::QuitDuringJob => "A task is still running. Quit anyway? Work finished so far is kept.".to_string(),
         };
         let mut answer = None;
         egui::Window::new("Please confirm")
@@ -1966,6 +2055,13 @@ impl App {
                         self.reload();
                     }
                     Confirm::ImportWithDelete => self.start_import(true),
+                    Confirm::QuitDuringJob => {
+                        if let Some(job) = &self.job {
+                            job.state.cancel.store(true, Ordering::SeqCst);
+                        }
+                        self.allow_close = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
                 }
             }
             Some(false) => self.confirm = None,

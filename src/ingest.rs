@@ -16,7 +16,6 @@ use rayon::prelude::*;
 use rusqlite::Connection;
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use walkdir::WalkDir;
 
 /// What happens to files being loaded.
@@ -58,6 +57,8 @@ pub struct IngestReport {
     pub masters: usize,
     /// Files deliberately not imported (e.g. DWARF `failed_*` frames).
     pub skipped: usize,
+    /// Files whose content is already in the catalogue (e.g. loaded before).
+    pub already_catalogued: usize,
     pub duplicates: Vec<(PathBuf, String)>,
     pub errors: Vec<(PathBuf, String)>,
     pub new_ids: Vec<String>,
@@ -74,10 +75,11 @@ impl IngestReport {
             "registered"
         };
         format!(
-            "{} {verb}, {} masters, {} duplicates skipped, {} rejected frames skipped, {} errors",
+            "{} {verb}, {} masters, {} already in catalogue, {} duplicate copies, {} rejected frames skipped, {} errors",
             self.registered,
             self.masters,
-            self.duplicates.len(),
+            self.already_catalogued,
+            self.duplicates.len() - self.already_catalogued,
             self.skipped,
             self.errors.len()
         )
@@ -103,13 +105,16 @@ impl IngestReport {
 }
 
 /// Recursively collect importable files under `dir`.
-pub fn collect_files(dir: &Path, exclude: Option<&Path>) -> Vec<PathBuf> {
+/// Folders the repository manages itself.
+pub const MANAGED_DIRS: &[&str] = &["Light", "Calibrate", "Stacked", "Masters", "Archive"];
+
+pub fn collect_files(dir: &Path, exclude: &[PathBuf]) -> Vec<PathBuf> {
     WalkDir::new(dir)
         .follow_links(true)
         .into_iter()
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
-            !(exclude.is_some_and(|x| e.path() == x) || name.starts_with(".astrofiler-work"))
+            !(exclude.iter().any(|x| e.path() == x) || name.starts_with(".astrofiler-work"))
         })
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
@@ -131,18 +136,43 @@ pub fn ingest_folder(
         bail!("source folder {} does not exist", source.display());
     }
     progress.update(0, 0, "Scanning for files...");
-    // When loading into the repository, don't re-process files already filed there.
-    let exclude = (opts.placement != Placement::InPlace
-        && !paths_equal(source, &cfg.repo)
-        && cfg.repo.starts_with(source))
-    .then(|| cfg.repo.clone());
-    let files = collect_files(source, exclude.as_deref());
+    // Never re-read the repository's own organised folders as input
+    // (the repository may live inside the folder being loaded).
+    let excluded: Vec<PathBuf> = if opts.placement == Placement::InPlace {
+        vec![]
+    } else if cfg.repo.starts_with(source) && !paths_equal(source, &cfg.repo) {
+        vec![cfg.repo.clone()]
+    } else {
+        MANAGED_DIRS.iter().map(|d| cfg.repo.join(d)).collect()
+    };
+    let files = collect_files(source, &excluded);
     log::info!(
         "Found {} candidate files in {}",
         files.len(),
         source.display()
     );
     ingest_files(conn, cfg, files, opts, progress)
+}
+
+/// Remove scratch folders left behind by an interrupted load (older than
+/// ten minutes, so a load running in another window is left alone).
+fn remove_stale_work_dirs(repo: &Path) {
+    let Ok(rd) = std::fs::read_dir(repo) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let stale = e
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".astrofiler-work-")
+            && e.metadata().and_then(|m| m.modified()).is_ok_and(|t| {
+                t.elapsed()
+                    .is_ok_and(|age| age > std::time::Duration::from_secs(600))
+            });
+        if stale {
+            std::fs::remove_dir_all(e.path()).ok();
+        }
+    }
 }
 
 fn paths_equal(a: &Path, b: &Path) -> bool {
@@ -195,6 +225,7 @@ pub fn ingest_files(
     let total = files.len();
     // Scratch space for converted files, so sources are never written to
     // when copying or doing a dry run.
+    remove_stale_work_dirs(&cfg.repo);
     let work = cfg.repo.join(format!(
         ".astrofiler-work-{}",
         uuid::Uuid::new_v4().simple()
@@ -209,6 +240,17 @@ pub fn ingest_files(
     Ok(report)
 }
 
+/// Files are processed in batches: unpack, hash and file one batch, commit it,
+/// then move on. This keeps scratch space small (only one batch of converted
+/// XISF files exists at a time), makes progress visible to other readers of
+/// the catalogue, and means an interrupted load loses at most one batch.
+const BATCH: usize = 64;
+
+struct FileState {
+    seen: HashSet<String>,
+    planned: HashSet<PathBuf>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn ingest_inner(
     conn: &mut Connection,
@@ -220,194 +262,212 @@ fn ingest_inner(
     report: &mut IngestReport,
     total: usize,
 ) -> Result<()> {
-    // Stage 1: unpack containers (zip, xisf, gz) into plain FITS files.
-    progress.update(0, total, "Unpacking archives and converting XISF...");
-    let unpacked: Vec<(PathBuf, Result<Vec<Staged>>)> = files
-        .into_par_iter()
-        .map(|p| {
-            let r = unpack(&p, cfg, opts, work);
-            (p, r)
-        })
-        .collect();
-    let mut staged: Vec<Staged> = Vec::new();
-    for (input, r) in unpacked {
-        match r {
-            Ok(list) => staged.extend(list),
-            Err(e) => report.errors.push((input, format!("{e:#}"))),
-        }
-    }
-
-    // Stage 2: parse, normalise and hash in parallel.
     let mappings = db::mappings(conn)?;
-    let counter = AtomicUsize::new(0);
-    let n = staged.len();
-    let prepared: Vec<(PathBuf, Result<Prepared>)> = staged
-        .into_par_iter()
-        .map(|st| {
-            let input = st.input.clone();
-            if progress.cancelled() {
-                return (input, Err(anyhow!("cancelled")));
-            }
-            let r = prepare(st, cfg, &mappings);
-            let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-            if done % 16 == 0 || done == n {
-                progress.update(
-                    done,
-                    n,
-                    &format!(
-                        "Reading headers: {}",
-                        input.file_name().unwrap_or_default().to_string_lossy()
-                    ),
-                );
-            }
-            (input, r)
-        })
-        .collect();
-    if progress.cancelled() {
-        bail!("cancelled");
-    }
-
-    // Stage 3: file and catalogue, sequentially, in one transaction.
-    let tx = conn.transaction()?;
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut planned: HashSet<PathBuf> = HashSet::new();
-    let n = prepared.len();
-    for (i, (input, prep)) in prepared.into_iter().enumerate() {
-        if i % 32 == 0 {
-            progress.update(
-                i,
-                n,
-                &format!(
-                    "Filing: {}",
-                    input.file_name().unwrap_or_default().to_string_lossy()
-                ),
-            );
+    let mut state = FileState {
+        seen: HashSet::new(),
+        planned: HashSet::new(),
+    };
+    let mut done = 0usize;
+    for chunk in files.chunks(BATCH) {
+        if progress.cancelled() {
+            bail!("cancelled");
         }
-        let prep = match prep {
-            Ok(p) => p,
-            Err(e) => {
-                log::warn!("{}: {e:#}", input.display());
-                report.errors.push((input, format!("{e:#}")));
-                continue;
-            }
+        let label = |p: &Path| {
+            p.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string()
         };
-        match prep {
-            Prepared::Master { staged, header } => {
-                let placement = if staged.temp {
-                    Placement::Move
-                } else {
-                    opts.placement
-                };
-                if opts.dry_run {
-                    let dest = match placement {
-                        Placement::InPlace => staged.path.clone(),
-                        _ => cfg
-                            .masters_dir()
-                            .join(staged.input.file_name().unwrap_or_default()),
-                    };
-                    report.masters += 1;
-                    report.placed.push((staged.input, dest));
-                    continue;
-                }
-                match masters::register_master(&tx, cfg, &staged.path, &header, placement) {
-                    Ok((_, final_path)) => {
-                        report.masters += 1;
-                        report.placed.push((staged.input, final_path));
+        progress.update(done, total, &format!("Reading {}", label(&chunk[0])));
+
+        // Unpack containers (zip, xisf, gz) into plain FITS files.
+        let unpacked: Vec<(PathBuf, Result<Vec<Staged>>)> = chunk
+            .par_iter()
+            .map(|p| (p.clone(), unpack(p, cfg, opts, work)))
+            .collect();
+        let mut staged: Vec<Staged> = Vec::new();
+        for (input, r) in unpacked {
+            match r {
+                Ok(list) => staged.extend(list),
+                Err(e) => report.errors.push((input, format!("{e:#}"))),
+            }
+        }
+
+        // Parse, normalise and hash in parallel.
+        let prepared: Vec<(PathBuf, Result<Prepared>)> = staged
+            .into_par_iter()
+            .map(|st| (st.input.clone(), prepare(st, cfg, &mappings)))
+            .collect();
+
+        // File and catalogue this batch in one transaction.
+        progress.update(done, total, &format!("Filing {}", label(&chunk[0])));
+        if !opts.dry_run {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+        }
+        let mut result = Ok(());
+        for (input, prep) in prepared {
+            match prep {
+                Ok(p) => {
+                    if let Err(e) = file_prepared(conn, cfg, opts, p, report, &mut state) {
+                        result = Err(e);
+                        break;
                     }
-                    Err(e) => report.errors.push((staged.input, format!("{e:#}"))),
+                }
+                Err(e) => {
+                    log::warn!("{}: {e:#}", input.display());
+                    report.errors.push((input, format!("{e:#}")));
                 }
             }
-            Prepared::Frame {
-                staged,
-                header,
-                new_name,
-                dest_dir,
-                hash,
-                rewrite,
-            } => {
-                if let Some(existing) = db::hash_exists(&tx, &hash)? {
-                    // Already catalogued. When syncing in place this is the same file.
-                    if !paths_equal(Path::new(&existing), &staged.path) {
-                        report.duplicates.push((staged.input, existing));
-                    }
-                    continue;
-                }
-                if !seen.insert(hash.clone()) {
-                    report
-                        .duplicates
-                        .push((staged.input, "another file in this batch".into()));
-                    continue;
-                }
-                let placement = if staged.temp && opts.placement == Placement::Copy {
-                    Placement::Move
-                } else {
-                    opts.placement
-                };
-                if opts.dry_run {
-                    let dest = match placement {
-                        Placement::InPlace => staged.path.clone(),
-                        _ => {
-                            // Mirror unique_path() against files planned in this run.
-                            let mut d = util::unique_path(&dest_dir.join(&new_name));
-                            let mut k = 1;
-                            while planned.contains(&d) {
-                                let stem = Path::new(&new_name)
-                                    .file_stem()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .to_string();
-                                d = dest_dir.join(format!("{stem}_{k:03}.fits"));
-                                k += 1;
-                            }
-                            planned.insert(d.clone());
-                            d
-                        }
-                    };
-                    report.registered += 1;
-                    report.placed.push((staged.input, dest));
-                    continue;
-                }
-                let final_path = match placement {
+        }
+        if !opts.dry_run {
+            // Keep whatever was filed, even if the batch stopped early, so
+            // the catalogue always matches the files on disk.
+            conn.execute_batch("COMMIT")?;
+        }
+        result?;
+        if work.exists() {
+            std::fs::remove_dir_all(work).ok();
+        }
+        done += chunk.len();
+        progress.update(done, total, &format!("{} of {total} files processed", done));
+    }
+    Ok(())
+}
+
+fn file_prepared(
+    conn: &Connection,
+    cfg: &Config,
+    opts: IngestOptions,
+    prep: Prepared,
+    report: &mut IngestReport,
+    state: &mut FileState,
+) -> Result<()> {
+    match prep {
+        Prepared::Master { staged, header } => {
+            let placement = if staged.temp {
+                Placement::Move
+            } else {
+                opts.placement
+            };
+            if opts.dry_run {
+                let dest = match placement {
                     Placement::InPlace => staged.path.clone(),
-                    Placement::Move | Placement::Copy => {
-                        let dest = util::unique_path(&dest_dir.join(&new_name));
-                        let r = if placement == Placement::Move {
-                            util::move_file(&staged.path, &dest)
-                        } else {
-                            std::fs::create_dir_all(&dest_dir)
-                                .map_err(anyhow::Error::from)
-                                .and_then(|_| {
-                                    std::fs::copy(&staged.path, &dest)?;
-                                    Ok(())
-                                })
-                        };
-                        if let Err(e) = r {
-                            report
-                                .errors
-                                .push((staged.input, format!("filing into repository: {e:#}")));
-                            continue;
+                    _ => cfg
+                        .masters_dir()
+                        .join(staged.input.file_name().unwrap_or_default()),
+                };
+                report.masters += 1;
+                report.placed.push((staged.input, dest));
+                return Ok(());
+            }
+            match masters::register_master(conn, cfg, &staged.path, &header, placement) {
+                Ok((_, final_path)) => {
+                    report.masters += 1;
+                    report.placed.push((staged.input, final_path));
+                }
+                Err(e) => report.errors.push((staged.input, format!("{e:#}"))),
+            }
+        }
+        Prepared::Frame {
+            staged,
+            header,
+            new_name,
+            dest_dir,
+            hash,
+            rewrite,
+        } => {
+            if let Some(existing) = db::hash_exists(conn, &hash)? {
+                // Already catalogued. When syncing in place this is the same file.
+                if !paths_equal(Path::new(&existing), &staged.path) {
+                    report.already_catalogued += 1;
+                    report.duplicates.push((staged.input, existing));
+                }
+                return Ok(());
+            }
+            if !state.seen.insert(hash.clone()) {
+                report
+                    .duplicates
+                    .push((staged.input, "another file in this batch".into()));
+                return Ok(());
+            }
+            let placement = if staged.temp && opts.placement == Placement::Copy {
+                Placement::Move
+            } else {
+                opts.placement
+            };
+            let target = dest_dir.join(&new_name);
+            // A previous, interrupted run may already have put this exact
+            // file in place: adopt it instead of making a `_001` copy.
+            let adopt = placement != Placement::InPlace
+                && target != staged.path
+                && target.exists()
+                && util::sha256_file(&target).is_ok_and(|h| h == hash);
+            if opts.dry_run {
+                let dest = match placement {
+                    Placement::InPlace => staged.path.clone(),
+                    _ if adopt || target == staged.path => target,
+                    _ => {
+                        // Mirror unique_path() against files planned in this run.
+                        let stem = Path::new(&new_name)
+                            .file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
+                        let mut d = util::unique_path(&target);
+                        let mut k = 1;
+                        while state.planned.contains(&d) {
+                            d = dest_dir.join(format!("{stem}_{k:03}.fits"));
+                            k += 1;
                         }
-                        dest
+                        state.planned.insert(d.clone());
+                        d
                     }
                 };
+                report.registered += 1;
+                report.placed.push((staged.input, dest));
+                return Ok(());
+            }
+            let final_path = if placement == Placement::InPlace || target == staged.path {
+                staged.path.clone()
+            } else if adopt {
+                if placement == Placement::Move || staged.temp {
+                    std::fs::remove_file(&staged.path).ok();
+                }
+                target
+            } else {
+                let dest = util::unique_path(&target);
+                let r = if placement == Placement::Move {
+                    util::move_file(&staged.path, &dest)
+                } else {
+                    std::fs::create_dir_all(&dest_dir)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|_| {
+                            std::fs::copy(&staged.path, &dest)?;
+                            Ok(())
+                        })
+                };
+                if let Err(e) = r {
+                    report
+                        .errors
+                        .push((staged.input, format!("filing into repository: {e:#}")));
+                    return Ok(());
+                }
                 if rewrite {
-                    if let Err(e) = fits::rewrite_primary_header(&final_path, &header) {
+                    if let Err(e) = fits::rewrite_primary_header(&dest, &header) {
                         log::warn!(
                             "could not save modified header for {}: {e:#}",
-                            final_path.display()
+                            dest.display()
                         );
                     }
                 }
-                let record = file_record(&header, &final_path, hash);
-                record.insert(&tx)?;
-                report.new_ids.push(record.id);
-                report.placed.push((staged.input, final_path));
-                report.registered += 1;
-            }
+                dest
+            };
+            let record = file_record(&header, &final_path, hash);
+            record.insert(conn)?;
+            report.new_ids.push(record.id);
+            report.placed.push((staged.input, final_path));
+            report.registered += 1;
         }
-    }
-    if !opts.dry_run {
-        tx.commit()?;
     }
     Ok(())
 }
@@ -506,7 +566,12 @@ fn prepare(st: Staged, cfg: &Config, mappings: &[Mapping]) -> Result<Prepared> {
         .unwrap_or_default()
         .to_uppercase();
     if is_master_path(&st.input) || imagetyp.contains("MASTER") {
-        return Ok(Prepared::Master { staged: st, header });
+        if masters::determine_master_type(&st.input, &header).is_some() {
+            return Ok(Prepared::Master { staged: st, header });
+        }
+        // e.g. PixInsight `masterLight_*.xisf` or DWARF `*-AstroWizard.fits`:
+        // an integrated light, filed with the stacked results.
+        header.set("IMAGETYP", Value::Str("Master Light".into()));
     }
     // Header fixes read folder names, so use the original location.
     let modified = normalize_header(&mut header, &st.input, mappings)?;
@@ -672,7 +737,10 @@ fn val(h: &Header, key: &str, default: &str) -> String {
 /// that is a light) are filed separately from sub-frames.
 pub fn is_stacked(h: &Header) -> bool {
     let light = FrameKind::classify(&val(h, "IMAGETYP", "")) == Some(FrameKind::Light);
-    light && (h.get_i64("STACKCNT").unwrap_or(0) > 1 || h.get_i64("NCOMBINE").unwrap_or(0) > 1)
+    light
+        && (h.get_i64("STACKCNT").unwrap_or(0) > 1
+            || h.get_i64("NCOMBINE").unwrap_or(0) > 1
+            || val(h, "IMAGETYP", "").to_uppercase().contains("MASTER"))
 }
 
 /// Descriptive file name and repository folder (same scheme as the original).

@@ -27,7 +27,7 @@ jobs:
             os: macos-14
             archive: tar.gz
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Linux GUI libraries
         if: runner.os == 'Linux'
@@ -61,7 +61,7 @@ jobs:
             tar czf ../astrofiler-${{ matrix.name }}.tar.gz astrofiler
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: astrofiler-${{ matrix.name }}
           path: astrofiler-${{ matrix.name }}.${{ matrix.archive }}

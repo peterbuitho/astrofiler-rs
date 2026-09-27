@@ -154,7 +154,7 @@ pub fn register_folder(
     move_files: bool,
     progress: &dyn Progress,
 ) -> Result<(usize, Vec<(PathBuf, String)>)> {
-    let files: Vec<PathBuf> = crate::ingest::collect_files(folder, None)
+    let files: Vec<PathBuf> = crate::ingest::collect_files(folder, &[])
         .into_iter()
         .filter(|p| util::is_fits_name(p))
         .collect();

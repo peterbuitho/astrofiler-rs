@@ -31,6 +31,8 @@ pub struct Config {
     pub dwarf_host: String,
     /// Also import Seestar `Stacked_*.fit` results.
     pub include_stacked: bool,
+    /// Interface size: "auto" or a factor relative to the desktop scaling (e.g. "1.5").
+    pub ui_scale: String,
     /// Where this config was loaded from / will be saved to.
     pub path: PathBuf,
 }
@@ -51,6 +53,7 @@ impl Default for Config {
             seestar_password: "guest".into(),
             dwarf_host: "192.168.88.1".into(),
             include_stacked: true,
+            ui_scale: "auto".into(),
             path: default_config_path(),
         }
     }
@@ -139,6 +142,9 @@ impl Config {
         if let Some(v) = get("include_stacked") {
             cfg.include_stacked = parse_bool(&v);
         }
+        if let Some(v) = get("ui_scale").filter(|v| !v.is_empty()) {
+            cfg.ui_scale = v.to_ascii_lowercase();
+        }
         cfg.database = get("database").filter(|v| !v.is_empty()).map(PathBuf::from);
         Ok(cfg)
     }
@@ -161,6 +167,7 @@ impl Config {
                     "False"
                 },
             )
+            .set("ui_scale", self.ui_scale.clone())
             .set("external_viewer", self.external_viewer.clone())
             .set("theme", self.theme.clone())
             .set("min_master_files", self.min_master_files.to_string())

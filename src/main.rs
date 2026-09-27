@@ -227,7 +227,7 @@ enum ConfigCmd {
     Show,
     /// Set a key: source, repo, save_modified_headers, external_viewer, theme,
     /// min_master_files, sigma_clip, database, seestar_host, seestar_username,
-    /// seestar_password, dwarf_host, include_stacked
+    /// seestar_password, dwarf_host, include_stacked, ui_scale (auto or e.g. 1.5)
     Set {
         key: String,
         value: String,
@@ -785,6 +785,7 @@ fn config_cmd(cfg: &mut Config, action: Option<&ConfigCmd>) -> Result<()> {
             println!("seestar_username:      {}", cfg.seestar_username);
             println!("dwarf_host:            {}", cfg.dwarf_host);
             println!("include_stacked:       {}", cfg.include_stacked);
+            println!("ui_scale:              {}", cfg.ui_scale);
         }
         Some(ConfigCmd::Set { key, value }) => {
             let b = || matches!(value.to_lowercase().as_str(), "1" | "true" | "yes" | "on");
@@ -805,6 +806,7 @@ fn config_cmd(cfg: &mut Config, action: Option<&ConfigCmd>) -> Result<()> {
                 "seestar_password" => cfg.seestar_password = value.clone(),
                 "dwarf_host" => cfg.dwarf_host = value.clone(),
                 "include_stacked" => cfg.include_stacked = b(),
+                "ui_scale" => cfg.ui_scale = value.to_lowercase(),
                 other => bail!("unknown key '{other}'"),
             }
             cfg.save()?;

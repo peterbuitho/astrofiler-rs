@@ -11,6 +11,27 @@ static LINES: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 struct Logger {
     level: LevelFilter,
     to_stderr: bool,
+    file: Option<Mutex<std::fs::File>>,
+}
+
+/// `astrofiler.log` in the user data folder, restarted when it passes 5 MB.
+pub fn log_path() -> Option<std::path::PathBuf> {
+    dirs::data_dir().map(|d| d.join("astrofiler").join("astrofiler.log"))
+}
+
+fn open_log_file() -> Option<std::fs::File> {
+    let path = log_path()?;
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    let too_big = std::fs::metadata(&path)
+        .map(|m| m.len() > 5 << 20)
+        .unwrap_or(false);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(!too_big)
+        .write(true)
+        .truncate(too_big)
+        .open(path)
+        .ok()
 }
 
 impl Log for Logger {
@@ -30,6 +51,11 @@ impl Log for Logger {
         if self.to_stderr && (r.level() <= Level::Warn || self.level >= LevelFilter::Debug) {
             eprintln!("{line}");
         }
+        if let Some(f) = &self.file {
+            use std::io::Write;
+            let date = chrono::Local::now().format("%Y-%m-%d");
+            let _ = writeln!(f.lock().unwrap(), "{date} {line}");
+        }
         let mut lines = LINES.lock().unwrap();
         if lines.len() >= KEEP {
             lines.pop_front();
@@ -45,7 +71,12 @@ pub fn init(verbose: bool, to_stderr: bool) {
     } else {
         LevelFilter::Info
     };
-    let _ = log::set_boxed_logger(Box::new(Logger { level, to_stderr }));
+    let file = open_log_file().map(Mutex::new);
+    let _ = log::set_boxed_logger(Box::new(Logger {
+        level,
+        to_stderr,
+        file,
+    }));
     log::set_max_level(level);
 }
 

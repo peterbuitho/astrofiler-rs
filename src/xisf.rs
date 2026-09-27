@@ -30,8 +30,20 @@ pub fn read(path: &Path) -> Result<XisfImage> {
             .get(16..16 + hlen)
             .ok_or_else(|| anyhow!("truncated XISF header"))?,
     )?;
-    let xml = xml.trim_end_matches('\0');
-    let doc = roxmltree::Document::parse(xml).context("parsing XISF XML header")?;
+    // Some writers (e.g. PixInsight processing history) leave control
+    // characters in the XML that strict parsers reject; blank them out.
+    let xml: String = xml
+        .trim_end_matches('\0')
+        .chars()
+        .map(|c| {
+            if (c as u32) < 0x20 && !matches!(c, '\t' | '\n' | '\r') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let doc = roxmltree::Document::parse(&xml).context("parsing XISF XML header")?;
     let image = doc
         .descendants()
         .find(|n| n.has_tag_name("Image"))

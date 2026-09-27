@@ -190,26 +190,36 @@ impl Telescope for Dwarf {
         }
 
         if let Some(folder) = comps.iter().rev().find(|c| c.starts_with("DWARF_RAW")) {
-            // DWARF_RAW_<INSTRUMENT>_<OBJECT>_EXP_<EXPTIME>_GAIN_<GAIN>_<DATE-OBS>
-            let parts: Vec<&str> = folder.split('_').collect();
-            if parts.len() < 8 {
-                bail!("unrecognised DWARF_RAW folder name '{folder}'");
+            // Header values win; the folder name only fills gaps. Folder
+            // names vary (manual mode has no EXP, users append "_a" etc.).
+            let info = RawFolder::parse(folder);
+            let cam = h
+                .get_truthy("CAMERA")
+                .map(|c| c.trim().to_string())
+                .or(info.camera);
+            if let Some(cam) = cam {
+                h.set("INSTRUME", Value::Str(cam));
             }
-            h.set("INSTRUME", Value::Str(parts[2].into()));
-            h.set("OBJECT", Value::Str(parts[3].into()));
-            // A stacked result's EXPTIME is the total integration; keep it.
-            if !(h.contains("STACKCNT") && h.contains("EXPTIME")) {
-                h.set(
-                    "EXPTIME",
-                    Value::Float(
-                        f(parts[5]).ok_or_else(|| anyhow!("bad DWARF exposure in '{folder}'"))?,
-                    ),
-                );
+            if h.get_truthy("OBJECT").is_none() {
+                if let Some(o) = info.object {
+                    h.set("OBJECT", Value::Str(o));
+                }
             }
-            h.set(
-                "GAIN",
-                Value::Float(f(parts[7]).ok_or_else(|| anyhow!("bad DWARF gain in '{folder}'"))?),
-            );
+            if !h.contains("EXPTIME") && !h.contains("EXPOSURE") {
+                if let Some(e) = info.exposure {
+                    h.set("EXPTIME", Value::Float(e));
+                }
+            }
+            if !h.contains("GAIN") {
+                if let Some(g) = info.gain {
+                    h.set("GAIN", Value::Float(g));
+                }
+            }
+            if h.get_truthy("DATE-OBS").is_none() {
+                if let Some(d) = info.date {
+                    h.set("DATE-OBS", Value::Str(d));
+                }
+            }
             for (k, v) in [
                 ("XBINNING", Value::Int(1)),
                 ("YBINNING", Value::Int(1)),
@@ -219,10 +229,9 @@ impl Telescope for Dwarf {
                     h.set(k, v);
                 }
             }
-            if !h.contains("DATE-OBS") && parts.len() > 8 {
-                h.set("DATE-OBS", Value::Str(parts[8..].join("_")));
+            if h.get_truthy("IMAGETYP").is_none() {
+                h.set("IMAGETYP", Value::Str("LIGHT".into()));
             }
-            h.set("IMAGETYP", Value::Str("LIGHT".into()));
             if !h.contains("TELESCOP") {
                 h.set("TELESCOP", Value::Str("DWARF".into()));
             }
@@ -318,6 +327,63 @@ impl Telescope for Dwarf {
     }
 }
 
+/// What a `DWARF_RAW_<CAM>_<OBJECT>[_Manual][_EXP_<s>][_GAIN_<g>]_<date>[_suffix]`
+/// folder name tells us.
+#[derive(Debug, Default, PartialEq)]
+struct RawFolder {
+    camera: Option<String>,
+    object: Option<String>,
+    exposure: Option<f64>,
+    gain: Option<f64>,
+    date: Option<String>,
+}
+
+impl RawFolder {
+    fn parse(name: &str) -> Self {
+        let tokens: Vec<&str> = name.split('_').collect();
+        let mut info = RawFolder::default();
+        if let Some(cam) = tokens
+            .get(2)
+            .filter(|c| c.eq_ignore_ascii_case("TELE") || c.eq_ignore_ascii_case("WIDE"))
+        {
+            info.camera = Some(cam.to_uppercase());
+        }
+        let is_date = |t: &str| {
+            t.len() >= 10 && t.as_bytes()[4] == b'-' && t[..4].chars().all(|c| c.is_ascii_digit())
+        };
+        let is_keyword =
+            |t: &str| ["EXP", "GAIN", "MANUAL"].contains(&t.to_uppercase().as_str()) || is_date(t);
+        let start = if info.camera.is_some() { 3 } else { 2 };
+        let object: Vec<&str> = tokens
+            .iter()
+            .skip(start)
+            .take_while(|t| !is_keyword(t))
+            .copied()
+            .collect();
+        if !object.is_empty() {
+            info.object = Some(object.join("_"));
+        }
+        for (i, t) in tokens.iter().enumerate() {
+            let next = tokens.get(i + 1).and_then(|v| v.parse::<f64>().ok());
+            match t.to_uppercase().as_str() {
+                "EXP" => info.exposure = info.exposure.or(next),
+                "GAIN" => info.gain = info.gain.or(next),
+                _ if info.date.is_none() && is_date(t) => {
+                    // 2026-09-27-01-46-25-216 -> 2026-09-27T01:46:25.216
+                    let p: Vec<&str> = t.split('-').collect();
+                    info.date = Some(if p.len() >= 6 && p[3..6].iter().all(|x| x.len() == 2) {
+                        format!("{}-{}-{}T{}:{}:{}", p[0], p[1], p[2], p[3], p[4], p[5])
+                    } else {
+                        t[..10].to_string()
+                    });
+                }
+                _ => {}
+            }
+        }
+        info
+    }
+}
+
 fn find_root(t: &mut dyn Transport) -> Option<(&'static str, Vec<super::Entry>)> {
     ROOTS.iter().find_map(|r| {
         let entries = t.list(r).ok()?;
@@ -371,6 +437,50 @@ mod tests {
             "/x/DWARF_RAW_TELE_M 52_EXP_15_GAIN_60_x/failed_1.fits"
         )));
         assert!(!Dwarf.skip_file(Path::new("/x/other/failed_1.fits")));
+    }
+
+    #[test]
+    fn folder_name_variants() {
+        // Real folder names from a DWARF 3 archive.
+        let p = RawFolder::parse("DWARF_RAW_TELE_M 39_EXP_15_GAIN_60_2026-09-27-01-46-25-216");
+        assert_eq!(
+            (p.object.as_deref(), p.exposure, p.gain),
+            (Some("M 39"), Some(15.0), Some(60.0))
+        );
+        assert_eq!(p.date.as_deref(), Some("2026-09-27T01:46:25"));
+        let p = RawFolder::parse("DWARF_RAW_TELE_LDN 935_GAIN_60_2026-08-08");
+        assert_eq!(
+            (p.object.as_deref(), p.exposure, p.gain),
+            (Some("LDN 935"), None, Some(60.0))
+        );
+        assert_eq!(p.date.as_deref(), Some("2026-08-08"));
+        let p = RawFolder::parse("DWARF_RAW_TELE_IC1396_Manual_GAIN_60_2026-08-01-XISF");
+        assert_eq!(p.object.as_deref(), Some("IC1396"));
+        let p = RawFolder::parse(
+            "DWARF_RAW_TELE_NGC6997_57Cyg_Manual_EXP_60_GAIN_60_2026-08-08-00-15-02-876",
+        );
+        assert_eq!(
+            (p.object.as_deref(), p.exposure),
+            (Some("NGC6997_57Cyg"), Some(60.0))
+        );
+        let p =
+            RawFolder::parse("DWARF_RAW_TELE_NGC 1491_EXP_60_GAIN_60_2026-03-05-20-33-46-329_a");
+        assert_eq!(
+            (p.object.as_deref(), p.camera.as_deref()),
+            (Some("NGC 1491"), Some("TELE"))
+        );
+
+        // Header values take precedence over the folder name.
+        let mut h = dwarf3_header();
+        Dwarf
+            .normalize_header(
+                &mut h,
+                Path::new("/x/DWARF_RAW_TELE_LDN 935_GAIN_60_2026-08-08/f.fits"),
+            )
+            .unwrap();
+        assert_eq!(h.get_str("OBJECT").as_deref(), Some("M 39"));
+        assert_eq!(h.get_f64("EXPTIME"), Some(15.0));
+        assert_eq!(h.get_str("IMAGETYP").as_deref(), Some("LIGHT"));
     }
 
     #[test]
