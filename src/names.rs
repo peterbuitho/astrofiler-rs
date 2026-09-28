@@ -3,6 +3,7 @@
 //! replace these in the settings (`[object_names]` in the config file).
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 /// Catalogue designation -> common name. Only names in wide use; objects
 /// known mainly by their number are left out.
@@ -201,9 +202,159 @@ pub fn object_folder(object: &str, custom: &BTreeMap<String, String>) -> String 
     }
 }
 
+/// Catalogue prefixes recognised at the start of a folder name.
+const CATALOGUES: &[&str] = &[
+    "MESSIER", "CALDWELL", "BARNARD", "ABELL", "SH2", "NGC", "IC", "SH", "LDN", "LBN", "VDB",
+    "ARP", "UGC", "PGC", "MEL", "CR", "TR", "HCG", "CED", "GUM", "RCW", "M", "C", "B",
+];
+
+/// Folders that stacking programs and archives put results in; the target
+/// is named by the folder above.
+const OUTPUT_FOLDERS: &[&str] = &[
+    "stacked",
+    "stack",
+    "stacks",
+    "light",
+    "lights",
+    "master",
+    "masters",
+    "masterlight",
+    "integration",
+    "output",
+    "processed",
+    "pixinsight",
+    "wbpp",
+    "fbpp",
+    "fits",
+    "xisf",
+    "registered",
+    "calibrated",
+];
+
+/// Folder names that say nothing about the target: looking further up would
+/// only find unrelated folders.
+const GENERIC: &[&str] = &[
+    "images",
+    "astro",
+    "astrophotography",
+    "photo",
+    "photos",
+    "pictures",
+    "archive",
+    "data",
+    "logs",
+    "new",
+    "tmp",
+    "temp",
+];
+
+/// The catalogue designation a folder name starts with, as written:
+/// "NGC 1333 Embryo Nebula" -> "NGC 1333", "Sh 2-132_Lion Nebula_EXP_30" ->
+/// "Sh 2-132", "SH2-158 Northern Lagoon" -> "SH2-158", "C4 Iris" -> "C4".
+fn designation(name: &str) -> Option<String> {
+    let name = name.trim();
+    let prefix_len = name.chars().take_while(|c| c.is_ascii_alphabetic()).count();
+    let prefix = &name[..prefix_len];
+    if !CATALOGUES.iter().any(|c| c.eq_ignore_ascii_case(prefix)) {
+        return None;
+    }
+    let rest = &name[prefix_len..];
+    let gap = rest.len() - rest.trim_start_matches([' ', '_']).len();
+    let digits = |s: &str| s.chars().take_while(|c| c.is_ascii_digit()).count();
+    let num = &rest[gap..];
+    let mut end = digits(num);
+    if end == 0 {
+        return None;
+    }
+    // Sharpless numbers carry the catalogue edition: "Sh 2-132".
+    if num[end..].starts_with('-') && digits(&num[end + 1..]) > 0 {
+        end += 1 + digits(&num[end + 1..]);
+    }
+    // The designation must end there: "M 13 Hercules" but not "M13x".
+    if num[end..]
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    Some(format!(
+        "{prefix}{}{}",
+        &rest[..gap].replace('_', " "),
+        &num[..end]
+    ))
+}
+
+fn is_generic(name: &str) -> bool {
+    let n = name.trim().to_lowercase();
+    GENERIC.contains(&n.as_str())
+        || n.is_empty()
+        || n.chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '-' | '_' | ' '))
+}
+
+/// The target of an image in `path`, from the folders it is in, for stacks
+/// whose header does not name it (PixInsight master lights). Output folders
+/// such as "master" or "Stacked" are skipped; the next folder up decides,
+/// by its catalogue designation or else its whole name. None when that
+/// folder is a generic one ("Astro", a year).
+pub fn object_from_folders(path: &Path) -> Option<String> {
+    let folder = path
+        .ancestors()
+        .skip(1)
+        .take(3)
+        .filter_map(|p| p.file_name())
+        .map(|n| n.to_string_lossy())
+        .find(|n| !OUTPUT_FOLDERS.contains(&n.trim().to_lowercase().as_str()))?;
+    if let Some(d) = designation(&folder) {
+        return Some(d);
+    }
+    (!is_generic(&folder)).then(|| folder.replace('_', " ").trim().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn objects_from_folder_names() {
+        let obj = |p: &str| object_from_folders(Path::new(p));
+        let cases = [
+            (
+                "/a/NGC 1333 Embryo Nebula/masterLight.xisf",
+                Some("NGC 1333"),
+            ),
+            (
+                "/a/Sh 2-132_Lion Nebula_EXP_30_GAIN_60_2026-07-15-00-03-13-569_XISF/m.xisf",
+                Some("Sh 2-132"),
+            ),
+            (
+                "/a/SH2-158 Northern Lagoon Nebula SH 2-158/m.xisf",
+                Some("SH2-158"),
+            ),
+            ("/a/SH 2-157 Lobster Claw Nebula/m.xisf", Some("SH 2-157")),
+            (
+                "/a/NGC 4631 (Whale Galaxy) + NGC 4656 (Crowbar Galaxy)/m.xisf",
+                Some("NGC 4631"),
+            ),
+            ("/a/NGC 4449 C 21 Box Galaxy/m.xisf", Some("NGC 4449")),
+            ("/a/C4 Iris Nebula/m.xisf", Some("C4")),
+            (
+                "/a/M 13 Hercules Globular Cluster 2026/master/m.xisf",
+                Some("M 13"),
+            ),
+            ("/a/Markarian's Chain/m.xisf", Some("Markarian's Chain")),
+            ("/a/Messier_31/Stacked/m.xisf", Some("Messier 31")),
+            ("/a/Medusa Nebula/m.xisf", Some("Medusa Nebula")),
+            ("/mnt/nas/photo/Astro/Stacked/m.xisf", None),
+            ("/data/2025/m.xisf", None),
+            ("/data/2025/master/m.xisf", None),
+            ("/a/NGC 7000/2025/m.xisf", None),
+        ];
+        for (path, want) in cases {
+            assert_eq!(obj(path).as_deref(), want, "{path}");
+        }
+    }
 
     #[test]
     fn folders() {

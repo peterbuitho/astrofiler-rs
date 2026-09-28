@@ -1212,6 +1212,18 @@ pub fn normalize_header(h: &mut Header, path: &Path, mappings: &[Mapping]) -> Re
                 modified = true;
             }
         }
+        // PixInsight master lights do not name their target; the folder
+        // they were saved in usually does.
+        if h.get_truthy("OBJECT").is_none() && imagetyp.to_uppercase().contains("MASTER") {
+            if let Some(o) = crate::names::object_from_folders(path) {
+                log::info!(
+                    "{}: no OBJECT keyword, using \"{o}\" from the folder name",
+                    path.display()
+                );
+                h.set("OBJECT", Value::Str(o));
+                modified = true;
+            }
+        }
         if h.get_truthy("OBJECT").is_none() {
             bail!("light frame has no OBJECT keyword");
         }
