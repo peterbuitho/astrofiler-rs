@@ -16,6 +16,7 @@ use rayon::prelude::*;
 use rusqlite::Connection;
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use walkdir::WalkDir;
 
 /// What happens to files being loaded.
@@ -628,13 +629,21 @@ fn ingest_inner(
                 .to_string_lossy()
                 .to_string()
         };
-        progress.update(done, total, &format!("Reading {}", label(&chunk[0])));
+        // Progress moves per file: the first half of a batch while files are
+        // read and hashed, the second half while they are filed.
+        let tick = |step: usize, steps: usize, half: usize, msg: String| {
+            let within = (half * steps + step) * chunk.len() / (2 * steps.max(1));
+            progress.update(done + within, total, &msg);
+        };
 
         // Unpack containers (zip, xisf, gz) into plain FITS files.
         let unpacked: Vec<(PathBuf, Result<Vec<Staged>>)> = pool.install(|| {
             chunk
                 .par_iter()
-                .map(|p| (p.clone(), unpack(p, cfg, opts, work)))
+                .map(|p| {
+                    tick(0, 1, 0, format!("Reading {}", label(p)));
+                    (p.clone(), unpack(p, cfg, opts, work))
+                })
                 .collect()
         });
         let mut staged: Vec<Staged> = Vec::new();
@@ -646,20 +655,29 @@ fn ingest_inner(
         }
 
         // Parse, normalise and hash in parallel.
+        let steps = staged.len();
+        let read = AtomicUsize::new(0);
         let prepared: Vec<(PathBuf, Result<Prepared>)> = pool.install(|| {
             staged
                 .into_par_iter()
-                .map(|st| (st.input.clone(), prepare(st, cfg, opts, &mappings)))
+                .map(|st| {
+                    let name = label(&st.input);
+                    let r = (st.input.clone(), prepare(st, cfg, opts, &mappings));
+                    let n = read.fetch_add(1, Ordering::Relaxed) + 1;
+                    tick(n, steps, 0, format!("Reading {name}"));
+                    r
+                })
                 .collect()
         });
 
         // File and catalogue this batch in one transaction.
-        progress.update(done, total, &format!("Filing {}", label(&chunk[0])));
+        let steps = prepared.len();
         if !opts.dry_run {
             conn.execute_batch("BEGIN IMMEDIATE")?;
         }
         let mut result = Ok(());
-        for (input, prep) in prepared {
+        for (i, (input, prep)) in prepared.into_iter().enumerate() {
+            tick(i, steps, 1, format!("Filing {}", label(&input)));
             match prep {
                 Ok(p) => {
                     if let Err(e) = file_prepared(conn, cfg, opts, p, report, &mut state) {

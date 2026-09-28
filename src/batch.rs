@@ -595,9 +595,8 @@ pub fn verify(
                     0
                 };
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                if d % 64 == 0 || d == total {
-                    progress.update(d, total, "Verifying files");
-                }
+                let name = p.file_name().unwrap_or_default().to_string_lossy();
+                progress.update(d, total, &format!("Verifying {name}"));
                 (f, state)
             })
             .collect()
