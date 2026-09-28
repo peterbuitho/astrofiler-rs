@@ -50,6 +50,7 @@ pub fn run(cfg: Config) -> Result<()> {
 /// What a double-click or the right-click menu does with an image row.
 #[derive(Clone, Copy)]
 enum RowAction {
+    FilterObject,
     ShowFolder,
     OpenViewer,
     CopyPath,
@@ -180,8 +181,6 @@ pub struct App {
     sort: SortKey,
     sort_desc: bool,
     selected: HashSet<String>,
-    /// "Show selected only": the rows selected when it was switched on.
-    only: Option<HashSet<String>>,
     anchor: Option<usize>,
     edit: EditDialog,
     load: LoadDialog,
@@ -245,7 +244,6 @@ impl App {
             sort: SortKey::Date,
             sort_desc: true,
             selected: HashSet::new(),
-            only: None,
             anchor: None,
             edit: EditDialog::default(),
             load: LoadDialog {
@@ -508,7 +506,6 @@ impl App {
         }
         self.filter_key = key;
         let q = self.search.to_lowercase();
-        let mut terms: Vec<&str> = q.split_whitespace().collect();
         // Common names, looked up once per object rather than once per file.
         let objects: HashSet<&str> = self
             .files
@@ -524,19 +521,28 @@ impl App {
                 )
             })
             .collect();
-        // A search starting with an object ("M 76", "m76", "NGC 7000 Ha")
-        // shows exactly that object; matching "m" and "76" as separate words
-        // would also find every file with 76 in its time or temperature.
+        // Commas separate alternatives: "M 76, M 52 LP" shows files matching
+        // either. A part starting with an object ("M 76", "m76", "NGC 7000
+        // Ha") shows exactly that object; matching "m" and "76" as separate
+        // words would also find every file with 76 in its time or temperature.
         let object_keys: HashSet<String> = common.keys().map(|o| names::key(o)).collect();
-        let mut object = None;
-        for n in (1..=terms.len()).rev() {
-            let k = names::key(&terms[..n].join(" "));
-            if object_keys.contains(&k) {
-                object = Some(k);
-                terms.drain(..n);
-                break;
-            }
-        }
+        let clauses: Vec<(Option<String>, Vec<&str>)> = q
+            .split(',')
+            .map(|part| {
+                let mut terms: Vec<&str> = part.split_whitespace().collect();
+                let mut object = None;
+                for n in (1..=terms.len()).rev() {
+                    let k = names::key(&terms[..n].join(" "));
+                    if object_keys.contains(&k) {
+                        object = Some(k);
+                        terms.drain(..n);
+                        break;
+                    }
+                }
+                (object, terms)
+            })
+            .filter(|(o, t)| o.is_some() || !t.is_empty())
+            .collect();
         let mut idx: Vec<usize> = self
             .files
             .iter()
@@ -549,12 +555,9 @@ impl App {
                     TypeFilter::Calibration => !matches!(kind, Some(FrameKind::Light) | None),
                     TypeFilter::Stacked => f.stacked,
                 };
-                let object_ok = object
-                    .as_ref()
-                    .is_none_or(|k| names::key(f.object.as_deref().unwrap_or("")) == *k);
-                let only_ok = self.only.as_ref().is_none_or(|ids| ids.contains(&f.id));
-                type_ok && object_ok && only_ok && {
+                type_ok && {
                     let object = f.object.as_deref().unwrap_or("");
+                    let key = names::key(object);
                     let hay = format!(
                         "{} {} {} {} {} {} {}",
                         object,
@@ -566,7 +569,11 @@ impl App {
                         f.name
                     )
                     .to_lowercase();
-                    terms.iter().all(|t| hay.contains(t))
+                    clauses.is_empty()
+                        || clauses.iter().any(|(o, terms)| {
+                            o.as_ref().is_none_or(|k| *k == key)
+                                && terms.iter().all(|t| hay.contains(t))
+                        })
                 }
             })
             .map(|(i, _)| i)
@@ -595,6 +602,22 @@ impl App {
             }
         });
         self.filtered = idx;
+    }
+
+    /// Search for the objects of the selected rows: "M 52, M 76".
+    fn filter_by_selected_objects(&mut self) {
+        let mut seen = HashSet::new();
+        let mut objects: Vec<&str> = self
+            .files
+            .iter()
+            .filter(|f| self.selected.contains(&f.id))
+            .filter_map(|f| f.object.as_deref())
+            .filter(|o| !o.trim().is_empty() && seen.insert(names::key(o)))
+            .collect();
+        objects.sort();
+        if !objects.is_empty() {
+            self.search = objects.join(", ");
+        }
     }
 
     fn request_preview(&mut self, f: &FitsFile) {
@@ -906,21 +929,12 @@ impl App {
                     self.selected.insert(self.files[i].id.clone());
                 }
             }
-            let mut only = self.only.is_some();
-            let toggle = ui
-                .add_enabled(
-                    only || n > 0,
-                    egui::SelectableLabel::new(only, "Show selected only"),
-                )
-                .on_hover_text(
-                    "Show just the rows selected now; search and the type buttons still apply. \
-                     Click again to show everything.",
-                );
-            if toggle.clicked() {
-                only = !only;
-                self.only = only.then(|| self.selected.clone());
-                // The filter only notices changes to its key; force a rerun.
-                self.filter_key.4 = usize::MAX;
+            if ui
+                .add_enabled(n > 0, egui::Button::new("🔍 Filter by object"))
+                .on_hover_text("Put the objects of the selected rows in the search field")
+                .clicked()
+            {
+                self.filter_by_selected_objects();
             }
         });
         ui.separator();
@@ -1091,6 +1105,7 @@ impl App {
                             }
                             resp.context_menu(|ui| {
                                 for (action, label) in [
+                                    (RowAction::FilterObject, "🔍 Filter by object"),
                                     (RowAction::ShowFolder, "🗁 Open containing folder"),
                                     (RowAction::OpenViewer, "🖼 Open in viewer"),
                                     (RowAction::CopyPath, "📋 Copy path"),
@@ -1138,6 +1153,10 @@ impl App {
         if let Some((i, action)) = row_action {
             let path = PathBuf::from(&self.files[self.filtered[i]].name);
             let r = match action {
+                RowAction::FilterObject => {
+                    self.filter_by_selected_objects();
+                    Ok(())
+                }
                 RowAction::ShowFolder => util::show_in_folder(&path),
                 RowAction::OpenViewer => util::open_external(&self.cfg.external_viewer, &path),
                 RowAction::CopyPath => {
