@@ -180,6 +180,8 @@ pub struct App {
     sort: SortKey,
     sort_desc: bool,
     selected: HashSet<String>,
+    /// "Show selected only": the rows selected when it was switched on.
+    only: Option<HashSet<String>>,
     anchor: Option<usize>,
     edit: EditDialog,
     load: LoadDialog,
@@ -243,6 +245,7 @@ impl App {
             sort: SortKey::Date,
             sort_desc: true,
             selected: HashSet::new(),
+            only: None,
             anchor: None,
             edit: EditDialog::default(),
             load: LoadDialog {
@@ -549,7 +552,8 @@ impl App {
                 let object_ok = object
                     .as_ref()
                     .is_none_or(|k| names::key(f.object.as_deref().unwrap_or("")) == *k);
-                type_ok && object_ok && {
+                let only_ok = self.only.as_ref().is_none_or(|ids| ids.contains(&f.id));
+                type_ok && object_ok && only_ok && {
                     let object = f.object.as_deref().unwrap_or("");
                     let hay = format!(
                         "{} {} {} {} {} {} {}",
@@ -837,6 +841,13 @@ impl App {
                     .hint_text("Search: M 76, M 76 LP, Barbell, 2026-09-27…")
                     .desired_width(260.0),
             );
+            if ui
+                .add_enabled(!self.search.is_empty(), egui::Button::new("✖"))
+                .on_hover_text("Clear the search")
+                .clicked()
+            {
+                self.search.clear();
+            }
             for (f, label) in [
                 (TypeFilter::All, "All"),
                 (TypeFilter::Light, "Lights"),
@@ -894,6 +905,22 @@ impl App {
                 for &i in &self.filtered {
                     self.selected.insert(self.files[i].id.clone());
                 }
+            }
+            let mut only = self.only.is_some();
+            let toggle = ui
+                .add_enabled(
+                    only || n > 0,
+                    egui::SelectableLabel::new(only, "Show selected only"),
+                )
+                .on_hover_text(
+                    "Show just the rows selected now; search and the type buttons still apply. \
+                     Click again to show everything.",
+                );
+            if toggle.clicked() {
+                only = !only;
+                self.only = only.then(|| self.selected.clone());
+                // The filter only notices changes to its key; force a rerun.
+                self.filter_key.4 = usize::MAX;
             }
         });
         ui.separator();
