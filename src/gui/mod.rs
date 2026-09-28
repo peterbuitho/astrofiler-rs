@@ -1985,32 +1985,28 @@ impl App {
                     }
                 });
             ui.add_space(10.0);
-            ui.columns(2, |cols| {
+            let by_object: Vec<(String, f64)> = s
+                .by_object
+                .iter()
+                .take(25)
+                .map(|(o, n, e)| {
+                    let label = match names::common_name(o, &self.cfg.object_names) {
+                        Some(name) => format!("{o} {name} ({n})"),
+                        None => format!("{o} ({n})"),
+                    };
+                    (label, *e)
+                })
+                .collect();
+            let others = |ui: &mut egui::Ui| {
                 bar_list(
-                    &mut cols[0],
-                    "Integration by object",
-                    s.by_object
-                        .iter()
-                        .take(25)
-                        .map(|(o, n, e)| {
-                            let label = match names::common_name(o, &self.cfg.object_names) {
-                                Some(name) => format!("{o} {name} ({n})"),
-                                None => format!("{o} ({n})"),
-                            };
-                            (label, *e)
-                        })
-                        .collect(),
-                    true,
-                );
-                bar_list(
-                    &mut cols[1],
+                    ui,
                     "Integration by filter",
                     s.by_filter.iter().map(|(f, e)| (f.clone(), *e)).collect(),
                     true,
                 );
-                cols[1].add_space(10.0);
+                ui.add_space(10.0);
                 bar_list(
-                    &mut cols[1],
+                    ui,
                     "Frames by telescope",
                     s.by_telescope
                         .iter()
@@ -2018,9 +2014,9 @@ impl App {
                         .collect(),
                     false,
                 );
-                cols[1].add_space(10.0);
+                ui.add_space(10.0);
                 bar_list(
-                    &mut cols[1],
+                    ui,
                     "Frames by camera",
                     s.by_instrument
                         .iter()
@@ -2028,7 +2024,18 @@ impl App {
                         .collect(),
                     false,
                 );
-            });
+            };
+            // Side by side when there is room, otherwise one under the other.
+            if ui.available_width() >= 760.0 {
+                ui.columns(2, |cols| {
+                    bar_list(&mut cols[0], "Integration by object", by_object, true);
+                    others(&mut cols[1]);
+                });
+            } else {
+                bar_list(ui, "Integration by object", by_object, true);
+                ui.add_space(10.0);
+                others(ui);
+            }
         });
     }
 
@@ -2508,18 +2515,24 @@ fn bar_list(ui: &mut egui::Ui, title: &str, rows: Vec<(String, f64)>, as_hours: 
     ui.strong(title);
     let max = rows.iter().map(|r| r.1).fold(0.0, f64::max).max(1e-9);
     let accent = ui.visuals().selection.bg_fill;
+    // Label, bar and value share the width available, so the charts shrink
+    // with the window instead of spilling into the next column.
+    let gap = ui.spacing().item_spacing.x;
+    let value_width = 70.0;
+    let avail = (ui.available_width() - value_width - 2.0 * gap).max(80.0);
+    let label_width = (avail * 0.5).min(260.0);
+    let width = (avail - label_width).max(20.0);
     for (label, v) in rows {
         ui.horizontal(|ui| {
             ui.allocate_ui_with_layout(
-                egui::vec2(220.0, 18.0),
+                egui::vec2(label_width, 18.0),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
-                    ui.set_width(220.0);
+                    ui.set_width(label_width);
                     ui.add(egui::Label::new(&label).truncate())
                         .on_hover_text(&label);
                 },
             );
-            let width = 220.0;
             let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 14.0), egui::Sense::hover());
             let w = (v / max) as f32 * width;
             ui.painter().rect_filled(
