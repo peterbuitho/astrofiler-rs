@@ -636,39 +636,37 @@ fn ingest_inner(
             progress.update(done + within, total, &msg);
         };
 
-        // Unpack containers (zip, xisf, gz) into plain FITS files.
-        let unpacked: Vec<(PathBuf, Result<Vec<Staged>>)> = pool.install(|| {
+        // Unpack containers (zip, xisf, gz) into plain FITS files, then
+        // parse, normalise and hash them, one input file per task. Progress
+        // counts input files, so slow XISF conversions move it too.
+        let read = AtomicUsize::new(0);
+        let steps = chunk.len();
+        type Read = (PathBuf, Result<Vec<(PathBuf, Result<Prepared>)>>);
+        let results: Vec<Read> = pool.install(|| {
             chunk
                 .par_iter()
                 .map(|p| {
-                    tick(0, 1, 0, format!("Reading {}", label(p)));
-                    (p.clone(), unpack(p, cfg, opts, work))
+                    let started = read.load(Ordering::Relaxed);
+                    tick(started, steps, 0, format!("Reading {}", label(p)));
+                    let r = unpack(p, cfg, opts, work).map(|staged| {
+                        staged
+                            .into_par_iter()
+                            .map(|st| (st.input.clone(), prepare(st, cfg, opts, &mappings)))
+                            .collect()
+                    });
+                    let n = read.fetch_add(1, Ordering::Relaxed) + 1;
+                    tick(n, steps, 0, format!("Reading {}", label(p)));
+                    (p.clone(), r)
                 })
                 .collect()
         });
-        let mut staged: Vec<Staged> = Vec::new();
-        for (input, r) in unpacked {
+        let mut prepared: Vec<(PathBuf, Result<Prepared>)> = Vec::new();
+        for (input, r) in results {
             match r {
-                Ok(list) => staged.extend(list),
+                Ok(list) => prepared.extend(list),
                 Err(e) => report.errors.push((input, format!("{e:#}"))),
             }
         }
-
-        // Parse, normalise and hash in parallel.
-        let steps = staged.len();
-        let read = AtomicUsize::new(0);
-        let prepared: Vec<(PathBuf, Result<Prepared>)> = pool.install(|| {
-            staged
-                .into_par_iter()
-                .map(|st| {
-                    let name = label(&st.input);
-                    let r = (st.input.clone(), prepare(st, cfg, opts, &mappings));
-                    let n = read.fetch_add(1, Ordering::Relaxed) + 1;
-                    tick(n, steps, 0, format!("Reading {name}"));
-                    r
-                })
-                .collect()
-        });
 
         // File and catalogue this batch in one transaction.
         let steps = prepared.len();
@@ -1526,6 +1524,46 @@ pub(crate) mod tests {
         assert!(repo
             .join("Stacked/M_2/Seestar_S50/Stacked_2_M 2_10.0s_IRCUT_20240801-221000.fit")
             .exists());
+    }
+
+    #[test]
+    fn progress_moves_per_file() {
+        struct Record(std::sync::Mutex<Vec<usize>>);
+        impl Progress for Record {
+            fn update(&self, done: usize, _: usize, _: &str) {
+                self.0.lock().unwrap().push(done);
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("in");
+        std::fs::create_dir_all(&src).unwrap();
+        for i in 0..70 {
+            make_frame(
+                &src,
+                &format!("f{i}.fits"),
+                "Light",
+                Some("M 2"),
+                &format!("2024-08-01T22:{:02}:{:02}", i / 60, i % 60),
+                10.0,
+                None,
+                i as f32,
+            );
+        }
+        let cfg = Config {
+            repo: tmp.path().join("repo"),
+            source: src.clone(),
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        let rec = Record(Default::default());
+        let r = ingest_folder(&mut conn, &cfg, &src, IngestOptions::COPY, &rec).unwrap();
+        assert_eq!(r.registered, 70, "{r:?}");
+        let mut seen = rec.0.into_inner().unwrap();
+        seen.sort();
+        seen.dedup();
+        // Every count within the first batch shows up, not just 64 and 70.
+        assert!((1..=64).all(|n| seen.contains(&n)), "{seen:?}");
+        assert_eq!(seen.last(), Some(&70));
     }
 
     #[test]
