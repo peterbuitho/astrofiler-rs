@@ -6,13 +6,13 @@ mod preview;
 
 use crate::batch::{self, EditOptions, ExportLayout};
 use crate::config::Config;
-use crate::db::{self, FitsFile, Mapping, Master, Session};
+use crate::db::{self, FitsFile, Mapping, Session};
 use crate::ingest::{self, IngestOptions, OnConflict, Placement};
 use crate::progress::{JobState, Progress};
 use crate::stats::{self, Stats};
 use crate::telescope::{self, Found, Link, RemoteFile};
 use crate::util::{self, FrameKind};
-use crate::{logging, masters, names, sessions};
+use crate::{logging, names, sessions};
 use anyhow::Result;
 use eframe::egui::{self, Align2, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
@@ -61,7 +61,6 @@ enum Tab {
     Images,
     Telescopes,
     Sessions,
-    Masters,
     Batch,
     Duplicates,
     Mappings,
@@ -74,7 +73,6 @@ const TABS: &[(Tab, &str)] = &[
     (Tab::Images, "Images"),
     (Tab::Telescopes, "Telescopes"),
     (Tab::Sessions, "Sessions"),
-    (Tab::Masters, "Masters"),
     (Tab::Batch, "Batch"),
     (Tab::Duplicates, "Duplicates"),
     (Tab::Mappings, "Mappings"),
@@ -194,7 +192,6 @@ pub struct App {
     sessions: Vec<Session>,
     session_sel: Option<String>,
     session_files: Vec<FitsFile>,
-    masters: Vec<Master>,
     dup_groups: Vec<Vec<FitsFile>>,
     mappings: Vec<Mapping>,
     new_map: (String, String, String),
@@ -262,7 +259,6 @@ impl App {
             sessions: vec![],
             session_sel: None,
             session_files: vec![],
-            masters: vec![],
             dup_groups: vec![],
             mappings: vec![],
             new_map: ("TELESCOP".into(), String::new(), String::new()),
@@ -362,7 +358,6 @@ impl App {
             let conn = self.conn()?;
             self.files = db::all_files(&conn, false)?;
             self.sessions = db::all_sessions(&conn)?;
-            self.masters = db::masters(&conn, false)?;
             self.mappings = db::mappings(&conn)?;
             self.dup_groups = batch::duplicate_groups(&conn)?;
             if let Some(id) = &self.session_sel {
@@ -803,7 +798,6 @@ impl eframe::App for App {
             Tab::Images => self.images_tab(ui, ctx),
             Tab::Telescopes => self.telescopes_tab(ui),
             Tab::Sessions => self.sessions_tab(ui),
-            Tab::Masters => self.masters_tab(ui),
             Tab::Batch => self.batch_tab(ui),
             Tab::Duplicates => self.duplicates_tab(ui),
             Tab::Mappings => self.mappings_tab(ui),
@@ -1447,17 +1441,7 @@ impl App {
             }
             if let Some(id) = self.session_sel.clone() {
                 ui.separator();
-                let sess = self.sessions.iter().find(|s| s.id == id).cloned();
-                if let Some(s) = sess {
-                    if s.is_calibration() && ui.button("⭐ Create master from session").clicked() {
-                        let sid = s.id.clone();
-                        self.spawn("Create master", move |conn, cfg, p| {
-                            Ok(format!(
-                                "created {}",
-                                masters::create_from_session(conn, cfg, &sid, p)?.path
-                            ))
-                        });
-                    }
+                if self.sessions.iter().any(|s| s.id == id) {
                     if ui.button("📤 Export session…").clicked() {
                         self.picker.open("export_session", "", ui.ctx());
                     }
@@ -1591,127 +1575,6 @@ impl App {
                     });
                 });
         });
-    }
-
-    // ------------------------------------------------------------ Masters
-
-    fn masters_tab(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .button("⭐ Create missing masters")
-                .on_hover_text("Stack every calibration session that has no master yet")
-                .clicked()
-            {
-                self.spawn("Create masters", |conn, cfg, p| {
-                    let (made, errs) = masters::create_missing(conn, cfg, p)?;
-                    for (s, e) in &errs {
-                        log::warn!("session {s}: {e}");
-                    }
-                    Ok(format!("{} created, {} failed", made.len(), errs.len()))
-                });
-            }
-            if ui.button("📂 Register masters from folder…").clicked() {
-                self.picker.open("masters", "", ui.ctx());
-            }
-            if let Some(dir) = self.picker.take("masters") {
-                {
-                    self.spawn("Register masters", move |conn, cfg, p| {
-                        let (n, errs) =
-                            masters::register_folder(conn, cfg, Path::new(&dir), false, p)?;
-                        Ok(format!("{n} registered, {} errors", errs.len()))
-                    });
-                }
-            }
-            if ui.button("✔ Validate").clicked() {
-                self.spawn("Validate masters", |conn, _, p| {
-                    let r = masters::validate(conn, p)?;
-                    Ok(format!(
-                        "{} ok, {} missing, {} changed",
-                        r.ok,
-                        r.missing.len(),
-                        r.corrupt.len()
-                    ))
-                });
-            }
-            if ui.button("Clean up missing").clicked() {
-                let r = self.conn().and_then(|c| masters::cleanup_missing(&c));
-                self.status = match r {
-                    Ok(v) => format!("{} missing masters removed", v.len()),
-                    Err(e) => format!("{e:#}"),
-                };
-                self.reload();
-            }
-        });
-        ui.separator();
-        let mut remove: Option<i64> = None;
-        TableBuilder::new(ui)
-            .striped(true)
-            .resizable(true)
-            .column(Column::initial(70.0).clip(true))
-            .column(Column::initial(60.0).clip(true))
-            .column(Column::initial(60.0).clip(true))
-            .column(Column::initial(70.0).clip(true))
-            .column(Column::initial(170.0).clip(true))
-            .column(Column::initial(40.0).clip(true))
-            .column(Column::remainder().clip(true))
-            .column(Column::exact(30.0))
-            .header(20.0, |mut h| {
-                for l in [
-                    "Type",
-                    "Frames",
-                    "Exp",
-                    "Filter",
-                    "Telescope / camera",
-                    "OK",
-                    "File",
-                    "",
-                ] {
-                    h.col(|ui| {
-                        ui.strong(l);
-                    });
-                }
-            })
-            .body(|body| {
-                body.rows(20.0, self.masters.len(), |mut row| {
-                    let m = &self.masters[row.index()];
-                    row.col(|ui| {
-                        ui.label(&m.master_type);
-                    });
-                    row.col(|ui| {
-                        ui.label(m.file_count.to_string());
-                    });
-                    row.col(|ui| {
-                        ui.label(opt(&m.exposure));
-                    });
-                    row.col(|ui| {
-                        ui.label(opt(&m.filter));
-                    });
-                    row.col(|ui| {
-                        ui.label(format!("{} / {}", opt(&m.telescope), opt(&m.instrument)));
-                    });
-                    row.col(|ui| {
-                        ui.label(if m.validated { "✔" } else { "?" });
-                    });
-                    row.col(|ui| {
-                        ui.label(&m.path);
-                    });
-                    row.col(|ui| {
-                        if ui
-                            .small_button("✖")
-                            .on_hover_text("Remove from catalogue (keeps the file)")
-                            .clicked()
-                        {
-                            remove = Some(m.id);
-                        }
-                    });
-                });
-            });
-        if let Some(id) = remove {
-            if let Err(e) = self.conn().and_then(|c| masters::delete(&c, id, false)) {
-                self.status = format!("{e:#}");
-            }
-            self.reload();
-        }
     }
 
     // ------------------------------------------------------------ Batch
@@ -1975,10 +1838,9 @@ impl App {
     fn status_counts(&self, ui: &mut egui::Ui) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(format!(
-                "{} files · {} sessions · {} masters",
+                "{} files · {} sessions",
                 self.files.len(),
-                self.sessions.len(),
-                self.masters.len()
+                self.sessions.len()
             ));
         });
     }
@@ -2011,7 +1873,6 @@ impl App {
                         ),
                         ("Size on disk", util::human_size(s.total_bytes)),
                         ("Sessions", s.sessions.to_string()),
-                        ("Masters", s.masters.to_string()),
                         (
                             "Date range",
                             format!(
@@ -2161,18 +2022,6 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut c.theme, "dark".to_string(), "Dark");
                     ui.selectable_value(&mut c.theme, "light".to_string(), "Light");
-                });
-                ui.end_row();
-                ui.label("Masters");
-                ui.horizontal(|ui| {
-                    ui.label("min frames");
-                    ui.add(egui::DragValue::new(&mut c.min_master_files).range(2..=500));
-                    ui.label("sigma clip κ");
-                    ui.add(
-                        egui::DragValue::new(&mut c.sigma_clip)
-                            .range(1.0..=10.0)
-                            .speed(0.1),
-                    );
                 });
                 ui.end_row();
                 ui.label("Seestar Wi-Fi");

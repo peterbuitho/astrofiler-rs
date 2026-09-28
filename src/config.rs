@@ -17,10 +17,6 @@ pub struct Config {
     pub external_viewer: String,
     /// `dark` or `light`.
     pub theme: String,
-    /// Minimum number of frames needed to build a master.
-    pub min_master_files: usize,
-    /// Kappa for sigma-clipped stacking.
-    pub sigma_clip: f32,
     /// Explicit database location (optional).
     pub database: Option<PathBuf>,
     /// Seestar Wi-Fi host name / IP and SMB login.
@@ -50,8 +46,6 @@ impl Default for Config {
             save_modified_headers: false,
             external_viewer: String::new(),
             theme: "dark".into(),
-            min_master_files: 2,
-            sigma_clip: 3.0,
             database: None,
             seestar_host: "seestar.local".into(),
             seestar_username: "guest".into(),
@@ -128,12 +122,6 @@ impl Config {
         if let Some(v) = get("theme") {
             cfg.theme = v.to_ascii_lowercase();
         }
-        if let Some(v) = get("min_master_files").and_then(|v| v.parse().ok()) {
-            cfg.min_master_files = v;
-        }
-        if let Some(v) = get("sigma_clip").and_then(|v| v.parse().ok()) {
-            cfg.sigma_clip = v;
-        }
         if let Some(v) = get("seestar_host").filter(|v| !v.is_empty()) {
             cfg.seestar_host = v;
         }
@@ -188,8 +176,6 @@ impl Config {
             .set("on_conflict", self.on_conflict.key())
             .set("external_viewer", self.external_viewer.clone())
             .set("theme", self.theme.clone())
-            .set("min_master_files", self.min_master_files.to_string())
-            .set("sigma_clip", self.sigma_clip.to_string())
             .set("seestar_host", self.seestar_host.clone())
             .set("seestar_username", self.seestar_username.clone())
             .set("seestar_password", self.seestar_password.clone())
@@ -244,9 +230,5 @@ impl Config {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("astrofiler")
             .join("astrofiler.db")
-    }
-
-    pub fn masters_dir(&self) -> PathBuf {
-        self.repo.join("Masters")
     }
 }

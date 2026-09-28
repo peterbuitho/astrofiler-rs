@@ -2,7 +2,7 @@
 //!
 //! A Rust port of the core of [AstroFiler](https://github.com/gordtulloch/astrofiler-gui):
 //! repository ingest (FITS, XISF, zip, gzip), a SQLite catalogue compatible with the
-//! original, sessions, master frames, batch management, duplicates, statistics and
+//! original, sessions, batch management, duplicates, statistics and
 //! Seestar / DWARF import over Wi-Fi or USB-C.
 
 pub mod batch;
@@ -11,7 +11,6 @@ pub mod db;
 pub mod fits;
 pub mod ingest;
 pub mod logging;
-pub mod masters;
 pub mod names;
 pub mod progress;
 pub mod sessions;

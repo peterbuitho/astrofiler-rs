@@ -14,7 +14,6 @@ pub struct Stats {
     pub light_files: usize,
     pub calibration_files: usize,
     pub sessions: usize,
-    pub masters: usize,
     pub first_date: Option<String>,
     pub last_date: Option<String>,
     /// object -> (frames, integration seconds)
@@ -97,7 +96,6 @@ pub fn compute(conn: &Connection) -> Result<Stats> {
     s.sessions = conn.query_row("SELECT count(*) FROM fitsSession", [], |r| {
         r.get::<_, i64>(0)
     })? as usize;
-    s.masters = db::masters(conn, false)?.len();
     Ok(s)
 }
 

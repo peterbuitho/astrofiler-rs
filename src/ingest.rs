@@ -8,7 +8,6 @@
 use crate::config::Config;
 use crate::db::{self, FitsFile, Mapping};
 use crate::fits::{self, Header, Value};
-use crate::masters;
 use crate::progress::Progress;
 use crate::util::{self, sanitize, FrameKind};
 use anyhow::{anyhow, bail, Context, Result};
@@ -117,7 +116,6 @@ impl IngestOptions {
 #[derive(Debug, Default)]
 pub struct IngestReport {
     pub registered: usize,
-    pub masters: usize,
     /// Files a telescope module asked to skip.
     pub skipped: usize,
     /// Files whose content is already in the catalogue (e.g. loaded before).
@@ -149,9 +147,8 @@ impl IngestReport {
             "registered"
         };
         let mut out = format!(
-            "{} {verb}, {} masters, {} already in catalogue, {} duplicate copies",
+            "{} {verb}, {} already in catalogue, {} duplicate copies",
             self.registered,
-            self.masters,
             self.already_catalogued,
             self.duplicates.len() - self.already_catalogued,
         );
@@ -219,7 +216,7 @@ impl IngestReport {
 
 /// Recursively collect importable files under `dir`.
 /// Folders the repository manages itself.
-pub const MANAGED_DIRS: &[&str] = &["Light", "Calibrate", "Stacked", "Masters", "Archive"];
+pub const MANAGED_DIRS: &[&str] = &["Light", "Calibrate", "Stacked", "Archive"];
 
 pub fn collect_files(dir: &Path, exclude: &[PathBuf]) -> Vec<PathBuf> {
     WalkDir::new(dir)
@@ -537,10 +534,6 @@ enum Prepared {
         hash: Option<String>,
         rewrite: bool,
     },
-    Master {
-        staged: Staged,
-        header: Header,
-    },
 }
 
 pub fn ingest_files(
@@ -678,7 +671,7 @@ fn ingest_inner(
             tick(i, steps, 1, format!("Filing {}", label(&input)));
             match prep {
                 Ok(p) => {
-                    if let Err(e) = file_prepared(conn, cfg, opts, p, report, &mut state) {
+                    if let Err(e) = file_prepared(conn, opts, p, report, &mut state) {
                         result = Err(e);
                         break;
                     }
@@ -706,38 +699,12 @@ fn ingest_inner(
 
 fn file_prepared(
     conn: &Connection,
-    cfg: &Config,
     opts: IngestOptions,
     prep: Prepared,
     report: &mut IngestReport,
     state: &mut FileState,
 ) -> Result<()> {
     match prep {
-        Prepared::Master { staged, header } => {
-            let placement = if staged.temp {
-                Placement::Move
-            } else {
-                opts.placement
-            };
-            if opts.dry_run {
-                let dest = match placement {
-                    Placement::InPlace => staged.path.clone(),
-                    _ => cfg
-                        .masters_dir()
-                        .join(staged.input.file_name().unwrap_or_default()),
-                };
-                report.masters += 1;
-                report.placed.push((staged.input, dest));
-                return Ok(());
-            }
-            match masters::register_master(conn, cfg, &staged.path, &header, placement) {
-                Ok((_, final_path)) => {
-                    report.masters += 1;
-                    report.placed.push((staged.input, final_path));
-                }
-                Err(e) => report.errors.push((staged.input, format!("{e:#}"))),
-            }
-        }
         Prepared::Frame {
             staged,
             header,
@@ -1074,6 +1041,29 @@ fn unpack(path: &Path, cfg: &Config, opts: IngestOptions, work: &Path) -> Result
     Ok(vec![staged(path.to_path_buf(), false)])
 }
 
+/// Whether a master frame is a bias, dark or flat, from its file name,
+/// IMAGETYP or OBJECT. None for a master light.
+fn master_calibration_kind(path: &Path, h: &Header) -> Option<FrameKind> {
+    let from = |s: &str| {
+        let n = util::normalize_image_type(s);
+        if n.contains("BIAS") {
+            Some(FrameKind::Bias)
+        } else if n.contains("FLATDARK") || n.contains("DARKFLAT") {
+            Some(FrameKind::FlatDark)
+        } else if n.contains("DARK") {
+            Some(FrameKind::Dark)
+        } else if n.contains("FLAT") {
+            Some(FrameKind::Flat)
+        } else {
+            None
+        }
+    };
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    from(&name)
+        .or_else(|| from(&h.get_str("IMAGETYP").unwrap_or_default()))
+        .or_else(|| from(&h.get_str("OBJECT").unwrap_or_default()))
+}
+
 fn is_master_path(path: &Path) -> bool {
     if path
         .components()
@@ -1098,12 +1088,19 @@ fn prepare(
         .unwrap_or_default()
         .to_uppercase();
     if is_master_path(&st.input) || imagetyp.contains("MASTER") {
-        if masters::determine_master_type(&st.input, &header).is_some() {
-            return Ok(Prepared::Master { staged: st, header });
+        match master_calibration_kind(&st.input, &header) {
+            // Master bias, darks and flats are catalogued like the frames
+            // they were made from.
+            Some(kind) => {
+                if FrameKind::classify(&imagetyp) != Some(kind) {
+                    let t = format!("Master {}", kind.object_name());
+                    header.set("IMAGETYP", Value::Str(t));
+                }
+            }
+            // e.g. PixInsight `masterLight_*.xisf` or DWARF `*-AstroWizard.fits`:
+            // an integrated light, filed with the stacked results.
+            None => header.set("IMAGETYP", Value::Str("Master Light".into())),
         }
-        // e.g. PixInsight `masterLight_*.xisf` or DWARF `*-AstroWizard.fits`:
-        // an integrated light, filed with the stacked results.
-        header.set("IMAGETYP", Value::Str("Master Light".into()));
     }
     // Header fixes read folder names, so use the original location.
     let modified = normalize_header(&mut header, &st.input, mappings)?;
@@ -1536,6 +1533,53 @@ pub(crate) mod tests {
         assert!(repo
             .join("Stacked/M_2/Seestar_S50/Stacked_2_M 2_10.0s_IRCUT_20240801-221000.fit")
             .exists());
+    }
+
+    #[test]
+    fn master_calibration_frames_are_catalogued_as_calibration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("in");
+        std::fs::create_dir_all(&src).unwrap();
+        let date = "2024-10-02T08:00:00";
+        make_frame(
+            &src,
+            "masterDark_300s.fits",
+            "Master Dark",
+            None,
+            date,
+            300.0,
+            None,
+            1.0,
+        );
+        // IMAGETYP says nothing useful; the file name says flat.
+        make_frame(
+            &src,
+            "masterFlat_L.fits",
+            "Master",
+            None,
+            date,
+            1.0,
+            Some("L"),
+            2.0,
+        );
+        let cfg = Config {
+            repo: tmp.path().join("repo"),
+            source: src.clone(),
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        let r = ingest_folder(&mut conn, &cfg, &src, IngestOptions::COPY, &NoProgress).unwrap();
+        assert_eq!((r.registered, r.errors.len()), (2, 0), "{r:?}");
+        let mut kinds: Vec<Option<FrameKind>> = db::all_files(&conn, false)
+            .unwrap()
+            .iter()
+            .map(|f| {
+                assert!(f.name.contains("/Calibrate/"), "{}", f.name);
+                FrameKind::classify(f.image_type.as_deref().unwrap_or(""))
+            })
+            .collect();
+        kinds.sort_by_key(|k| format!("{k:?}"));
+        assert_eq!(kinds, [Some(FrameKind::Dark), Some(FrameKind::Flat)]);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Session grouping (port of `SessionProcessor`). Light frames are grouped by
 //! object, night and filter; calibration frames by the settings that must match
-//! for them to be stacked into a master.
+//! for them to be used together.
 
 use crate::db::{self, FitsFile, Session};
 use crate::progress::Progress;

@@ -278,7 +278,7 @@ pub fn is_light(t: &str) -> bool {
     normalize_image_type(t).contains("LIGHT")
 }
 
-/// Calibration frame class used for repository folders and master types.
+/// Frame class used for repository folders and sessions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FrameKind {
     Light,
@@ -313,27 +313,6 @@ impl FrameKind {
             Self::Dark => "Dark",
             Self::Flat => "Flat",
             Self::FlatDark => "FlatDark",
-        }
-    }
-
-    /// Master type string stored in the `Masters` table.
-    pub fn master_type(self) -> &'static str {
-        match self {
-            Self::Light => "light",
-            Self::Bias => "bias",
-            Self::Dark => "dark",
-            Self::Flat => "flat",
-            Self::FlatDark => "flatdark",
-        }
-    }
-
-    pub fn from_master_type(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "bias" => Some(Self::Bias),
-            "dark" => Some(Self::Dark),
-            "flat" => Some(Self::Flat),
-            "flatdark" => Some(Self::FlatDark),
-            _ => None,
         }
     }
 }

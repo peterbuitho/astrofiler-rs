@@ -19,7 +19,6 @@ and a command-line tool. No Python, no C libraries to install.
     Light/<Object>/<Telescope>/<Camera>/<YYYYMMDD>/M_31-RedCat_51-ASI2600MM-Ha-20241001210000-300.0s-1x1-t-10.0.fits
     Calibrate/<DARK|FLAT|BIAS|FLATDARK>/<Telescope>/<Camera>/
     Stacked/<Object>/<Telescope>/<Camera>/     (stacked results, under their original names)
-    Masters/                                   (master calibration frames)
   ```
 
   Object folders of well-known objects include the common name, e.g.
@@ -32,7 +31,10 @@ and a command-line tool. No Python, no C libraries to install.
   `Light/M_2/Seestar_S50/20260926/M_2-Seestar_S50-IRCUT-…fits`.
 
   Stacked results (Seestar `Stacked_*.fit`, DWARF `stacked-*.fits`, PixInsight
-  masters) keep the name they were given, and so do their previews.
+  master lights) keep the name they were given, and so do their previews. A
+  PixInsight master light without an OBJECT keyword takes its target from the
+  folder it is in ("NGC 1333 Embryo Nebula" → NGC 1333). Master bias, darks
+  and flats are catalogued like other calibration frames.
 
   Files filed by older versions are moved to this layout with one click (the app
   offers it), or with `astrofiler migrate-layout`.
@@ -63,8 +65,6 @@ and a command-line tool. No Python, no C libraries to install.
   AstroFiler, so an existing `astrofiler.db` can be opened directly.
 - **Sessions**: groups frames by object, night and filter (and calibration frames
   by matching settings).
-- **Master frames**: registers existing masters, builds new ones from
-  calibration sessions (parallel sigma-clipped stacking), validates checksums.
 - **Batch management**: merge objects (e.g. "Andromeda" → "M 31"), bulk-edit
   OBJECT/FILTER/TELESCOP/INSTRUME/OBSERVER/NOTES in the catalogue, headers and
   file names, export sessions or selections, delete, verify, and regenerate the catalogue.
@@ -126,8 +126,6 @@ astrofiler import dwarf --list           # list what's on a DWARF over Wi-Fi
 astrofiler import seestar --delete       # import, then delete from the telescope
 
 astrofiler sessions create
-astrofiler masters create                # build masters for all calibration sessions
-astrofiler masters register ~/old-masters --move
 astrofiler merge "Andromeda" "M 31" --headers --refile
 astrofiler set FILTER "L-Pro" --object "NGC 7000" --current "LP"
 astrofiler export ~/stack-me --session <session-id> --by-object
@@ -194,8 +192,7 @@ Improvements and fixes over the original:
   `failed_*` frames are imported instead of reported as errors;
 - stacked results are kept apart from sub-frames;
 - header mappings are actually applied on import;
-- light sessions with interleaved filters group correctly;
-- master flats keep their ADU scale.
+- light sessions with interleaved filters group correctly.
 
 ## License
 

@@ -3,7 +3,7 @@ use astrofiler::batch::{self, EditOptions, ExportLayout};
 use astrofiler::config::Config;
 use astrofiler::progress::{BarProgress, NoProgress};
 use astrofiler::telescope::{self, Link};
-use astrofiler::{db, fits, ingest, logging, masters, sessions, stats, util, xisf};
+use astrofiler::{db, fits, ingest, logging, sessions, stats, util, xisf};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -98,11 +98,6 @@ enum Cmd {
     Sessions {
         #[command(subcommand)]
         action: SessionCmd,
-    },
-    /// Master calibration frames
-    Masters {
-        #[command(subcommand)]
-        action: MasterCmd,
     },
     /// Rename an object everywhere (e.g. "Andromeda" -> "M 31")
     Merge {
@@ -207,27 +202,6 @@ enum SessionCmd {
 }
 
 #[derive(Subcommand)]
-enum MasterCmd {
-    List,
-    /// Build masters for calibration sessions (all missing ones, or one session)
-    Create {
-        #[arg(long)]
-        session: Option<String>,
-    },
-    /// Register existing master files from a folder
-    Register {
-        dir: PathBuf,
-        /// Move them into <repo>/Masters
-        #[arg(long = "move")]
-        move_files: bool,
-    },
-    /// Check master files exist and match their checksum
-    Validate,
-    /// Forget masters whose files are gone
-    Cleanup,
-}
-
-#[derive(Subcommand)]
 enum MappingCmd {
     List,
     /// Map CARD value CURRENT to REPLACE (empty CURRENT = default for missing values)
@@ -245,7 +219,7 @@ enum MappingCmd {
 enum ConfigCmd {
     Show,
     /// Set a key: source, repo, save_modified_headers, external_viewer, theme,
-    /// min_master_files, sigma_clip, database, seestar_host, seestar_username,
+    /// database, seestar_host, seestar_username,
     /// seestar_password, dwarf_host, include_stacked, ui_scale (auto or e.g. 1.5)
     Set {
         key: String,
@@ -513,62 +487,6 @@ fn run(cli: Cli) -> Result<()> {
             }
             SessionCmd::Clear => println!("removed {} sessions", sessions::clear_all(&mut conn)?),
         },
-        Cmd::Masters { action } => match action {
-            MasterCmd::List => {
-                for m in db::masters(&conn, false)? {
-                    println!(
-                        "{:<9} {:>3} frames  {}  {}",
-                        m.master_type,
-                        m.file_count,
-                        if m.validated { "ok " } else { "?  " },
-                        m.path
-                    );
-                }
-            }
-            MasterCmd::Create { session } => {
-                if let Some(id) = session {
-                    let m = masters::create_from_session(&conn, &cfg, &id, &bar)?;
-                    bar.finish();
-                    println!("created {}", m.path);
-                } else {
-                    let (made, errors) = masters::create_missing(&conn, &cfg, &bar)?;
-                    bar.finish();
-                    for m in &made {
-                        println!("created {}", m.path);
-                    }
-                    for (s, e) in &errors {
-                        println!("session {s}: {e}");
-                    }
-                    println!("{} masters created, {} failed", made.len(), errors.len());
-                }
-            }
-            MasterCmd::Register { dir, move_files } => {
-                let (n, errors) =
-                    masters::register_folder(&mut conn, &cfg, &dir, move_files, &bar)?;
-                bar.finish();
-                println!("registered {n} masters");
-                for (p, e) in errors {
-                    println!("  {}: {e}", p.display());
-                }
-            }
-            MasterCmd::Validate => {
-                let r = masters::validate(&conn, &bar)?;
-                bar.finish();
-                println!(
-                    "{} ok, {} missing, {} changed/corrupt",
-                    r.ok,
-                    r.missing.len(),
-                    r.corrupt.len()
-                );
-                for p in r.missing.iter().chain(&r.corrupt) {
-                    println!("  {p}");
-                }
-            }
-            MasterCmd::Cleanup => println!(
-                "removed {} missing masters",
-                masters::cleanup_missing(&conn)?.len()
-            ),
-        },
         Cmd::Merge {
             from,
             to,
@@ -722,7 +640,6 @@ fn run(cli: Cli) -> Result<()> {
             );
             println!("Size:         {}", util::human_size(s.total_bytes));
             println!("Sessions:     {}", s.sessions);
-            println!("Masters:      {}", s.masters);
             println!(
                 "Date range:   {} .. {}",
                 s.first_date.unwrap_or_default(),
@@ -846,8 +763,6 @@ fn config_cmd(cfg: &mut Config, action: Option<&ConfigCmd>) -> Result<()> {
             println!("save_modified_headers: {}", cfg.save_modified_headers);
             println!("external_viewer:       {}", cfg.external_viewer);
             println!("theme:                 {}", cfg.theme);
-            println!("min_master_files:      {}", cfg.min_master_files);
-            println!("sigma_clip:            {}", cfg.sigma_clip);
             println!("seestar_host:          {}", cfg.seestar_host);
             println!("seestar_username:      {}", cfg.seestar_username);
             println!("dwarf_host:            {}", cfg.dwarf_host);
@@ -863,8 +778,6 @@ fn config_cmd(cfg: &mut Config, action: Option<&ConfigCmd>) -> Result<()> {
                 "save_modified_headers" => cfg.save_modified_headers = b(),
                 "external_viewer" => cfg.external_viewer = value.clone(),
                 "theme" => cfg.theme = value.clone(),
-                "min_master_files" => cfg.min_master_files = value.parse()?,
-                "sigma_clip" => cfg.sigma_clip = value.parse()?,
                 "database" => {
                     cfg.database =
                         Some(value.into()).filter(|p: &PathBuf| !p.as_os_str().is_empty())
