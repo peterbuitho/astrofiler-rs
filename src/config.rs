@@ -34,6 +34,11 @@ pub struct Config {
     /// Common names for objects, added to their folder names; they take
     /// precedence over the built-in list (`[object_names]` section).
     pub object_names: std::collections::BTreeMap<String, String>,
+    /// Address of the web version that keeps the catalogue (e.g. on a NAS).
+    pub web_url: String,
+    /// The web version's incoming folder as this machine sees it (e.g. the
+    /// mounted share); finished downloads are moved there.
+    pub inbox: PathBuf,
     /// Where this config was loaded from / will be saved to.
     pub path: PathBuf,
 }
@@ -55,6 +60,8 @@ impl Default for Config {
             ui_scale: "auto".into(),
             on_conflict: Default::default(),
             object_names: Default::default(),
+            web_url: String::new(),
+            inbox: PathBuf::new(),
             path: default_config_path(),
         }
     }
@@ -143,6 +150,12 @@ impl Config {
         if let Some(c) = get("on_conflict").and_then(|v| crate::ingest::OnConflict::parse(&v)) {
             cfg.on_conflict = c;
         }
+        if let Some(v) = get("web_url") {
+            cfg.web_url = v;
+        }
+        if let Some(v) = get("inbox") {
+            cfg.inbox = PathBuf::from(v);
+        }
         if let Some(sec) = ini.section(Some("object_names")) {
             cfg.object_names = sec
                 .iter()
@@ -180,6 +193,8 @@ impl Config {
             .set("seestar_username", self.seestar_username.clone())
             .set("seestar_password", self.seestar_password.clone())
             .set("dwarf_host", self.dwarf_host.clone())
+            .set("web_url", self.web_url.clone())
+            .set("inbox", self.inbox.to_string_lossy())
             .set(
                 "include_stacked",
                 if self.include_stacked {

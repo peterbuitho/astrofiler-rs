@@ -172,20 +172,17 @@ impl Session {
             .scan(self.transport.as_mut(), &ScanOptions { include_stacked })
     }
 
-    /// Download `files` into `dest`, import them into the repository and, if
-    /// requested, delete the originals from the telescope once catalogued
-    /// (or already present in the catalogue).
-    pub fn import(
+    /// Download `files` into `dest`, in the telescope's own folders. Returns
+    /// each file fetched, its local path and whether its size matched the
+    /// telescope's; the ones that could not be fetched go to `failed`.
+    fn fetch_all(
         &mut self,
-        conn: &mut rusqlite::Connection,
-        cfg: &Config,
         files: &[RemoteFile],
         dest: &Path,
-        delete_on_scope: bool,
         progress: &dyn Progress,
-    ) -> Result<ImportReport> {
-        let mut report = ImportReport::default();
-        let mut downloaded: Vec<(RemoteFile, PathBuf)> = Vec::new();
+        failed: &mut Vec<(String, String)>,
+    ) -> Vec<(RemoteFile, PathBuf, bool)> {
+        let mut downloaded = Vec::new();
         let total_bytes = files.iter().map(|f| f.size).sum::<u64>().max(1);
         let mut bytes = 0u64;
         for (i, f) in files.iter().enumerate() {
@@ -214,14 +211,75 @@ impl Session {
             match fetched {
                 Ok(()) => {
                     bytes += f.size;
+                    // Before the header fix below, which can change the size.
+                    let complete = std::fs::metadata(&local).is_ok_and(|m| m.len() == f.size);
                     if let Err(e) = self.telescope.after_download(&local, f) {
                         log::warn!("{}: {e:#}", local.display());
                     }
-                    downloaded.push((f.clone(), local));
+                    downloaded.push((f.clone(), local, complete));
                 }
-                Err(e) => report.failed.push((f.path.clone(), format!("{e:#}"))),
+                Err(e) => failed.push((f.path.clone(), format!("{e:#}"))),
             }
         }
+        downloaded
+    }
+
+    /// Download `files` into `dest` and nothing more: no filing, no
+    /// catalogue. If requested, a file is deleted from the telescope once
+    /// its copy has the size the telescope reported.
+    pub fn download(
+        &mut self,
+        files: &[RemoteFile],
+        dest: &Path,
+        delete_on_scope: bool,
+        progress: &dyn Progress,
+    ) -> Result<DownloadReport> {
+        let mut report = DownloadReport::default();
+        let downloaded = self.fetch_all(files, dest, progress, &mut report.failed);
+        report.downloaded = downloaded.len();
+        if delete_on_scope {
+            for (i, (remote, _, complete)) in downloaded.iter().enumerate() {
+                progress.update(
+                    i + 1,
+                    downloaded.len(),
+                    &format!("Deleting {} from telescope", remote.name),
+                );
+                if !complete {
+                    report.failed.push((
+                        remote.path.clone(),
+                        "copy is incomplete, kept on the telescope".into(),
+                    ));
+                    continue;
+                }
+                match self.transport.delete(&remote.path) {
+                    Ok(()) => report.deleted += 1,
+                    Err(e) => report
+                        .failed
+                        .push((remote.path.clone(), format!("delete: {e:#}"))),
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Download `files` into `dest`, import them into the repository and, if
+    /// requested, delete the originals from the telescope once catalogued
+    /// (or already present in the catalogue).
+    pub fn import(
+        &mut self,
+        conn: &mut rusqlite::Connection,
+        cfg: &Config,
+        files: &[RemoteFile],
+        dest: &Path,
+        delete_on_scope: bool,
+        progress: &dyn Progress,
+    ) -> Result<ImportReport> {
+        let mut report = ImportReport::default();
+        let downloaded: Vec<(RemoteFile, PathBuf)> = self
+            .fetch_all(files, dest, progress, &mut report.failed)
+            .into_iter()
+            .map(|(f, p, _)| (f, p))
+            .collect();
         report.downloaded = downloaded.len();
 
         progress.update(0, downloaded.len(), "Importing into repository...");
@@ -331,6 +389,24 @@ impl DeleteReport {
             "{} folders and {} files deleted from telescope, {} failed",
             self.folders,
             self.files,
+            self.failed.len()
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct DownloadReport {
+    pub downloaded: usize,
+    pub deleted: usize,
+    pub failed: Vec<(String, String)>,
+}
+
+impl DownloadReport {
+    pub fn summary(&self) -> String {
+        format!(
+            "{} downloaded, {} deleted from telescope, {} failed",
+            self.downloaded,
+            self.deleted,
             self.failed.len()
         )
     }

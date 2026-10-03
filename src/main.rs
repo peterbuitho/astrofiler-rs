@@ -93,6 +93,9 @@ enum Cmd {
         /// Download folder before filing (default: configured source)
         #[arg(long)]
         dest: Option<PathBuf>,
+        /// Only download into the folder: no filing, no catalogue
+        #[arg(long)]
+        download_only: bool,
     },
     /// Session grouping
     Sessions {
@@ -415,6 +418,7 @@ fn run(cli: Cli) -> Result<()> {
             delete,
             no_stacked,
             dest,
+            download_only,
         } => {
             let known: Vec<&str> = telescope::all().iter().map(|t| t.id()).collect();
             let scope = telescope::find(&scope).ok_or_else(|| {
@@ -444,6 +448,15 @@ fn run(cli: Cli) -> Result<()> {
                 return Ok(());
             }
             let dest = dest.unwrap_or_else(|| cfg.source.clone());
+            if download_only {
+                let r = session.download(&files, &dest, delete, &bar)?;
+                bar.finish();
+                println!("{}", r.summary());
+                for (p, e) in &r.failed {
+                    println!("  failed: {p}: {e}");
+                }
+                return Ok(());
+            }
             let r = session.import(&mut conn, &cfg, &files, &dest, delete, &bar)?;
             bar.finish();
             println!("{}", r.summary());
@@ -769,12 +782,16 @@ fn config_cmd(cfg: &mut Config, action: Option<&ConfigCmd>) -> Result<()> {
             println!("include_stacked:       {}", cfg.include_stacked);
             println!("ui_scale:              {}", cfg.ui_scale);
             println!("on_conflict:           {}", cfg.on_conflict.key());
+            println!("web_url:               {}", cfg.web_url);
+            println!("inbox:                 {}", cfg.inbox.display());
         }
         Some(ConfigCmd::Set { key, value }) => {
             let b = || matches!(value.to_lowercase().as_str(), "1" | "true" | "yes" | "on");
             match key.as_str() {
                 "source" => cfg.source = value.into(),
                 "repo" => cfg.repo = value.into(),
+                "web_url" => cfg.web_url = value.clone(),
+                "inbox" => cfg.inbox = value.into(),
                 "save_modified_headers" => cfg.save_modified_headers = b(),
                 "external_viewer" => cfg.external_viewer = value.clone(),
                 "theme" => cfg.theme = value.clone(),

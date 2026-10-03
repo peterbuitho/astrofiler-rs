@@ -711,6 +711,78 @@ pub fn regenerate(
     )
 }
 
+#[derive(Debug, Default)]
+pub struct InboxReport {
+    pub moved: usize,
+    /// Files left where they were because the inbox already has one of that name.
+    pub skipped: Vec<PathBuf>,
+    pub errors: Vec<(PathBuf, String)>,
+}
+
+impl InboxReport {
+    pub fn summary(&self) -> String {
+        format!(
+            "{} files moved to the inbox, {} already there, {} errors",
+            self.moved,
+            self.skipped.len(),
+            self.errors.len()
+        )
+    }
+}
+
+/// Move folders (or single files) into `inbox` under their own names, e.g.
+/// finished telescope downloads on their way to the machine that keeps the
+/// catalogue. Nothing in the inbox is overwritten.
+pub fn move_to_inbox(
+    entries: &[PathBuf],
+    inbox: &Path,
+    progress: &dyn Progress,
+) -> Result<InboxReport> {
+    if !inbox.is_dir() {
+        bail!("the inbox {} is not a folder", inbox.display());
+    }
+    // (file, where it goes)
+    let mut plan: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for entry in entries {
+        let Some(name) = entry.file_name() else {
+            continue;
+        };
+        if entry.is_dir() {
+            for e in walkdir::WalkDir::new(entry)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file())
+            {
+                let rel = e.path().strip_prefix(entry).unwrap_or(e.path());
+                plan.push((e.path().to_path_buf(), inbox.join(name).join(rel)));
+            }
+        } else if entry.is_file() {
+            plan.push((entry.clone(), inbox.join(name)));
+        }
+    }
+    let mut report = InboxReport::default();
+    for (i, (from, to)) in plan.iter().enumerate() {
+        if progress.cancelled() {
+            bail!("cancelled");
+        }
+        let name = from.file_name().unwrap_or_default().to_string_lossy();
+        progress.update(i + 1, plan.len(), &format!("Moving {name}"));
+        if to.exists() {
+            report.skipped.push(from.clone());
+            continue;
+        }
+        match util::move_file(from, to) {
+            Ok(()) => report.moved += 1,
+            Err(e) => report.errors.push((from.clone(), format!("{e:#}"))),
+        }
+    }
+    for entry in entries.iter().filter(|e| e.is_dir()) {
+        remove_empty_dirs(entry);
+        std::fs::remove_dir(entry).ok();
+    }
+    Ok(report)
+}
+
 pub fn remove_empty_dirs(root: &Path) -> usize {
     let mut removed = 0;
     let dirs: Vec<PathBuf> = walkdir::WalkDir::new(root)
@@ -997,6 +1069,35 @@ mod tests {
         assert!(!h.contains("IMAGETYP"));
         assert!(new_dir.join(info).exists());
         assert!(!cfg.repo.join("Light/NGC281_-_Pacman_Nebula").exists());
+    }
+
+    #[test]
+    fn moves_folders_to_the_inbox_without_overwriting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (local, inbox) = (tmp.path().join("local"), tmp.path().join("inbox"));
+        let night = local.join("DWARF_RAW_TELE_M 31");
+        std::fs::create_dir_all(night.join("stack")).unwrap();
+        std::fs::create_dir_all(inbox.join("DWARF_RAW_TELE_M 31")).unwrap();
+        std::fs::write(night.join("a.fits"), "a").unwrap();
+        std::fs::write(night.join("stack/s.fits"), "s").unwrap();
+        std::fs::write(night.join("b.fits"), "new").unwrap();
+        std::fs::write(inbox.join("DWARF_RAW_TELE_M 31/b.fits"), "old").unwrap();
+        std::fs::write(local.join("loose.fits"), "l").unwrap();
+
+        let entries = [night.clone(), local.join("loose.fits")];
+        let r = move_to_inbox(&entries, &inbox, &NoProgress).unwrap();
+        assert_eq!((r.moved, r.skipped.len(), r.errors.len()), (3, 1, 0));
+        let there = inbox.join("DWARF_RAW_TELE_M 31");
+        assert!(there.join("a.fits").exists() && there.join("stack/s.fits").exists());
+        assert!(inbox.join("loose.fits").exists() && !local.join("loose.fits").exists());
+        // The one already in the inbox is untouched, and its twin stays local.
+        assert_eq!(
+            std::fs::read_to_string(there.join("b.fits")).unwrap(),
+            "old"
+        );
+        assert!(night.join("b.fits").exists() && !night.join("stack").exists());
+
+        assert!(move_to_inbox(&entries, &tmp.path().join("missing"), &NoProgress).is_err());
     }
 
     #[test]

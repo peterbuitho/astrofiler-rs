@@ -5,8 +5,17 @@ file-management core of [AstroFiler](https://github.com/gordtulloch/astrofiler-g
 by Gord Tulloch, focused on organising large FITS/XISF collections and importing
 straight from smart telescopes.
 
-Runs natively on **Windows, macOS (Apple Silicon) and Linux**, with a desktop app
-and a command-line tool. No Python, no C libraries to install.
+Runs natively on **Windows, macOS (Apple Silicon) and Linux**. No Python, no C
+libraries to install. It comes in three parts:
+
+- **The desktop app** downloads from your telescope into a local folder and,
+  when you are done with a session, moves it to the inbox of the web version.
+- **[AstroFiler web](https://github.com/peterbuitho/astrofiler-web)** runs next
+  to the repository, for example in Docker on a NAS, and keeps the catalogue:
+  loading, browsing, sessions, batch edits, duplicates and statistics, in your
+  browser.
+- **The command-line tool** does everything described below directly, for
+  scripts or for a repository on the same computer.
 
 ## What it does
 
@@ -36,8 +45,8 @@ and a command-line tool. No Python, no C libraries to install.
   folder it is in ("NGC 1333 Embryo Nebula" → NGC 1333). Master bias, darks
   and flats are catalogued like other calibration frames.
 
-  Files filed by older versions are moved to this layout with one click (the app
-  offers it), or with `astrofiler migrate-layout`.
+  Files filed by older versions are moved to this layout with
+  `astrofiler migrate-layout`, or from the web version's Batch page.
 
   A Seestar keeps each target in two folders on its drive: `M 2` (stacked results
   and previews) and `M 2_sub` (the sub-frames). Loading either one brings in the other.
@@ -102,13 +111,20 @@ Add `--no-default-features` for a command-line-only build.
 
 ## Quick start
 
-1. Open the app, go to **Settings**, and set the **Repository** (where organised
-   files live) and the **Incoming folder**.
-2. **Existing archive (e.g. on a NAS):** Images → *Load folder…* → pick the folder →
-   tick *Dry run* to preview → then run it for real with *Copy* (safest) or *Move*.
-3. **From a telescope:** Telescopes → plug in over USB-C (it's detected
-   automatically) or pick Wi-Fi → *Connect & list files* → *Import selected*.
-4. Sessions → *Create sessions*, then browse in **Images** and **Statistics**.
+1. Set up [AstroFiler web](https://github.com/peterbuitho/astrofiler-web) where
+   the repository is, with an incoming (inbox) folder on the same share.
+2. Open the desktop app, go to **Settings**, and set the **Download folder** (on
+   this computer), the **Inbox folder** (the web version's incoming folder as
+   this computer sees it, e.g. on the mounted share) and the **Web version**
+   address, e.g. `http://nas:8080`.
+3. **Telescopes** → plug in over USB-C (it's detected automatically) or pick
+   Wi-Fi → *Connect & list files* → *Download selected*. The files land in the
+   download folder under the telescope's own folder names, ready for stacking.
+4. **Send to inbox** → tick the folders you are done with → *Move selected to
+   inbox*. The web version's Load page opens when the move has finished.
+
+Without the web version, the command line does the same filing and
+cataloguing on this computer.
 
 ## Command line
 
@@ -124,6 +140,7 @@ astrofiler find                          # telescopes connected over USB (add --
 astrofiler import seestar --usb auto     # import from a Seestar on USB-C
 astrofiler import dwarf --list           # list what's on a DWARF over Wi-Fi
 astrofiler import seestar --delete       # import, then delete from the telescope
+astrofiler import dwarf --download-only  # only download, as the desktop app does
 
 astrofiler sessions create
 astrofiler merge "Andromeda" "M 31" --headers --refile

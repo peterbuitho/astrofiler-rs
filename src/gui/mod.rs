@@ -1,25 +1,21 @@
-//! Desktop GUI (egui). Long operations run on background threads with their
-//! own database connection; the UI polls a shared [`JobState`] for progress.
+//! Desktop GUI (egui): downloads from smart telescopes into a local folder
+//! and hands finished folders to the web version, which keeps the catalogue.
 
 mod picker;
-mod preview;
 
-use crate::batch::{self, EditOptions, ExportLayout};
+use crate::batch;
 use crate::config::Config;
-use crate::db::{self, FitsFile, Mapping, Session};
-use crate::ingest::{self, IngestOptions, OnConflict, Placement};
+use crate::logging;
 use crate::progress::{JobState, Progress};
-use crate::stats::{self, Stats};
 use crate::telescope::{self, Found, Link, RemoteFile};
-use crate::util::{self, FrameKind};
-use crate::{logging, names, sessions};
+use crate::util;
 use anyhow::Result;
 use eframe::egui::{self, Align2, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub fn run(cfg: Config) -> Result<()> {
@@ -47,108 +43,39 @@ pub fn run(cfg: Config) -> Result<()> {
     .map_err(|e| anyhow::anyhow!("GUI error: {e}"))
 }
 
-/// What a double-click or the right-click menu does with an image row.
-#[derive(Clone, Copy)]
-enum RowAction {
-    FilterObject,
-    ShowFolder,
-    OpenViewer,
-    CopyPath,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
-    Images,
     Telescopes,
-    Sessions,
-    Batch,
-    Duplicates,
-    Mappings,
-    Stats,
+    Inbox,
     Config,
     Log,
 }
 
 const TABS: &[(Tab, &str)] = &[
-    (Tab::Images, "Images"),
     (Tab::Telescopes, "Telescopes"),
-    (Tab::Sessions, "Sessions"),
-    (Tab::Batch, "Batch"),
-    (Tab::Duplicates, "Duplicates"),
-    (Tab::Mappings, "Mappings"),
-    (Tab::Stats, "Statistics"),
+    (Tab::Inbox, "Send to inbox"),
     (Tab::Config, "Settings"),
     (Tab::Log, "Log"),
 ];
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TypeFilter {
-    All,
-    Light,
-    Calibration,
-    Stacked,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SortKey {
-    Object,
-    Date,
-    Type,
-    Filter,
-    Exposure,
-    Telescope,
-}
+/// The task that moves folders to the inbox; the web version opens when it
+/// has finished.
+const MOVE_TO_INBOX: &str = "Move to inbox";
 
 struct Job {
     name: String,
     state: Arc<JobState>,
-    /// Changes the catalogue. Only one such task runs at a time (SQLite has a
-    /// single writer); read-only tasks run alongside it.
-    writes: bool,
-}
-
-type Work = Box<dyn FnOnce(&mut rusqlite::Connection, &Config, &JobState) -> Result<String> + Send>;
-
-/// A catalogue-changing task waiting for the running one to finish.
-struct Queued {
-    name: String,
-    work: Work,
 }
 
 /// Something the user must confirm before it happens.
 enum Confirm {
-    DeleteFiles {
-        ids: Vec<String>,
-        from_disk: bool,
-    },
-    RemoveDuplicates,
-    ClearSessions,
-    ImportWithDelete,
+    DownloadWithDelete,
     /// Whole telescope folders (remote paths) and single files to delete.
     DeleteFromTelescope {
         folders: Vec<String>,
         files: Vec<RemoteFile>,
     },
     QuitDuringJob,
-}
-
-#[derive(Default)]
-struct EditDialog {
-    open: bool,
-    field: usize,
-    value: String,
-    headers: bool,
-    refile: bool,
-}
-
-struct LoadDialog {
-    open: bool,
-    folder: String,
-    placement: Placement,
-    dry_run: bool,
-    on_conflict: OnConflict,
-    /// Skip checksums of files that are only renamed; fill them in afterwards.
-    quick: bool,
 }
 
 /// A line of the telescope file list: a folder, or a file of an expanded folder.
@@ -177,55 +104,34 @@ struct ScopeUi {
     dest: String,
 }
 
+/// A folder (or loose file) in the download folder.
+#[derive(Clone)]
+struct LocalEntry {
+    path: PathBuf,
+    name: String,
+    files: usize,
+    bytes: u64,
+}
+
 pub struct App {
     cfg: Config,
-    last_refresh: std::time::Instant,
     allow_close: bool,
     /// Zoom last applied from the interface-size setting (None = not yet).
     applied_zoom: Option<f32>,
     /// "Auto" interface size, worked out once the monitor size is known.
     auto_zoom: Option<f32>,
-    db_path: PathBuf,
     tab: Tab,
     status: String,
     jobs: Vec<Job>,
-    queued: VecDeque<Queued>,
     confirm: Option<Confirm>,
-
-    files: Vec<FitsFile>,
-    filtered: Vec<usize>,
-    filter_key: (String, TypeFilter, SortKey, bool, usize),
-    search: String,
-    type_filter: TypeFilter,
-    sort: SortKey,
-    sort_desc: bool,
-    selected: HashSet<String>,
-    anchor: Option<usize>,
-    edit: EditDialog,
-    load: LoadDialog,
-
-    preview_for: Option<String>,
-    preview_tex: Option<egui::TextureHandle>,
-    preview_info: String,
-    preview_rx: Option<mpsc::Receiver<(String, Result<preview::Preview, String>)>>,
     picker: picker::FolderPicker,
-
-    sessions: Vec<Session>,
-    session_sel: Option<String>,
-    session_files: Vec<FitsFile>,
-    dup_groups: Vec<Vec<FitsFile>>,
-    mappings: Vec<Mapping>,
-    new_map: (String, String, String),
-    stats: Arc<Mutex<Option<Stats>>>,
-    merge: (String, String, bool, bool),
-    export_layout_by_object: bool,
     scope: ScopeUi,
-    clean_dir: String,
+    /// What is in the download folder, and which of it is ticked.
+    local: Arc<Mutex<Vec<LocalEntry>>>,
+    local_sel: HashSet<PathBuf>,
+    /// Folder `local` was listed from (None = not listed yet).
+    local_dir: Option<String>,
     cfg_edit: Config,
-    /// Files still filed under an older layout (see `batch::layout_plan`).
-    old_layout: Arc<Mutex<usize>>,
-    /// Object and common name being added in the settings.
-    new_object_name: (String, String),
 }
 
 impl App {
@@ -236,56 +142,15 @@ impl App {
         } else {
             egui::Visuals::dark()
         });
-        let db_path = cfg.database_path();
         let mut app = App {
-            last_refresh: std::time::Instant::now(),
             allow_close: false,
             applied_zoom: None,
             auto_zoom: None,
-            db_path,
-            tab: Tab::Images,
+            tab: Tab::Telescopes,
             status: String::new(),
             jobs: Vec::new(),
-            queued: VecDeque::new(),
             confirm: None,
-            files: vec![],
-            filtered: vec![],
-            filter_key: (
-                String::from("\u{0}"),
-                TypeFilter::All,
-                SortKey::Date,
-                false,
-                usize::MAX,
-            ),
-            search: String::new(),
-            type_filter: TypeFilter::All,
-            sort: SortKey::Date,
-            sort_desc: true,
-            selected: HashSet::new(),
-            anchor: None,
-            edit: EditDialog::default(),
-            load: LoadDialog {
-                open: false,
-                folder: cfg.source.to_string_lossy().into(),
-                placement: Placement::Copy,
-                dry_run: false,
-                on_conflict: cfg.on_conflict,
-                quick: true,
-            },
-            preview_for: None,
-            preview_tex: None,
-            preview_info: String::new(),
-            preview_rx: None,
             picker: Default::default(),
-            sessions: vec![],
-            session_sel: None,
-            session_files: vec![],
-            dup_groups: vec![],
-            mappings: vec![],
-            new_map: ("TELESCOP".into(), String::new(), String::new()),
-            stats: Arc::new(Mutex::new(None)),
-            merge: (String::new(), String::new(), true, true),
-            export_layout_by_object: true,
             scope: ScopeUi {
                 telescope: 0,
                 usb: true,
@@ -300,18 +165,16 @@ impl App {
                 delete_after: false,
                 dest: cfg.source.to_string_lossy().into(),
             },
-            clean_dir: String::new(),
+            local: Arc::new(Mutex::new(vec![])),
+            local_sel: HashSet::new(),
+            local_dir: None,
             cfg_edit: cfg.clone(),
-            old_layout: Arc::new(Mutex::new(0)),
-            new_object_name: Default::default(),
             cfg,
         };
-        app.reload();
-        app.check_layout(&cc.egui_ctx);
         // Offer USB telescopes straight away.
         let usb = telescope::find_usb();
         if let Some(f) = usb.first() {
-            app.status = format!("Found {} — see the Telescopes tab", f.label);
+            app.status = format!("Found {}", f.label);
             if let Link::Usb(p) = &f.link {
                 app.scope.telescope = telescope::all()
                     .iter()
@@ -324,134 +187,29 @@ impl App {
         app
     }
 
-    /// Count, in the background, files filed under an older layout.
-    fn check_layout(&self, ctx: &egui::Context) {
-        let (cfg, db_path) = (self.cfg.clone(), self.db_path.clone());
-        let (count, ctx) = (self.old_layout.clone(), ctx.clone());
-        std::thread::spawn(move || {
-            let n = db::open(&db_path)
-                .and_then(|conn| batch::layout_plan(&conn, &cfg))
-                .map(|plan| plan.len())
-                .unwrap_or(0);
-            *count.lock().unwrap() = n;
-            ctx.request_repaint();
-        });
-    }
-
-    fn layout_banner(&mut self, ctx: &egui::Context) {
-        let n = *self.old_layout.lock().unwrap();
-        if n == 0 || self.job_active("Update folders") {
-            return;
-        }
-        egui::TopBottomPanel::top("old_layout").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(format!(
-                    "{n} files in the repository are filed the old way: object folders without \
-                     the object's name, Seestar serial-number folders or renamed stacked results."
-                ));
-                if ui.button("Move them to the current layout").clicked() {
-                    let count = self.old_layout.clone();
-                    self.spawn("Update folders", move |conn, cfg, p| {
-                        let r = batch::migrate_layout(conn, cfg, false, p)?;
-                        for (f, e) in &r.errors {
-                            log::warn!("Not moved: {} ({e})", f.display());
-                        }
-                        *count.lock().unwrap() = r.errors.len();
-                        Ok(format!(
-                            "{} files moved to the current layout{}",
-                            r.moved.len(),
-                            if r.errors.is_empty() {
-                                String::new()
-                            } else {
-                                format!(", {} not moved (see Log)", r.errors.len())
-                            }
-                        ))
-                    });
-                }
-            });
-        });
-    }
-
-    fn conn(&self) -> Result<rusqlite::Connection> {
-        db::open(&self.db_path)
-    }
-
-    fn reload(&mut self) {
-        let r = (|| -> Result<()> {
-            let conn = self.conn()?;
-            self.files = db::all_files(&conn, false)?;
-            self.sessions = db::all_sessions(&conn)?;
-            self.mappings = db::mappings(&conn)?;
-            self.dup_groups = batch::duplicate_groups(&conn)?;
-            if let Some(id) = &self.session_sel {
-                self.session_files = sessions::session_files(&conn, id)?;
-            }
-            Ok(())
-        })();
-        if let Err(e) = r {
-            self.status = format!("Database error: {e:#}");
-        }
-        let ids: HashSet<&str> = self.files.iter().map(|f| f.id.as_str()).collect();
-        self.selected.retain(|s| ids.contains(s.as_str()));
-        self.filter_key.4 = usize::MAX; // force re-filter
-        *self.stats.lock().unwrap() = None;
-    }
-
-    /// Run a task that changes the catalogue on a background thread with its
-    /// own DB connection. It waits in a queue while another such task runs.
+    /// Run a task on a background thread.
     fn spawn<F>(&mut self, name: &str, work: F)
     where
-        F: FnOnce(&mut rusqlite::Connection, &Config, &JobState) -> Result<String> + Send + 'static,
+        F: FnOnce(&Config, &JobState) -> Result<String> + Send + 'static,
     {
-        self.submit(name, true, Box::new(work));
-    }
-
-    /// Run a task that only reads the catalogue; it starts straight away.
-    fn spawn_read<F>(&mut self, name: &str, work: F)
-    where
-        F: FnOnce(&mut rusqlite::Connection, &Config, &JobState) -> Result<String> + Send + 'static,
-    {
-        self.submit(name, false, Box::new(work));
-    }
-
-    fn submit(&mut self, name: &str, writes: bool, work: Work) {
-        if self.job_active(name) {
+        if self.jobs.iter().any(|j| j.name == name) {
             self.status = format!("{name} is already running");
             return;
         }
-        if writes && self.jobs.iter().any(|j| j.writes) {
-            self.status = format!("{name} will start when the current task finishes");
-            self.queued.push_back(Queued {
-                name: name.to_string(),
-                work,
-            });
-            return;
-        }
-        self.start(name, writes, work);
-    }
-
-    fn job_active(&self, name: &str) -> bool {
-        self.jobs.iter().any(|j| j.name == name) || self.queued.iter().any(|q| q.name == name)
-    }
-
-    fn start(&mut self, name: &str, writes: bool, work: Work) {
         let state = Arc::new(JobState::default());
         let st = state.clone();
         let cfg = self.cfg.clone();
-        let db_path = self.db_path.clone();
         let label = name.to_string();
         std::thread::spawn(move || {
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                db::open(&db_path).and_then(|mut conn| work(&mut conn, &cfg, &st))
-            }))
-            .unwrap_or_else(|panic| {
-                let msg = panic
-                    .downcast_ref::<String>()
-                    .cloned()
-                    .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
-                    .unwrap_or_else(|| "unknown error".into());
-                Err(anyhow::anyhow!("internal error (please report): {msg}"))
-            });
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&cfg, &st)))
+                .unwrap_or_else(|panic| {
+                    let msg = panic
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_else(|| "unknown error".into());
+                    Err(anyhow::anyhow!("internal error (please report): {msg}"))
+                });
             if let Err(e) = &r {
                 log::error!("{label}: {e:#}");
             }
@@ -460,7 +218,6 @@ impl App {
         self.jobs.push(Job {
             name: name.to_string(),
             state,
-            writes,
         });
     }
 
@@ -469,223 +226,54 @@ impl App {
             .into_iter()
             .partition(|j| j.state.done.load(Ordering::SeqCst));
         self.jobs = running;
-        let mut reload = false;
         for job in finished {
             let result = job.state.result.lock().unwrap().take();
+            let ok = matches!(result, Some(Ok(_)));
             self.status = match result {
                 Some(Ok(msg)) => format!("{}: {msg}", job.name),
                 Some(Err(e)) => format!("{} failed: {e}", job.name),
                 None => String::new(),
             };
-            // Stats jobs only read; reloading would clear the result and loop.
-            reload |= job.name != "Statistics";
             if job.name.ends_with(" telescope") {
                 let n = self.scope.files.lock().unwrap().len();
                 self.scope.selected = vec![false; n];
                 self.scope.anchor = None;
             }
-        }
-        if reload {
-            self.reload();
-        }
-        if !self.jobs.iter().any(|j| j.writes) {
-            if let Some(q) = self.queued.pop_front() {
-                self.start(&q.name, true, q.work);
+            // Downloads and moves change what is in the download folder.
+            self.local_dir = None;
+            if job.name == MOVE_TO_INBOX && ok {
+                self.local_sel.clear();
+                // The files are in the inbox: on to loading them.
+                self.open_web("/load");
             }
         }
-        if self.jobs.is_empty() {
-            return;
+        if !self.jobs.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
-        // Loads commit in batches, so show new files as they arrive.
-        if self.jobs.iter().any(|j| j.writes)
-            && self.last_refresh.elapsed() > Duration::from_secs(3)
-        {
-            self.last_refresh = std::time::Instant::now();
-            if let Ok(files) = self.conn().and_then(|c| db::all_files(&c, false)) {
-                if files.len() != self.files.len() {
-                    self.files = files;
-                    self.filter_key.4 = usize::MAX;
-                    *self.stats.lock().unwrap() = None;
-                }
-            }
-        }
-        ctx.request_repaint_after(Duration::from_millis(100));
     }
 
-    fn refilter(&mut self) {
-        let key = (
-            self.search.clone(),
-            self.type_filter,
-            self.sort,
-            self.sort_desc,
-            self.files.len(),
-        );
-        if key == self.filter_key {
+    /// Open a page of the web version in the browser.
+    fn open_web(&mut self, page: &str) {
+        let base = self.cfg.web_url.trim().trim_end_matches('/');
+        if base.is_empty() {
+            self.status = format!(
+                "{} Set the web version's address in Settings to open it from here.",
+                self.status
+            )
+            .trim()
+            .to_string();
             return;
         }
-        self.filter_key = key;
-        let q = self.search.to_lowercase();
-        // Common names, looked up once per object rather than once per file.
-        let objects: HashSet<&str> = self
-            .files
-            .iter()
-            .filter_map(|f| f.object.as_deref())
-            .collect();
-        let common: HashMap<&str, String> = objects
-            .into_iter()
-            .map(|o| {
-                (
-                    o,
-                    names::common_name(o, &self.cfg.object_names).unwrap_or_default(),
-                )
-            })
-            .collect();
-        // Commas separate alternatives: "M 76, M 52 LP" shows files matching
-        // either. A part starting with an object ("M 76", "m76", "NGC 7000
-        // Ha") shows exactly that object; matching "m" and "76" as separate
-        // words would also find every file with 76 in its time or temperature.
-        let object_keys: HashSet<String> = common.keys().map(|o| names::key(o)).collect();
-        let clauses: Vec<(Option<String>, Vec<&str>)> = q
-            .split(',')
-            .map(|part| {
-                let mut terms: Vec<&str> = part.split_whitespace().collect();
-                let mut object = None;
-                for n in (1..=terms.len()).rev() {
-                    let k = names::key(&terms[..n].join(" "));
-                    if object_keys.contains(&k) {
-                        object = Some(k);
-                        terms.drain(..n);
-                        break;
-                    }
-                }
-                (object, terms)
-            })
-            .filter(|(o, t)| o.is_some() || !t.is_empty())
-            .collect();
-        let mut idx: Vec<usize> = self
-            .files
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| {
-                let kind = FrameKind::classify(f.image_type.as_deref().unwrap_or(""));
-                let type_ok = match self.type_filter {
-                    TypeFilter::All => true,
-                    TypeFilter::Light => kind == Some(FrameKind::Light) && !f.stacked,
-                    TypeFilter::Calibration => !matches!(kind, Some(FrameKind::Light) | None),
-                    TypeFilter::Stacked => f.stacked,
-                };
-                type_ok && {
-                    let object = f.object.as_deref().unwrap_or("");
-                    let key = names::key(object);
-                    let hay = format!(
-                        "{} {} {} {} {} {} {}",
-                        object,
-                        common.get(object).map(String::as_str).unwrap_or(""),
-                        f.filter.as_deref().unwrap_or(""),
-                        f.telescope.as_deref().unwrap_or(""),
-                        f.instrument.as_deref().unwrap_or(""),
-                        f.date.as_deref().unwrap_or(""),
-                        f.name
-                    )
-                    .to_lowercase();
-                    clauses.is_empty()
-                        || clauses.iter().any(|(o, terms)| {
-                            o.as_ref().is_none_or(|k| *k == key)
-                                && terms.iter().all(|t| hay.contains(t))
-                        })
-                }
-            })
-            .map(|(i, _)| i)
-            .collect();
-        let files = &self.files;
-        let exp = |f: &FitsFile| {
-            f.exptime
-                .as_deref()
-                .and_then(|e| e.parse::<f64>().ok())
-                .unwrap_or(0.0)
+        let url = if base.contains("://") {
+            format!("{base}{page}")
+        } else {
+            format!("http://{base}{page}")
         };
-        idx.sort_by(|&a, &b| {
-            let (x, y) = (&files[a], &files[b]);
-            let o = match self.sort {
-                SortKey::Object => x.object.cmp(&y.object).then(x.date.cmp(&y.date)),
-                SortKey::Date => x.date.cmp(&y.date),
-                SortKey::Type => x.image_type.cmp(&y.image_type).then(x.date.cmp(&y.date)),
-                SortKey::Filter => x.filter.cmp(&y.filter).then(x.date.cmp(&y.date)),
-                SortKey::Exposure => exp(x).total_cmp(&exp(y)),
-                SortKey::Telescope => x.telescope.cmp(&y.telescope).then(x.date.cmp(&y.date)),
-            };
-            if self.sort_desc {
-                o.reverse()
-            } else {
-                o
-            }
-        });
-        self.filtered = idx;
-    }
-
-    /// Search for the objects of the selected rows: "M 52, M 76".
-    fn filter_by_selected_objects(&mut self) {
-        let mut seen = HashSet::new();
-        let mut objects: Vec<&str> = self
-            .files
-            .iter()
-            .filter(|f| self.selected.contains(&f.id))
-            .filter_map(|f| f.object.as_deref())
-            .filter(|o| !o.trim().is_empty() && seen.insert(names::key(o)))
-            .collect();
-        objects.sort();
-        if !objects.is_empty() {
-            self.search = objects.join(", ");
+        if let Err(e) = util::open_external("", Path::new(&url)) {
+            self.status = format!("Could not open {url}: {e:#}");
         }
     }
 
-    fn request_preview(&mut self, f: &FitsFile) {
-        if self.preview_for.as_deref() == Some(&f.id) {
-            return;
-        }
-        self.preview_for = Some(f.id.clone());
-        self.preview_info = "Loading preview...".into();
-        let (tx, rx) = mpsc::channel();
-        let path = PathBuf::from(&f.name);
-        let id = f.id.clone();
-        std::thread::spawn(move || {
-            let r = preview::render(&path, 1024).map_err(|e| format!("{e:#}"));
-            let _ = tx.send((id, r));
-        });
-        self.preview_rx = Some(rx);
-    }
-
-    fn poll_preview(&mut self, ctx: &egui::Context) {
-        let Some(rx) = &self.preview_rx else { return };
-        match rx.try_recv() {
-            Ok((id, r)) => {
-                if self.preview_for.as_deref() == Some(&id) {
-                    match r {
-                        Ok(p) => {
-                            self.preview_tex = Some(ctx.load_texture(
-                                "preview",
-                                p.image,
-                                egui::TextureOptions::LINEAR,
-                            ));
-                            self.preview_info = p.info;
-                        }
-                        Err(e) => {
-                            self.preview_tex = None;
-                            self.preview_info = format!("No preview: {e}");
-                        }
-                    }
-                }
-                self.preview_rx = None;
-            }
-            Err(mpsc::TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(50)),
-            Err(_) => self.preview_rx = None,
-        }
-    }
-
-    /// Zoom picked by "Auto": the desktop scaling, raised so text stays
-    /// readable on high-resolution screens (4K at 100% -> 150%).
-    /// Computed once and cached: the monitor size egui reports is in points,
-    /// which change with the zoom itself.
     fn auto_zoom(&mut self, ctx: &egui::Context) -> f32 {
         if let Some(z) = self.auto_zoom {
             return z;
@@ -739,10 +327,9 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_jobs(ctx);
-        self.poll_preview(ctx);
         self.apply_ui_scale(ctx);
         if ctx.input(|i| i.viewport().close_requested())
-            && !(self.jobs.is_empty() && self.queued.is_empty())
+            && !self.jobs.is_empty()
             && !self.allow_close
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -759,14 +346,21 @@ impl eframe::App for App {
                         self.tab = *tab;
                     }
                 }
+                ui.separator();
+                if ui
+                    .button("🌐 Open web version")
+                    .on_hover_text("The catalogue, in your browser")
+                    .clicked()
+                {
+                    self.status.clear();
+                    self.open_web("/");
+                }
             });
             ui.add_space(2.0);
         });
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            let mut unqueue = None;
-            for (i, job) in self.jobs.iter().enumerate() {
-                let last = i + 1 == self.jobs.len();
+            for job in &self.jobs {
                 ui.horizontal(|ui| {
                     let (done, total, msg) = job.state.snapshot();
                     ui.spinner();
@@ -789,43 +383,16 @@ impl eframe::App for App {
                     if ui.button("Cancel").clicked() {
                         job.state.cancel.store(true, Ordering::SeqCst);
                     }
-                    if last && self.queued.is_empty() {
-                        self.status_counts(ui);
-                    }
                 });
             }
-            if !self.queued.is_empty() {
-                ui.horizontal(|ui| {
-                    ui.label("Waiting:");
-                    for (i, q) in self.queued.iter().enumerate() {
-                        ui.label(&q.name);
-                        if ui.small_button("✖").on_hover_text("Don't run").clicked() {
-                            unqueue = Some(i);
-                        }
-                    }
-                    self.status_counts(ui);
-                });
-            }
-            if let Some(i) = unqueue {
-                self.queued.remove(i);
-            }
-            if self.jobs.is_empty() && self.queued.is_empty() {
-                ui.horizontal(|ui| {
-                    ui.label(&self.status);
-                    self.status_counts(ui);
-                });
+            if self.jobs.is_empty() {
+                ui.label(&self.status);
             }
         });
 
-        self.layout_banner(ctx);
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
-            Tab::Images => self.images_tab(ui, ctx),
             Tab::Telescopes => self.telescopes_tab(ui),
-            Tab::Sessions => self.sessions_tab(ui),
-            Tab::Batch => self.batch_tab(ui),
-            Tab::Duplicates => self.duplicates_tab(ui),
-            Tab::Mappings => self.mappings_tab(ui),
-            Tab::Stats => self.stats_tab(ui),
+            Tab::Inbox => self.inbox_tab(ui, ctx),
             Tab::Config => {
                 egui::ScrollArea::vertical().show(ui, |ui| self.config_tab(ui, ctx));
             }
@@ -843,375 +410,13 @@ fn interaction_style(s: &mut egui::Style) {
     s.interaction.resize_grab_radius_side = 8.0;
 }
 
-/// Status line for a bulk edit; the files that failed go to the log.
-fn edit_summary(r: &batch::EditReport) -> String {
-    for (f, e) in &r.errors {
-        log::warn!("Not changed: {f} ({e})");
-    }
-    format!(
-        "{} updated, {} moved{}",
-        r.updated,
-        r.moved,
-        if r.errors.is_empty() {
-            String::new()
-        } else {
-            format!(", {} errors (see Log)", r.errors.len())
-        }
-    )
-}
-
-fn opt(s: &Option<String>) -> &str {
-    s.as_deref().unwrap_or("")
-}
-
 impl App {
-    // ------------------------------------------------------------ Images
-
-    fn images_tab(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .button("📥 Load folder…")
-                .on_hover_text(
-                    "Load images from an incoming folder or an existing archive (e.g. on your NAS)",
-                )
-                .clicked()
-            {
-                self.load.open = true;
-            }
-            if ui
-                .button("🔄 Sync repository")
-                .on_hover_text("Catalogue files already in the repository without moving them")
-                .clicked()
-            {
-                self.spawn("Sync repository", |conn, cfg, p| {
-                    Ok(
-                        ingest::ingest_folder(conn, cfg, &cfg.repo, IngestOptions::IN_PLACE, p)?
-                            .summary(),
-                    )
-                });
-            }
-            if ui.button("Refresh").clicked() {
-                self.reload();
-            }
-            ui.separator();
-            ui.add(
-                egui::TextEdit::singleline(&mut self.search)
-                    .hint_text("Search: M 76, M 76 LP, Barbell, 2026-09-27…")
-                    .desired_width(260.0),
-            );
-            if ui
-                .add_enabled(!self.search.is_empty(), egui::Button::new("✖"))
-                .on_hover_text("Clear the search")
-                .clicked()
-            {
-                self.search.clear();
-            }
-            for (f, label) in [
-                (TypeFilter::All, "All"),
-                (TypeFilter::Light, "Lights"),
-                (TypeFilter::Calibration, "Calibration"),
-                (TypeFilter::Stacked, "Stacked"),
-            ] {
-                ui.selectable_value(&mut self.type_filter, f, label);
-            }
-        });
-        self.refilter();
-
-        ui.horizontal(|ui| {
-            let n = self.selected.len();
-            ui.label(format!("{} shown, {n} selected", self.filtered.len()));
-            ui.add_enabled_ui(n > 0, |ui| {
-                if ui.button("✏ Edit field…").clicked() {
-                    self.edit.open = true;
-                }
-                if ui.button("📤 Export…").clicked() {
-                    self.picker.open("export", "", ui.ctx());
-                }
-                if let Some(dir) = self.picker.take("export") {
-                    {
-                        let ids: Vec<String> = self.selected.iter().cloned().collect();
-                        let layout = if self.export_layout_by_object {
-                            ExportLayout::ByObject
-                        } else {
-                            ExportLayout::Flat
-                        };
-                        self.spawn_read("Export", move |conn, _, p| {
-                            Ok(format!(
-                                "{} files exported",
-                                batch::export_files(conn, &ids, Path::new(&dir), layout, false, p)?
-                            ))
-                        });
-                    }
-                }
-                if ui.button("🗑 Remove from catalogue").clicked() {
-                    self.confirm = Some(Confirm::DeleteFiles {
-                        ids: self.selected.iter().cloned().collect(),
-                        from_disk: false,
-                    });
-                }
-                if ui.button("🗑 Delete files").clicked() {
-                    self.confirm = Some(Confirm::DeleteFiles {
-                        ids: self.selected.iter().cloned().collect(),
-                        from_disk: true,
-                    });
-                }
-                if ui.button("Clear selection").clicked() {
-                    self.selected.clear();
-                }
-            });
-            if ui.button("Select all shown").clicked() {
-                for &i in &self.filtered {
-                    self.selected.insert(self.files[i].id.clone());
-                }
-            }
-            if ui
-                .add_enabled(n > 0, egui::Button::new("🔍 Filter by object"))
-                .on_hover_text("Put the objects of the selected rows in the search field")
-                .clicked()
-            {
-                self.filter_by_selected_objects();
-            }
-        });
-        ui.separator();
-
-        let full_width = ui.available_width();
-        egui::SidePanel::right("preview")
-            .resizable(true)
-            .default_width((full_width * 0.3).clamp(240.0, 420.0))
-            .min_width(200.0)
-            .max_width(full_width * 0.7)
-            .show_inside(ui, |ui| {
-                // egui remembers the panel width from its contents, so fill
-                // the width the divider was dragged to; otherwise a narrow
-                // (portrait) preview or an empty panel snaps it back.
-                ui.set_min_width(ui.available_width());
-                ui.heading("Preview");
-                if let Some(id) = self.preview_for.clone() {
-                    if let Some(f) = self.files.iter().find(|f| f.id == id) {
-                        ui.label(RichText::new(f.file_name()).small());
-                        ui.horizontal(|ui| {
-                            if ui.button("Open in viewer").clicked() {
-                                if let Err(e) = util::open_external(
-                                    &self.cfg.external_viewer,
-                                    Path::new(&f.name),
-                                ) {
-                                    self.status = format!("Could not open viewer: {e}");
-                                }
-                            }
-                            if ui.button("Show folder").clicked() {
-                                if let Err(e) = util::show_in_folder(Path::new(&f.name)) {
-                                    self.status = format!("Could not open folder: {e:#}");
-                                }
-                            }
-                        });
-                    }
-                }
-                ui.label(&self.preview_info);
-                if let Some(tex) = &self.preview_tex {
-                    let avail = ui.available_size();
-                    ui.add(
-                        egui::Image::from_texture(tex)
-                            .max_size(avail)
-                            .maintain_aspect_ratio(true),
-                    );
-                }
-            });
-
-        let mut clicked: Option<usize> = None;
-        let mut row_action: Option<(usize, RowAction)> = None;
-        let mut sort_click: Option<SortKey> = None;
-        let n = self.filtered.len();
-        // The scroll area clips the table to the space left of the preview
-        // and scrolls sideways when the columns don't fit.
-        // Dragging must not scroll: a drag that just misses the preview
-        // divider would move the table instead of the divider.
-        egui::ScrollArea::horizontal()
-            .id_salt("images_hscroll")
-            .auto_shrink([false, false])
-            .drag_to_scroll(false)
-            // Keep the table's scrollbar clear of the preview divider, or a
-            // drag aimed at the divider grabs the scrollbar.
-            .max_width(ui.available_width() - 14.0)
-            .show(ui, |ui| {
-                TableBuilder::new(ui)
-                    .striped(true)
-                    .resizable(true)
-                    .drag_to_scroll(false)
-                    .sense(egui::Sense::click())
-                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                    .column(Column::initial(150.0).clip(true).at_least(60.0))
-                    .column(Column::initial(90.0).clip(true))
-                    .column(Column::initial(140.0).clip(true))
-                    .column(Column::initial(60.0).clip(true))
-                    .column(Column::initial(55.0).clip(true))
-                    .column(Column::initial(40.0).clip(true))
-                    .column(Column::initial(50.0).clip(true))
-                    .column(Column::initial(130.0).clip(true))
-                    // No handle of its own next to the preview divider.
-                    .column(
-                        Column::remainder()
-                            .clip(true)
-                            .at_least(100.0)
-                            .resizable(false),
-                    )
-                    .header(22.0, |mut h| {
-                        let mut head =
-                            |h: &mut egui_extras::TableRow, label: &str, key: Option<SortKey>| {
-                                h.col(|ui| {
-                                    let mut text = label.to_string();
-                                    if key == Some(self.sort) {
-                                        text.push_str(if self.sort_desc { " ⏷" } else { " ⏶" });
-                                    }
-                                    if ui
-                                        .add(
-                                            egui::Label::new(RichText::new(text).strong())
-                                                .sense(egui::Sense::click()),
-                                        )
-                                        .clicked()
-                                    {
-                                        sort_click = key;
-                                    }
-                                });
-                            };
-                        head(&mut h, "Object", Some(SortKey::Object));
-                        head(&mut h, "Type", Some(SortKey::Type));
-                        head(&mut h, "Date", Some(SortKey::Date));
-                        head(&mut h, "Filter", Some(SortKey::Filter));
-                        head(&mut h, "Exp (s)", Some(SortKey::Exposure));
-                        head(&mut h, "Bin", None);
-                        head(&mut h, "Temp", None);
-                        head(&mut h, "Telescope / camera", Some(SortKey::Telescope));
-                        head(&mut h, "File", None);
-                    })
-                    .body(|body| {
-                        body.rows(20.0, n, |mut row| {
-                            let i = row.index();
-                            let f = &self.files[self.filtered[i]];
-                            row.set_selected(self.selected.contains(&f.id));
-                            let typ = if f.stacked {
-                                "STACKED".to_string()
-                            } else {
-                                opt(&f.image_type).to_string()
-                            };
-                            row.col(|ui| {
-                                ui.label(opt(&f.object));
-                            });
-                            row.col(|ui| {
-                                ui.label(typ);
-                            });
-                            row.col(|ui| {
-                                ui.label(
-                                    opt(&f.date)
-                                        .replace('T', " ")
-                                        .chars()
-                                        .take(19)
-                                        .collect::<String>(),
-                                );
-                            });
-                            row.col(|ui| {
-                                ui.label(opt(&f.filter));
-                            });
-                            row.col(|ui| {
-                                ui.label(opt(&f.exptime));
-                            });
-                            row.col(|ui| {
-                                ui.label(format!("{}x{}", opt(&f.xbin), opt(&f.ybin)));
-                            });
-                            row.col(|ui| {
-                                ui.label(opt(&f.ccd_temp));
-                            });
-                            row.col(|ui| {
-                                ui.label(format!("{} / {}", opt(&f.telescope), opt(&f.instrument)));
-                            });
-                            row.col(|ui| {
-                                ui.label(f.file_name()).on_hover_text(&f.name);
-                            });
-                            let resp = row.response();
-                            if resp.clicked() {
-                                clicked = Some(i);
-                            }
-                            // Right-clicking an unselected row selects it, as
-                            // in a file manager.
-                            if resp.secondary_clicked() && !self.selected.contains(&f.id) {
-                                clicked = Some(i);
-                            }
-                            if resp.double_clicked() {
-                                row_action = Some((i, RowAction::ShowFolder));
-                            }
-                            resp.context_menu(|ui| {
-                                for (action, label) in [
-                                    (RowAction::FilterObject, "🔍 Filter by object"),
-                                    (RowAction::ShowFolder, "🗁 Open containing folder"),
-                                    (RowAction::OpenViewer, "🖼 Open in viewer"),
-                                    (RowAction::CopyPath, "📋 Copy path"),
-                                ] {
-                                    if ui.button(label).clicked() {
-                                        row_action = Some((i, action));
-                                        ui.close_menu();
-                                    }
-                                }
-                            });
-                        });
-                    });
-            });
-
-        if let Some(k) = sort_click {
-            if self.sort == k {
-                self.sort_desc = !self.sort_desc;
-            } else {
-                self.sort = k;
-                self.sort_desc = k == SortKey::Date;
-            }
-        }
-        if let Some(i) = clicked {
-            let mods = ui.input(|inp| inp.modifiers);
-            let id = self.files[self.filtered[i]].id.clone();
-            if mods.shift {
-                let a = self.anchor.unwrap_or(i);
-                for j in a.min(i)..=a.max(i) {
-                    self.selected
-                        .insert(self.files[self.filtered[j]].id.clone());
-                }
-            } else if mods.command {
-                if !self.selected.remove(&id) {
-                    self.selected.insert(id);
-                }
-                self.anchor = Some(i);
-            } else {
-                self.selected.clear();
-                self.selected.insert(id);
-                self.anchor = Some(i);
-            }
-            let f = self.files[self.filtered[i]].clone();
-            self.request_preview(&f);
-        }
-        if let Some((i, action)) = row_action {
-            let path = PathBuf::from(&self.files[self.filtered[i]].name);
-            let r = match action {
-                RowAction::FilterObject => {
-                    self.filter_by_selected_objects();
-                    Ok(())
-                }
-                RowAction::ShowFolder => util::show_in_folder(&path),
-                RowAction::OpenViewer => util::open_external(&self.cfg.external_viewer, &path),
-                RowAction::CopyPath => {
-                    ui.ctx().copy_text(path.to_string_lossy().into_owned());
-                    self.status = format!("Copied {}", path.display());
-                    Ok(())
-                }
-            };
-            if let Err(e) = r {
-                self.status = format!("Could not open {}: {e:#}", path.display());
-            }
-        }
-    }
-
     // ------------------------------------------------------------ Telescopes
 
     fn telescopes_tab(&mut self, ui: &mut egui::Ui) {
         let scopes = telescope::all();
-        ui.heading("Import from a smart telescope");
-        ui.label("FITS files and DWARF session info (shotsInfo.json) are transferred — the telescope's JPG/PNG previews and thumbnails are skipped.");
+        ui.heading("Download from a smart telescope");
+        ui.label("FITS files and DWARF session info (shotsInfo.json) are transferred — the telescope's JPG/PNG previews and thumbnails are skipped. They are saved in the telescope's own folders.");
         ui.add_space(6.0);
 
         let found = self.scope.found.lock().unwrap().clone();
@@ -1243,7 +448,7 @@ impl App {
             }
             if ui.button("📡 Scan Wi-Fi").clicked() {
                 let slot = self.scope.found.clone();
-                self.spawn_read("Network scan", move |_, cfg, p| {
+                self.spawn("Network scan", move |cfg, p| {
                     let mut all = telescope::find_usb();
                     for t in telescope::all() {
                         all.extend(telescope::find_network(cfg, *t, p));
@@ -1316,7 +521,7 @@ impl App {
                     );
                     ui.checkbox(
                         &mut self.scope.delete_after,
-                        RichText::new("Delete from telescope after safe import")
+                        RichText::new("Delete from telescope after download")
                             .color(Color32::from_rgb(230, 150, 60)),
                     );
                 });
@@ -1334,7 +539,7 @@ impl App {
                 let slot = self.scope.files.clone();
                 let link = link.clone();
                 let stacked = self.scope.include_stacked;
-                self.spawn_read("Scanning telescope", move |_, cfg, p| {
+                self.spawn("Scanning telescope", move |cfg, p| {
                     p.update(0, 0, &format!("Connecting to {} ({link})…", t.name()));
                     let mut s = telescope::connect(cfg, t, &link)?;
                     let files = s.scan(stacked)?;
@@ -1407,14 +612,14 @@ impl App {
             if ui
                 .add_enabled(
                     sel_n > 0,
-                    egui::Button::new(RichText::new("⬇ Import selected").strong()),
+                    egui::Button::new(RichText::new("⬇ Download selected").strong()),
                 )
                 .clicked()
             {
                 if self.scope.delete_after {
-                    self.confirm = Some(Confirm::ImportWithDelete);
+                    self.confirm = Some(Confirm::DownloadWithDelete);
                 } else {
-                    self.start_import(false);
+                    self.start_download(false);
                 }
             }
             if ui
@@ -1424,7 +629,7 @@ impl App {
                         RichText::new("🗑 Delete selected").color(Color32::from_rgb(230, 120, 60)),
                     ),
                 )
-                .on_hover_text("Delete from the telescope without importing")
+                .on_hover_text("Delete from the telescope without downloading")
                 .clicked()
             {
                 // A fully ticked folder goes as a whole, previews included.
@@ -1551,7 +756,7 @@ impl App {
             });
     }
 
-    fn start_import(&mut self, delete: bool) {
+    fn start_download(&mut self, delete: bool) {
         let files: Vec<RemoteFile> = self
             .scope
             .files
@@ -1571,14 +776,15 @@ impl App {
         };
         let dest = PathBuf::from(&self.scope.dest);
         let slot = self.scope.files.clone();
-        self.spawn("Importing from telescope", move |conn, cfg, p| {
+        let stacked = self.scope.include_stacked;
+        self.spawn("Downloading from telescope", move |cfg, p| {
             let mut s = telescope::connect(cfg, t, &link)?;
-            let r = s.import(conn, cfg, &files, &dest, delete, p)?;
+            let r = s.download(&files, &dest, delete, p)?;
             for (path, e) in &r.failed {
                 log::warn!("{path}: {e}");
             }
             // Rescan so the list reflects what is left on the telescope.
-            if let Ok(left) = s.scan(true) {
+            if let Ok(left) = s.scan(stacked) {
                 *slot.lock().unwrap() = left;
             }
             Ok(r.summary())
@@ -1595,7 +801,7 @@ impl App {
         };
         let stacked = self.scope.include_stacked;
         let slot = self.scope.files.clone();
-        self.spawn_read("Deleting from telescope", move |_, cfg, p| {
+        self.spawn("Deleting from telescope", move |cfg, p| {
             let mut s = telescope::connect(cfg, t, &link)?;
             let r = s.delete(&folders, &files, p);
             for (path, e) in &r.failed {
@@ -1609,528 +815,158 @@ impl App {
         });
     }
 
-    // ------------------------------------------------------------ Sessions
+    // ------------------------------------------------------------ Inbox
 
-    fn sessions_tab(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if ui
-                .button("➕ Create sessions")
-                .on_hover_text("Group unassigned files by object, night and filter")
-                .clicked()
-            {
-                self.spawn("Create sessions", |conn, _, p| {
-                    let r = sessions::create_all(conn, p)?;
-                    Ok(format!(
-                        "{} sessions created ({} light, {} calibration)",
-                        r.total(),
-                        r.light,
-                        r.total() - r.light
-                    ))
-                });
-            }
-            if ui.button("Clear all sessions").clicked() {
-                self.confirm = Some(Confirm::ClearSessions);
-            }
-            if let Some(id) = self.session_sel.clone() {
-                ui.separator();
-                if self.sessions.iter().any(|s| s.id == id) {
-                    if ui.button("📤 Export session…").clicked() {
-                        self.picker.open("export_session", "", ui.ctx());
-                    }
-                    if let Some(dir) = self.picker.take("export_session") {
-                        {
-                            let ids: Vec<String> =
-                                self.session_files.iter().map(|f| f.id.clone()).collect();
-                            self.spawn_read("Export session", move |conn, _, p| {
-                                Ok(format!(
-                                    "{} files exported",
-                                    batch::export_files(
-                                        conn,
-                                        &ids,
-                                        Path::new(&dir),
-                                        ExportLayout::ByObject,
-                                        false,
-                                        p
-                                    )?
-                                ))
-                            });
-                        }
-                    }
-                    if ui.button("Select files in Images").clicked() {
-                        self.selected = self.session_files.iter().map(|f| f.id.clone()).collect();
-                        self.tab = Tab::Images;
-                    }
-                }
-            }
-        });
-        ui.separator();
-        let mut pick: Option<String> = None;
-        let avail = ui.available_height();
-        ui.push_id("sessions_table", |ui| {
-            TableBuilder::new(ui)
-                .striped(true)
-                .resizable(true)
-                .sense(egui::Sense::click())
-                .max_scroll_height(avail * 0.55)
-                .column(Column::initial(180.0).clip(true))
-                .column(Column::initial(95.0).clip(true))
-                .column(Column::initial(70.0).clip(true))
-                .column(Column::initial(60.0).clip(true))
-                .column(Column::initial(50.0).clip(true))
-                .column(Column::initial(55.0).clip(true))
-                .column(Column::remainder().clip(true))
-                .header(20.0, |mut h| {
-                    for l in [
-                        "Object",
-                        "Date",
-                        "Filter",
-                        "Exp",
-                        "Files",
-                        "Temp",
-                        "Telescope / camera",
-                    ] {
-                        h.col(|ui| {
-                            ui.strong(l);
-                        });
-                    }
-                })
-                .body(|body| {
-                    body.rows(20.0, self.sessions.len(), |mut row| {
-                        let s = &self.sessions[row.index()];
-                        row.set_selected(self.session_sel.as_deref() == Some(&s.id));
-                        row.col(|ui| {
-                            let name = opt(&s.object);
-                            if s.is_calibration() {
-                                ui.label(RichText::new(name).italics());
-                            } else {
-                                ui.label(name);
-                            }
-                        });
-                        row.col(|ui| {
-                            ui.label(opt(&s.date));
-                        });
-                        row.col(|ui| {
-                            ui.label(opt(&s.filter));
-                        });
-                        row.col(|ui| {
-                            ui.label(opt(&s.exposure));
-                        });
-                        row.col(|ui| {
-                            ui.label(s.file_count.to_string());
-                        });
-                        row.col(|ui| {
-                            ui.label(opt(&s.ccd_temp));
-                        });
-                        row.col(|ui| {
-                            ui.label(format!("{} / {}", opt(&s.telescope), opt(&s.imager)));
-                        });
-                        if row.response().clicked() {
-                            pick = Some(s.id.clone());
-                        }
-                    });
-                });
-        });
-        if let Some(id) = pick {
-            self.session_files = self
-                .conn()
-                .and_then(|c| sessions::session_files(&c, &id))
-                .unwrap_or_default();
-            self.session_sel = Some(id);
-        }
-        ui.separator();
-        ui.label(format!(
-            "{} files in selected session",
-            self.session_files.len()
-        ));
-        ui.push_id("session_files", |ui| {
-            TableBuilder::new(ui)
-                .striped(true)
-                .column(Column::initial(160.0).clip(true))
-                .column(Column::remainder().clip(true))
-                .header(20.0, |mut h| {
-                    h.col(|ui| {
-                        ui.strong("Date");
-                    });
-                    h.col(|ui| {
-                        ui.strong("File");
-                    });
-                })
-                .body(|body| {
-                    body.rows(18.0, self.session_files.len(), |mut row| {
-                        let f = &self.session_files[row.index()];
-                        row.col(|ui| {
-                            ui.label(opt(&f.date));
-                        });
-                        row.col(|ui| {
-                            ui.label(&f.name);
-                        });
-                    });
-                });
-        });
-    }
-
-    // ------------------------------------------------------------ Batch
-
-    fn batch_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Merge objects");
-        ui.label("Rename an object everywhere, e.g. \"Andromeda\" -> \"M 31\".");
-        let objects: Vec<String> = {
-            let mut v: Vec<String> = self
-                .files
-                .iter()
-                .filter_map(|f| f.object.clone())
-                .collect::<HashSet<_>>()
+    /// List the download folder in the background.
+    fn list_local(&mut self, ctx: &egui::Context) {
+        let dir = self.scope.dest.clone();
+        self.local_dir = Some(dir.clone());
+        let (slot, ctx) = (self.local.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let mut entries: Vec<LocalEntry> = std::fs::read_dir(&dir)
                 .into_iter()
+                .flatten()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    !p.file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+                })
+                .filter_map(|path| {
+                    let (mut files, mut bytes) = (0, 0);
+                    for f in walkdir::WalkDir::new(&path)
+                        .into_iter()
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.file_type().is_file())
+                    {
+                        files += 1;
+                        bytes += f.metadata().map(|m| m.len()).unwrap_or(0);
+                    }
+                    Some(LocalEntry {
+                        name: path.file_name()?.to_string_lossy().into_owned(),
+                        path,
+                        files,
+                        bytes,
+                    })
+                })
                 .collect();
-            v.sort();
-            v
-        };
-        ui.horizontal(|ui| {
-            ui.label("From");
-            egui::ComboBox::from_id_salt("merge_from")
-                .selected_text(&self.merge.0)
-                .width(200.0)
-                .show_ui(ui, |ui| {
-                    for o in &objects {
-                        ui.selectable_value(&mut self.merge.0, o.clone(), o);
-                    }
-                });
-            ui.label("to");
-            ui.add(egui::TextEdit::singleline(&mut self.merge.1).desired_width(200.0));
-        });
-        ui.checkbox(&mut self.merge.2, "Also rewrite OBJECT in the FITS headers");
-        ui.checkbox(&mut self.merge.3, "Also rename and re-file the files");
-        let count = self
-            .files
-            .iter()
-            .filter(|f| f.object.as_deref() == Some(self.merge.0.as_str()))
-            .count();
-        if ui
-            .add_enabled(
-                count > 0 && !self.merge.1.trim().is_empty(),
-                egui::Button::new(format!("Merge {count} files")),
-            )
-            .clicked()
-        {
-            let (from, to) = (self.merge.0.clone(), self.merge.1.trim().to_string());
-            let opts = EditOptions {
-                update_headers: self.merge.2,
-                refile: self.merge.3,
-            };
-            self.spawn("Merge objects", move |conn, cfg, p| {
-                let r = batch::merge_objects(conn, cfg, &from, &to, opts, p)?;
-                Ok(edit_summary(&r))
-            });
-        }
-        ui.separator();
-
-        ui.heading("Repository maintenance");
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .button("Verify files")
-                .on_hover_text("Check every catalogued file still exists")
-                .clicked()
-            {
-                self.spawn_read("Verify", |conn, _, p| {
-                    let r = batch::verify(conn, false, p)?;
-                    Ok(format!(
-                        "{} checked, {} missing",
-                        r.checked,
-                        r.missing.len()
-                    ))
-                });
-            }
-            if ui
-                .button("Verify checksums")
-                .on_hover_text("Re-hash every file (slower)")
-                .clicked()
-            {
-                self.spawn_read("Verify checksums", |conn, _, p| {
-                    let r = batch::verify(conn, true, p)?;
-                    for f in &r.mismatched {
-                        log::warn!("changed: {}", f.name);
-                    }
-                    Ok(format!(
-                        "{} checked, {} missing, {} changed",
-                        r.checked,
-                        r.missing.len(),
-                        r.mismatched.len()
-                    ))
-                });
-            }
-            if ui.button("Forget missing files").clicked() {
-                self.spawn("Forget missing", |conn, _, p| {
-                    Ok(format!(
-                        "{} entries removed",
-                        batch::remove_missing(conn, p)?
-                    ))
-                });
-            }
-            if ui.button("Remove empty folders").clicked() {
-                self.status = format!(
-                    "{} empty folders removed",
-                    batch::remove_empty_dirs(&self.cfg.repo)
-                );
-            }
-            if ui
-                .button("Regenerate catalogue")
-                .on_hover_text("Rebuild the catalogue by rescanning the repository")
-                .clicked()
-            {
-                self.spawn("Regenerate", |conn, cfg, p| {
-                    Ok(batch::regenerate(conn, cfg, p)?.summary())
-                });
-            }
-        });
-        ui.checkbox(
-            &mut self.export_layout_by_object,
-            "Export into <object>/<filter> folders",
-        );
-        ui.separator();
-
-        ui.heading("Clean up telescope previews");
-        ui.label("Delete JPG/PNG previews and empty Thumbnail folders under a folder (e.g. an old backup). FITS and JSON files are kept.");
-        ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.clean_dir).desired_width(360.0));
-            if ui.button("Browse…").clicked() {
-                self.picker.open("clean", &self.clean_dir, ui.ctx());
-            }
-            if let Some(p) = self.picker.take("clean") {
-                self.clean_dir = p;
-            }
-            if ui.button("Preview").clicked() {
-                match batch::clean_previews(Path::new(&self.clean_dir), true) {
-                    Ok((f, b)) => {
-                        self.status = format!(
-                            "{} preview files ({}) would be deleted",
-                            f.len(),
-                            util::human_size(b)
-                        )
-                    }
-                    Err(e) => self.status = format!("{e:#}"),
-                }
-            }
-            if ui
-                .button(RichText::new("Delete previews").color(Color32::from_rgb(230, 150, 60)))
-                .clicked()
-            {
-                let dir = self.clean_dir.clone();
-                self.spawn_read("Clean previews", move |_, _, _| {
-                    let (f, b) = batch::clean_previews(Path::new(&dir), false)?;
-                    Ok(format!(
-                        "{} files deleted, {} freed",
-                        f.len(),
-                        util::human_size(b)
-                    ))
-                });
-            }
+            entries.sort_by_key(|e| e.name.to_lowercase());
+            *slot.lock().unwrap() = entries;
+            ctx.request_repaint();
         });
     }
 
-    // ------------------------------------------------------------ Duplicates
+    fn inbox_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.local_dir.as_deref() != Some(self.scope.dest.as_str()) {
+            self.list_local(ctx);
+        }
+        let entries = self.local.lock().unwrap().clone();
+        self.local_sel
+            .retain(|p| entries.iter().any(|e| &e.path == p));
+        let inbox = self.cfg.inbox.clone();
+        let inbox_set = !inbox.as_os_str().is_empty();
 
-    fn duplicates_tab(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.heading("Send to the web version");
+        ui.label(format!(
+            "What is in the download folder {}. Move the folders you are done with to the inbox, \
+             where the web version files them into the repository.",
+            self.scope.dest
+        ));
+        if inbox_set {
+            ui.label(format!("Inbox: {}", inbox.display()));
+        } else {
+            ui.label(
+                RichText::new("Set the inbox folder in Settings first.")
+                    .color(Color32::from_rgb(230, 150, 60)),
+            );
+        }
+        ui.add_space(6.0);
+
+        let bytes: u64 = entries
+            .iter()
+            .filter(|e| self.local_sel.contains(&e.path))
+            .map(|e| e.bytes)
+            .sum();
+        ui.horizontal_wrapped(|ui| {
             ui.label(format!(
-                "{} groups of identical files (same SHA-256)",
-                self.dup_groups.len()
+                "{} of {} selected ({})",
+                self.local_sel.len(),
+                entries.len(),
+                util::human_size(bytes)
             ));
+            if ui.button("All").clicked() {
+                self.local_sel = entries.iter().map(|e| e.path.clone()).collect();
+            }
+            if ui.button("None").clicked() {
+                self.local_sel.clear();
+            }
+            if ui.button("Refresh").clicked() {
+                self.list_local(ctx);
+            }
             if ui
                 .add_enabled(
-                    !self.dup_groups.is_empty(),
-                    egui::Button::new("Delete duplicates, keep one of each"),
+                    inbox_set && !self.local_sel.is_empty(),
+                    egui::Button::new(RichText::new("📤 Move selected to inbox").strong()),
                 )
+                .on_hover_text("Then opens the web version's Load page")
                 .clicked()
             {
-                self.confirm = Some(Confirm::RemoveDuplicates);
+                let picked: Vec<PathBuf> = entries
+                    .iter()
+                    .filter(|e| self.local_sel.contains(&e.path))
+                    .map(|e| e.path.clone())
+                    .collect();
+                self.spawn(MOVE_TO_INBOX, move |cfg, p| {
+                    let r = batch::move_to_inbox(&picked, &cfg.inbox, p)?;
+                    for f in &r.skipped {
+                        log::warn!("Not moved: {} (the inbox already has it)", f.display());
+                    }
+                    for (f, e) in &r.errors {
+                        log::warn!("Not moved: {} ({e})", f.display());
+                    }
+                    Ok(r.summary())
+                });
             }
         });
         ui.separator();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for g in &self.dup_groups {
-                ui.collapsing(format!("{} × {}", g.len(), g[0].file_name()), |ui| {
-                    for (i, f) in g.iter().enumerate() {
-                        ui.label(format!(
-                            "{} {}",
-                            if i == 0 { "keep  " } else { "delete" },
-                            f.name
-                        ));
-                    }
-                });
-            }
-        });
-    }
 
-    // ------------------------------------------------------------ Mappings
-
-    fn mappings_tab(&mut self, ui: &mut egui::Ui) {
-        ui.label("Header values are rewritten on import. Leave \"current\" empty to fill in a missing or Unknown value.");
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("map_card")
-                .selected_text(&self.new_map.0)
-                .show_ui(ui, |ui| {
-                    for c in [
-                        "TELESCOP", "INSTRUME", "OBSERVER", "OBJECT", "FILTER", "NOTES",
-                    ] {
-                        ui.selectable_value(&mut self.new_map.0, c.to_string(), c);
-                    }
-                });
-            ui.add(
-                egui::TextEdit::singleline(&mut self.new_map.1)
-                    .hint_text("current value")
-                    .desired_width(180.0),
-            );
-            ui.label("->");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.new_map.2)
-                    .hint_text("replacement")
-                    .desired_width(180.0),
-            );
-            if ui.button("Add").clicked() && !self.new_map.2.trim().is_empty() {
-                let r = self.conn().and_then(|c| {
-                    db::add_mapping(&c, &self.new_map.0, &self.new_map.1, self.new_map.2.trim())
-                });
-                if let Err(e) = r {
-                    self.status = format!("{e:#}");
-                }
-                self.new_map.1.clear();
-                self.new_map.2.clear();
-                self.reload();
-            }
-        });
-        ui.separator();
-        let mut remove = None;
-        egui::Grid::new("mappings")
+        TableBuilder::new(ui)
             .striped(true)
-            .num_columns(4)
-            .show(ui, |ui| {
-                for m in &self.mappings {
-                    ui.label(&m.card);
-                    ui.label(m.current.as_deref().unwrap_or("(missing / Unknown)"));
-                    ui.label(format!("-> {}", m.replace.as_deref().unwrap_or("")));
-                    if ui.small_button("✖").clicked() {
-                        remove = Some(m.id);
-                    }
-                    ui.end_row();
+            .column(Column::auto())
+            .column(Column::initial(520.0).clip(true))
+            .column(Column::initial(70.0))
+            .column(Column::remainder())
+            .header(20.0, |mut h| {
+                for l in ["", "Folder", "Files", "Size"] {
+                    h.col(|ui| {
+                        ui.strong(l);
+                    });
                 }
+            })
+            .body(|body| {
+                body.rows(20.0, entries.len(), |mut row| {
+                    let e = &entries[row.index()];
+                    row.col(|ui| {
+                        let mut on = self.local_sel.contains(&e.path);
+                        if ui.checkbox(&mut on, "").changed() {
+                            if on {
+                                self.local_sel.insert(e.path.clone());
+                            } else {
+                                self.local_sel.remove(&e.path);
+                            }
+                        }
+                    });
+                    row.col(|ui| {
+                        ui.label(&e.name);
+                    });
+                    row.col(|ui| {
+                        ui.label(e.files.to_string());
+                    });
+                    row.col(|ui| {
+                        ui.label(util::human_size(e.bytes));
+                    });
+                });
             });
-        if let Some(id) = remove {
-            let _ = self.conn().and_then(|c| db::remove_mapping(&c, id));
-            self.reload();
-        }
-    }
-
-    // ------------------------------------------------------------ Stats
-
-    fn status_counts(&self, ui: &mut egui::Ui) {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(format!(
-                "{} files · {} sessions",
-                self.files.len(),
-                self.sessions.len()
-            ));
-        });
-    }
-
-    fn stats_tab(&mut self, ui: &mut egui::Ui) {
-        let snapshot = self.stats.lock().unwrap().clone();
-        let Some(s) = snapshot else {
-            if !self.job_active("Statistics") {
-                let slot = self.stats.clone();
-                self.spawn_read("Statistics", move |conn, _, _| {
-                    *slot.lock().unwrap() = Some(stats::compute(conn)?);
-                    Ok("updated".into())
-                });
-            }
-            ui.spinner();
-            return;
-        };
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("summary")
-                .num_columns(2)
-                .spacing([24.0, 4.0])
-                .show(ui, |ui| {
-                    for (k, v) in [
-                        (
-                            "Files",
-                            format!(
-                                "{} ({} lights, {} calibration)",
-                                s.total_files, s.light_files, s.calibration_files
-                            ),
-                        ),
-                        ("Size on disk", util::human_size(s.total_bytes)),
-                        ("Sessions", s.sessions.to_string()),
-                        (
-                            "Date range",
-                            format!(
-                                "{} -> {}",
-                                s.first_date.clone().unwrap_or_default(),
-                                s.last_date.clone().unwrap_or_default()
-                            ),
-                        ),
-                        (
-                            "Total integration",
-                            stats::hours(s.by_object.iter().map(|o| o.2).sum()),
-                        ),
-                    ] {
-                        ui.strong(k);
-                        ui.label(v);
-                        ui.end_row();
-                    }
-                });
-            ui.add_space(10.0);
-            let by_object: Vec<(String, f64)> = s
-                .by_object
-                .iter()
-                .take(25)
-                .map(|(o, n, e)| {
-                    let label = match names::common_name(o, &self.cfg.object_names) {
-                        Some(name) => format!("{o} {name} ({n})"),
-                        None => format!("{o} ({n})"),
-                    };
-                    (label, *e)
-                })
-                .collect();
-            let others = |ui: &mut egui::Ui| {
-                bar_list(
-                    ui,
-                    "Integration by filter",
-                    s.by_filter.iter().map(|(f, e)| (f.clone(), *e)).collect(),
-                    true,
-                );
-                ui.add_space(10.0);
-                bar_list(
-                    ui,
-                    "Frames by telescope",
-                    s.by_telescope
-                        .iter()
-                        .map(|(t, n)| (t.clone(), *n as f64))
-                        .collect(),
-                    false,
-                );
-                ui.add_space(10.0);
-                bar_list(
-                    ui,
-                    "Frames by camera",
-                    s.by_instrument
-                        .iter()
-                        .map(|(t, n)| (t.clone(), *n as f64))
-                        .collect(),
-                    false,
-                );
-            };
-            // Side by side when there is room, otherwise one under the other.
-            if ui.available_width() >= 760.0 {
-                ui.columns(2, |cols| {
-                    bar_list(&mut cols[0], "Integration by object", by_object, true);
-                    others(&mut cols[1]);
-                });
-            } else {
-                bar_list(ui, "Integration by object", by_object, true);
-                ui.add_space(10.0);
-                others(ui);
-            }
-        });
     }
 
     // ------------------------------------------------------------ Config
@@ -2166,46 +1002,43 @@ impl App {
                 };
                 path_row(
                     ui,
-                    "cfg_repo",
-                    "Repository",
-                    "Where organised files are kept",
-                    &mut c.repo,
+                    "cfg_source",
+                    "Download folder",
+                    "Where telescope downloads are saved on this computer",
+                    &mut c.source,
                 );
                 path_row(
                     ui,
-                    "cfg_source",
-                    "Incoming folder",
-                    "Default folder for Load and telescope downloads",
-                    &mut c.source,
+                    "cfg_inbox",
+                    "Inbox folder",
+                    "The web version's incoming folder as this computer sees it, e.g. on the mounted NAS share",
+                    &mut c.inbox,
                 );
-                ui.label("External viewer");
+                ui.label("Web version")
+                    .on_hover_text("Address of the web version that keeps the catalogue");
                 ui.add(
-                    egui::TextEdit::singleline(&mut c.external_viewer)
-                        .hint_text("e.g. siril (empty = system default)")
+                    egui::TextEdit::singleline(&mut c.web_url)
+                        .hint_text("e.g. http://nas:8080")
                         .desired_width(420.0),
                 );
                 ui.end_row();
-                ui.label("Save fixed headers");
-                ui.checkbox(
-                    &mut c.save_modified_headers,
-                    "Write normalised headers into the filed FITS files",
-                );
-                ui.end_row();
                 ui.label("Interface size");
-            ui.horizontal(|ui| {
-                let label = |v: &str| match v.parse::<f32>() {
-                    Ok(z) => format!("{:.0}%", z * 100.0),
-                    Err(_) => format!("Auto ({:.0}%)", auto * 100.0),
-                };
-                egui::ComboBox::from_id_salt("ui_scale").selected_text(label(&c.ui_scale)).show_ui(ui, |ui| {
-                    for v in ["auto", "1", "1.25", "1.5", "1.75", "2", "2.5"] {
-                        ui.selectable_value(&mut c.ui_scale, v.to_string(), label(v));
-                    }
+                ui.horizontal(|ui| {
+                    let label = |v: &str| match v.parse::<f32>() {
+                        Ok(z) => format!("{:.0}%", z * 100.0),
+                        Err(_) => format!("Auto ({:.0}%)", auto * 100.0),
+                    };
+                    egui::ComboBox::from_id_salt("ui_scale")
+                        .selected_text(label(&c.ui_scale))
+                        .show_ui(ui, |ui| {
+                            for v in ["auto", "1", "1.25", "1.5", "1.75", "2", "2.5"] {
+                                ui.selectable_value(&mut c.ui_scale, v.to_string(), label(v));
+                            }
+                        });
+                    ui.weak("Auto follows your screen resolution and desktop scaling. Ctrl +/- zooms, Ctrl 0 resets.");
                 });
-                ui.weak("Auto follows your screen resolution and desktop scaling. Ctrl +/- zooms, Ctrl 0 resets.");
-            });
-            ui.end_row();
-            ui.label("Theme");
+                ui.end_row();
+                ui.label("Theme");
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut c.theme, "dark".to_string(), "Dark");
                     ui.selectable_value(&mut c.theme, "light".to_string(), "Light");
@@ -2230,82 +1063,20 @@ impl App {
                 ui.label("Stacked results");
                 ui.checkbox(
                     &mut c.include_stacked,
-                    "Import the telescopes' own stacked results by default",
+                    "Download the telescopes' own stacked results by default",
                 );
-                ui.end_row();
-                ui.label("Name conflicts");
-                egui::ComboBox::from_id_salt("on_conflict")
-                    .selected_text(c.on_conflict.label())
-                    .show_ui(ui, |ui| {
-                        for v in OnConflict::ALL {
-                            ui.selectable_value(&mut c.on_conflict, v, v.label());
-                        }
-                    });
                 ui.end_row();
             });
         ui.add_space(8.0);
-        ui.collapsing("Object names in folder names", |ui| {
-            ui.label(
-                "Well-known objects get their common name in the folder name, e.g. \
-                 Light/M_76_Barbell_Nebula. Add names here, or change a built-in one; \
-                 leave the name empty to use just the catalogue number.",
-            );
-            let mut remove = None;
-            egui::Grid::new("object_names")
-                .num_columns(3)
-                .spacing([12.0, 4.0])
-                .show(ui, |ui| {
-                    for (object, name) in c.object_names.iter_mut() {
-                        ui.label(object.as_str());
-                        ui.add(egui::TextEdit::singleline(name).desired_width(260.0));
-                        if ui.small_button("✖").on_hover_text("Remove").clicked() {
-                            remove = Some(object.clone());
-                        }
-                        ui.end_row();
-                    }
-                    let (object, name) = &mut self.new_object_name;
-                    ui.add(
-                        egui::TextEdit::singleline(object)
-                            .hint_text("M 76")
-                            .desired_width(100.0),
-                    );
-                    ui.add(
-                        egui::TextEdit::singleline(name)
-                            .hint_text("Barbell Nebula")
-                            .desired_width(260.0),
-                    );
-                    if ui
-                        .add_enabled(!object.trim().is_empty(), egui::Button::new("Add"))
-                        .clicked()
-                    {
-                        c.object_names
-                            .insert(object.trim().to_string(), name.trim().to_string());
-                        object.clear();
-                        name.clear();
-                    }
-                    ui.end_row();
-                });
-            if let Some(o) = remove {
-                c.object_names.remove(&o);
-            }
-            let (object, _) = &self.new_object_name;
-            if !object.trim().is_empty() {
-                let current = crate::names::common_name(object, &Default::default());
-                ui.weak(match current {
-                    Some(n) => format!("Built-in name: {n}"),
-                    None => "No built-in name".to_string(),
-                });
-            }
-            ui.weak("Save the settings, then use the bar at the top to rename existing folders.");
-        });
-        ui.add_space(8.0);
         ui.label(format!("Config file: {}", self.cfg.path.display()));
-        ui.label(format!("Database: {}", self.db_path.display()));
         if ui.button("💾 Save settings").clicked() {
             match self.cfg_edit.save() {
                 Ok(()) => {
+                    // The download folder follows the setting unless it was changed by hand.
+                    if self.scope.dest == self.cfg.source.to_string_lossy() {
+                        self.scope.dest = self.cfg_edit.source.to_string_lossy().into();
+                    }
                     self.cfg = self.cfg_edit.clone();
-                    self.check_layout(ctx);
                     ctx.style_mut(interaction_style);
                     ctx.set_visuals(if self.cfg.theme == "light" {
                         egui::Visuals::light()
@@ -2313,7 +1084,6 @@ impl App {
                         egui::Visuals::dark()
                     });
                     self.scope.include_stacked = self.cfg.include_stacked;
-                    self.load.on_conflict = self.cfg.on_conflict;
                     self.status = "Settings saved".into();
                 }
                 Err(e) => self.status = format!("Could not save settings: {e:#}"),
@@ -2324,207 +1094,9 @@ impl App {
     // ------------------------------------------------------------ Dialogs
 
     fn dialogs(&mut self, ctx: &egui::Context) {
-        if self.load.open {
-            let mut open = true;
-            egui::Window::new("Load images")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    ui.label(
-                        "Folder with FITS / XISF files (incoming folder, NAS archive, USB drive…)",
-                    );
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.load.folder).desired_width(380.0),
-                        );
-                        if ui.button("Browse…").clicked() {
-                            self.picker.open("load", &self.load.folder, ui.ctx());
-                        }
-                        if let Some(p) = self.picker.take("load") {
-                            self.load.folder = p;
-                        }
-                    });
-                    let folder = Path::new(&self.load.folder);
-                    if util::is_gvfs(folder) && util::prefer_kernel_mount(folder) == folder {
-                        ui.label(
-                            RichText::new(
-                                "This folder is in GNOME's network view, where big copies have \
-                                 failed part-way and left empty files. Mounting the share (e.g. \
-                                 in /etc/fstab) is more dependable.",
-                            )
-                            .small()
-                            .color(Color32::from_rgb(230, 150, 60)),
-                        );
-                    }
-                    let also = ingest::seestar_companions(Path::new(&self.load.folder));
-                    if !also.is_empty() {
-                        let names: Vec<String> = also
-                            .iter()
-                            .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
-                            .collect();
-                        ui.label(
-                            RichText::new(format!("Also loads: {}", names.join(", ")))
-                                .small()
-                                .weak(),
-                        );
-                    }
-                    ui.add_space(6.0);
-                    ui.radio_value(
-                        &mut self.load.placement,
-                        Placement::Copy,
-                        "Copy into the repository, keep originals untouched",
-                    );
-                    ui.radio_value(
-                        &mut self.load.placement,
-                        Placement::Move,
-                        "Move into the repository (rename & organise)",
-                    );
-                    if self.load.placement == Placement::Move {
-                        ui.indent("quick", |ui| {
-                            ui.checkbox(
-                                &mut self.load.quick,
-                                "Quick move: fill in checksums afterwards",
-                            )
-                            .on_hover_text(
-                                "Files moved within one drive or NAS share are just renamed, \
-                                 like moving them in the NAS's web interface. Their checksums \
-                                 (used to spot duplicates) are filled in by a background task \
-                                 right after the load.",
-                            );
-                        });
-                    }
-                    ui.radio_value(
-                        &mut self.load.placement,
-                        Placement::InPlace,
-                        "Catalogue in place (no renaming or moving)",
-                    );
-                    ui.add_space(6.0);
-                    ui.label("If a different file already has the same name in the repository:");
-                    ui.horizontal(|ui| {
-                        for c in OnConflict::ALL {
-                            ui.radio_value(&mut self.load.on_conflict, c, c.label());
-                        }
-                    });
-                    ui.weak("Identical files are never copied twice, and empty or half-copied leftovers are always replaced.");
-                    ui.add_space(6.0);
-                    ui.checkbox(
-                        &mut self.load.dry_run,
-                        "Dry run — only show what would happen (plan is written to the log)",
-                    );
-                    ui.add_space(6.0);
-                    if ui.button(RichText::new("Start").strong()).clicked() {
-                        let src = PathBuf::from(&self.load.folder);
-                        let opts = IngestOptions {
-                            placement: self.load.placement,
-                            dry_run: self.load.dry_run,
-                            on_conflict: self.load.on_conflict,
-                            quick: self.load.quick && self.load.placement == Placement::Move,
-                        };
-                        self.submit(
-                            if opts.dry_run { "Dry run" } else { "Load" },
-                            !opts.dry_run,
-                            Box::new(move |conn, cfg, p| {
-                                let r = ingest::ingest_folder(conn, cfg, &src, opts, p)?;
-                                if opts.dry_run {
-                                    for (a, b) in &r.placed {
-                                        log::info!("plan: {} -> {}", a.display(), b.display());
-                                    }
-                                }
-                                for (a, e) in &r.errors {
-                                    log::warn!("{}: {e}", a.display());
-                                }
-                                for (a, b) in &r.conflicts {
-                                    log::warn!(
-                                        "{}: skipped, a different file already exists at {}",
-                                        a.display(),
-                                        b.display()
-                                    );
-                                }
-                                Ok(r.summary())
-                            }),
-                        );
-                        if opts.quick && !opts.dry_run {
-                            // Queued behind the load; does nothing if every
-                            // file had to be read anyway.
-                            self.submit(
-                                "Fill checksums",
-                                true,
-                                Box::new(|conn, _, p| Ok(batch::fill_checksums(conn, p)?.summary())),
-                            );
-                        }
-                        self.load.open = false;
-                    }
-                });
-            if !open {
-                self.load.open = false;
-            }
-        }
-
-        if self.edit.open {
-            let fields: Vec<&str> = batch::EDITABLE.iter().map(|e| e.0).collect();
-            let mut open = true;
-            egui::Window::new(format!("Edit {} files", self.selected.len()))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        egui::ComboBox::from_id_salt("edit_field")
-                            .selected_text(fields[self.edit.field])
-                            .show_ui(ui, |ui| {
-                                for (i, f) in fields.iter().enumerate() {
-                                    ui.selectable_value(&mut self.edit.field, i, *f);
-                                }
-                            });
-                        ui.label("=");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.edit.value).desired_width(220.0),
-                        );
-                    });
-                    ui.checkbox(
-                        &mut self.edit.headers,
-                        "Also write it into the FITS headers",
-                    );
-                    ui.checkbox(&mut self.edit.refile, "Rename and re-file to match");
-                    if ui
-                        .add_enabled(
-                            !self.edit.value.trim().is_empty(),
-                            egui::Button::new("Apply"),
-                        )
-                        .clicked()
-                    {
-                        let ids: Vec<String> = self.selected.iter().cloned().collect();
-                        let field = fields[self.edit.field].to_string();
-                        let value = self.edit.value.trim().to_string();
-                        let opts = EditOptions {
-                            update_headers: self.edit.headers,
-                            refile: self.edit.refile,
-                        };
-                        self.spawn("Edit files", move |conn, cfg, p| {
-                            let r = batch::set_field(conn, cfg, &ids, &field, &value, opts, p)?;
-                            Ok(edit_summary(&r))
-                        });
-                        self.edit.open = false;
-                    }
-                });
-            if !open {
-                self.edit.open = false;
-            }
-        }
-
         let Some(confirm) = &self.confirm else { return };
         let text = match confirm {
-            Confirm::DeleteFiles { ids, from_disk: true } => format!("Permanently delete {} files from disk?", ids.len()),
-            Confirm::DeleteFiles { ids, from_disk: false } => format!("Remove {} files from the catalogue? (files stay on disk)", ids.len()),
-            Confirm::RemoveDuplicates => {
-                let n: usize = self.dup_groups.iter().map(|g| g.len() - 1).sum();
-                format!("Delete {n} duplicate files from disk, keeping one copy of each?")
-            }
-            Confirm::ClearSessions => "Remove all sessions? Files are kept; you can re-create sessions any time.".to_string(),
-            Confirm::ImportWithDelete => "Files will be DELETED from the telescope after they are safely catalogued. Continue?".to_string(),
+            Confirm::DownloadWithDelete => "Files will be DELETED from the telescope once they are downloaded completely. Continue?".to_string(),
             Confirm::DeleteFromTelescope { folders, files } => {
                 let mut what = Vec::new();
                 if !folders.is_empty() {
@@ -2537,7 +1109,7 @@ impl App {
                     what.push(format!("{} file(s)", files.len()));
                 }
                 format!(
-                    "Permanently DELETE {} from the telescope WITHOUT importing? This cannot be undone.",
+                    "Permanently DELETE {} from the telescope WITHOUT downloading? This cannot be undone.",
                     what.join(" and ")
                 )
             }
@@ -2563,85 +1135,22 @@ impl App {
                 });
             });
         match answer {
-            Some(true) => {
-                let c = self.confirm.take().unwrap();
-                match c {
-                    Confirm::DeleteFiles { ids, from_disk } => {
-                        self.spawn("Delete", move |conn, _, _| {
-                            let (n, errs) = batch::delete_files(conn, &ids, from_disk)?;
-                            Ok(format!("{n} removed, {} errors", errs.len()))
-                        });
-                        self.selected.clear();
-                    }
-                    Confirm::RemoveDuplicates => self.spawn("Remove duplicates", |conn, _, _| {
-                        let (n, b) = batch::remove_duplicates(conn)?;
-                        Ok(format!("{n} files removed, {} freed", util::human_size(b)))
-                    }),
-                    Confirm::ClearSessions => {
-                        let r = self.conn().and_then(|mut c| sessions::clear_all(&mut c));
-                        self.status = match r {
-                            Ok(n) => format!("{n} sessions removed"),
-                            Err(e) => format!("{e:#}"),
-                        };
-                        self.session_sel = None;
-                        self.session_files.clear();
-                        self.reload();
-                    }
-                    Confirm::ImportWithDelete => self.start_import(true),
-                    Confirm::DeleteFromTelescope { folders, files } => {
-                        self.start_delete(folders, files)
-                    }
-                    Confirm::QuitDuringJob => {
-                        self.queued.clear();
-                        for job in &self.jobs {
-                            job.state.cancel.store(true, Ordering::SeqCst);
-                        }
-                        self.allow_close = true;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
+            Some(true) => match self.confirm.take().unwrap() {
+                Confirm::DownloadWithDelete => self.start_download(true),
+                Confirm::DeleteFromTelescope { folders, files } => {
+                    self.start_delete(folders, files)
                 }
-            }
+                Confirm::QuitDuringJob => {
+                    for job in &self.jobs {
+                        job.state.cancel.store(true, Ordering::SeqCst);
+                    }
+                    self.allow_close = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            },
             Some(false) => self.confirm = None,
             None => {}
         }
-    }
-}
-
-fn bar_list(ui: &mut egui::Ui, title: &str, rows: Vec<(String, f64)>, as_hours: bool) {
-    ui.strong(title);
-    let max = rows.iter().map(|r| r.1).fold(0.0, f64::max).max(1e-9);
-    let accent = ui.visuals().selection.bg_fill;
-    // Label, bar and value share the width available, so the charts shrink
-    // with the window instead of spilling into the next column.
-    let gap = ui.spacing().item_spacing.x;
-    let value_width = 70.0;
-    let avail = (ui.available_width() - value_width - 2.0 * gap).max(80.0);
-    let label_width = (avail * 0.5).min(260.0);
-    let width = (avail - label_width).max(20.0);
-    for (label, v) in rows {
-        ui.horizontal(|ui| {
-            ui.allocate_ui_with_layout(
-                egui::vec2(label_width, 18.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.set_width(label_width);
-                    ui.add(egui::Label::new(&label).truncate())
-                        .on_hover_text(&label);
-                },
-            );
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 14.0), egui::Sense::hover());
-            let w = (v / max) as f32 * width;
-            ui.painter().rect_filled(
-                egui::Rect::from_min_size(rect.min, egui::vec2(w.max(1.0), rect.height())),
-                3.0,
-                accent,
-            );
-            ui.label(if as_hours {
-                stats::hours(v)
-            } else {
-                format!("{v:.0}")
-            });
-        });
     }
 }
 
