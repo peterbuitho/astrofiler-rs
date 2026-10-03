@@ -119,9 +119,11 @@ pub fn set_field(
     Ok(report)
 }
 
-/// Move the companion files (session info, stack previews) of a folder whose
-/// frames have all been re-filed to where the frames went.
+/// Once every frame of a folder has been re-filed, move what is left in it
+/// (session info, stack previews) to where the frames went. Filed companions
+/// carry their source folder's name, so they are not told apart by name.
 fn move_sidecars(old: &Path, new: &Path) {
+    let is_image = |p: &Path| util::is_supported_file(p) && !util::is_sidecar(p);
     let files: Vec<PathBuf> = match std::fs::read_dir(old) {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
@@ -130,13 +132,10 @@ fn move_sidecars(old: &Path, new: &Path) {
             .collect(),
         Err(_) => return,
     };
-    if files
-        .iter()
-        .any(|p| util::is_supported_file(p) && !util::is_sidecar(p))
-    {
+    if files.iter().any(|p| is_image(p)) {
         return;
     }
-    for p in files.iter().filter(|p| util::is_sidecar(p)) {
+    for p in &files {
         let Some(name) = p.file_name() else {
             continue;
         };
@@ -955,7 +954,9 @@ mod tests {
         h.set("INSTRUME", Value::Str("DWARF 3".into()));
         h.set("CAMERA", Value::Str("TELE".into()));
         fits::rewrite_primary_header(&p, &h).unwrap();
-        std::fs::write(dir.join("shotsInfo.json"), "{}").unwrap();
+        // As ingest files it: named after the telescope's folder.
+        let info = "DWARF_RAW_TELE_NGC281_EXP_30_GAIN_60_2026-10-02-20-22-23-549_shotsInfo.json";
+        std::fs::write(dir.join(info), "{}").unwrap();
         let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
         ingest::ingest_folder(
             &mut conn,
@@ -994,7 +995,7 @@ mod tests {
         let h = fits::read_primary_header(Path::new(&f.name)).unwrap();
         assert_eq!(h.get_str("OBJECT").as_deref(), Some("NGC 281"));
         assert!(!h.contains("IMAGETYP"));
-        assert!(new_dir.join("shotsInfo.json").exists());
+        assert!(new_dir.join(info).exists());
         assert!(!cfg.repo.join("Light/NGC281_-_Pacman_Nebula").exists());
     }
 
