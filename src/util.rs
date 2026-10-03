@@ -137,7 +137,21 @@ pub fn same_filesystem(a: &Path, b: &Path) -> bool {
         };
         matches!((dev(a), dev(b)), (Some(x), Some(y)) if x == y)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // Same drive letter or network share.
+        let volume = |p: &Path| {
+            let q = p.ancestors().find_map(|q| q.canonicalize().ok())?;
+            match q.components().next() {
+                Some(std::path::Component::Prefix(pre)) => {
+                    Some(pre.as_os_str().to_ascii_lowercase())
+                }
+                _ => None,
+            }
+        };
+        matches!((volume(a), volume(b)), (Some(x), Some(y)) if x == y)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (a, b);
         false
