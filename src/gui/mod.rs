@@ -26,7 +26,7 @@ pub fn run(cfg: Config) -> Result<()> {
             let vb = egui::ViewportBuilder::default()
                 .with_inner_size([1400.0, 880.0])
                 .with_min_inner_size([900.0, 600.0])
-                .with_title("AstroFiler")
+                .with_title(concat!("AstroFiler ", env!("CARGO_PKG_VERSION")))
                 .with_app_id("astrofiler");
             match eframe::icon_data::from_png_bytes(include_bytes!("../../assets/astrofiler.png")) {
                 Ok(icon) => vb.with_icon(icon),
@@ -340,6 +340,7 @@ impl eframe::App for App {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 ui.heading(RichText::new("🔭 AstroFiler").strong());
+                ui.label(RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).weak());
                 ui.separator();
                 for (tab, label) in TABS {
                     if ui.selectable_label(self.tab == *tab, *label).clicked() {
