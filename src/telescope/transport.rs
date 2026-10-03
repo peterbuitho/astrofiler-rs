@@ -21,6 +21,8 @@ pub trait Transport {
     fn fetch(&mut self, path: &str, local: &Path) -> Result<()>;
     /// Delete a remote file.
     fn delete(&mut self, path: &str) -> Result<()>;
+    /// Remove an empty remote directory.
+    fn remove_dir(&mut self, dir: &str) -> Result<()>;
 
     /// Whether `dir` exists and can be listed.
     fn exists(&mut self, dir: &str) -> bool {
@@ -75,6 +77,10 @@ impl Transport for LocalTransport {
     }
     fn delete(&mut self, path: &str) -> Result<()> {
         std::fs::remove_file(self.root.join(path))?;
+        Ok(())
+    }
+    fn remove_dir(&mut self, dir: &str) -> Result<()> {
+        std::fs::remove_dir(self.root.join(dir))?;
         Ok(())
     }
 }
@@ -138,6 +144,11 @@ impl Transport for SmbTransport {
         self.rt
             .block_on(self.client.delete_file(&mut self.tree, path))
             .map_err(|e| anyhow!("deleting {path}: {e}"))
+    }
+    fn remove_dir(&mut self, dir: &str) -> Result<()> {
+        self.rt
+            .block_on(self.client.delete_directory(&mut self.tree, dir))
+            .map_err(|e| anyhow!("removing {dir}: {e}"))
     }
 }
 
@@ -205,6 +216,11 @@ impl Transport for FtpTransport {
         self.ftp
             .rm(format!("/{path}"))
             .map_err(|e| anyhow!("deleting {path}: {e}"))
+    }
+    fn remove_dir(&mut self, dir: &str) -> Result<()> {
+        self.ftp
+            .rmdir(format!("/{dir}"))
+            .map_err(|e| anyhow!("removing {dir}: {e}"))
     }
 }
 

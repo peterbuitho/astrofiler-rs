@@ -261,6 +261,79 @@ impl Session {
         report.ingest = ingest;
         Ok(report)
     }
+
+    /// Delete from the telescope without importing: each of `folders` with
+    /// everything in it (previews and thumbnails included), plus the single
+    /// `files`.
+    pub fn delete(
+        &mut self,
+        folders: &[String],
+        files: &[RemoteFile],
+        progress: &dyn Progress,
+    ) -> DeleteReport {
+        let mut report = DeleteReport::default();
+        let total = folders.len() + files.len();
+        for (i, dir) in folders.iter().enumerate() {
+            if progress.cancelled() {
+                return report;
+            }
+            progress.update(i, total, &format!("Deleting {dir} from telescope"));
+            if dir.trim_matches('/').is_empty() {
+                continue; // never the storage root
+            }
+            match remove_tree(self.transport.as_mut(), dir, &mut report) {
+                Ok(()) => report.folders += 1,
+                Err(e) => report.failed.push((dir.clone(), format!("{e:#}"))),
+            }
+        }
+        for (i, f) in files.iter().enumerate() {
+            if progress.cancelled() {
+                break;
+            }
+            progress.update(
+                folders.len() + i,
+                total,
+                &format!("Deleting {} from telescope", f.name),
+            );
+            match self.transport.delete(&f.path) {
+                Ok(()) => report.files += 1,
+                Err(e) => report.failed.push((f.path.clone(), format!("{e:#}"))),
+            }
+        }
+        report
+    }
+}
+
+/// Delete everything under `dir`, then `dir` itself.
+fn remove_tree(t: &mut dyn Transport, dir: &str, report: &mut DeleteReport) -> Result<()> {
+    for e in t.list(dir)? {
+        let path = transport::join(dir, &e.name);
+        if e.is_dir {
+            remove_tree(t, &path, report)?;
+        } else {
+            t.delete(&path)?;
+            report.files += 1;
+        }
+    }
+    t.remove_dir(dir)
+}
+
+#[derive(Debug, Default)]
+pub struct DeleteReport {
+    pub folders: usize,
+    pub files: usize,
+    pub failed: Vec<(String, String)>,
+}
+
+impl DeleteReport {
+    pub fn summary(&self) -> String {
+        format!(
+            "{} folders and {} files deleted from telescope, {} failed",
+            self.folders,
+            self.files,
+            self.failed.len()
+        )
+    }
 }
 
 #[derive(Debug, Default)]
@@ -543,7 +616,7 @@ mod tests {
         .unwrap();
         let dwarf = find("dwarf").unwrap();
         assert!(dwarf.detect_usb(&usb));
-        let mut s = connect(&Config::default(), dwarf, &Link::Usb(usb)).unwrap();
+        let mut s = connect(&Config::default(), dwarf, &Link::Usb(usb.clone())).unwrap();
         let files = s.scan(true).unwrap();
         // 0001.fits, failed_0002.fits, shotsInfo.json, stacked.jpg and the
         // CALI_FRAME master; not the thumbnail or img_reference.png.
@@ -551,5 +624,21 @@ mod tests {
         assert!(files.iter().any(|f| f.kind == "session info"));
         let master = files.iter().find(|f| f.kind == "master").unwrap();
         assert_eq!(master.local_dir, "CALI_FRAME/dark/cam_0");
+
+        // Deleting a folder takes its thumbnails with it; a single file
+        // leaves the rest of its folder alone.
+        let r = s.delete(
+            &["Astronomy/DWARF_RAW_TELE_M 42_EXP_15_GAIN_80_2024-10-01-21-00-00-000".to_string()],
+            std::slice::from_ref(master),
+            &NoProgress,
+        );
+        assert_eq!((r.folders, r.files), (1, 7), "{r:?}");
+        assert!(r.failed.is_empty(), "{r:?}");
+        assert!(!raw.exists());
+        assert!(tmp
+            .path()
+            .join("usb/Astronomy/CALI_FRAME/dark/cam_0")
+            .is_dir());
+        assert_eq!(s.scan(true).unwrap().len(), 0);
     }
 }

@@ -117,10 +117,18 @@ struct Queued {
 
 /// Something the user must confirm before it happens.
 enum Confirm {
-    DeleteFiles { ids: Vec<String>, from_disk: bool },
+    DeleteFiles {
+        ids: Vec<String>,
+        from_disk: bool,
+    },
     RemoveDuplicates,
     ClearSessions,
     ImportWithDelete,
+    /// Whole telescope folders (remote paths) and single files to delete.
+    DeleteFromTelescope {
+        folders: Vec<String>,
+        files: Vec<RemoteFile>,
+    },
     QuitDuringJob,
 }
 
@@ -143,6 +151,15 @@ struct LoadDialog {
     quick: bool,
 }
 
+/// A line of the telescope file list: a folder, or a file of an expanded folder.
+#[derive(Clone, Copy)]
+enum ScopeRow {
+    /// Index into the folder groups.
+    Folder(usize),
+    /// Index into the scanned files.
+    File(usize),
+}
+
 struct ScopeUi {
     telescope: usize,
     usb: bool,
@@ -151,6 +168,10 @@ struct ScopeUi {
     found: Arc<Mutex<Vec<Found>>>,
     files: Arc<Mutex<Vec<RemoteFile>>>,
     selected: Vec<bool>,
+    /// Telescope folders whose files are shown in the list.
+    expanded: HashSet<String>,
+    /// Folder last ticked, for shift-click ranges.
+    anchor: Option<usize>,
     include_stacked: bool,
     delete_after: bool,
     dest: String,
@@ -273,6 +294,8 @@ impl App {
                 found: Arc::new(Mutex::new(vec![])),
                 files: Arc::new(Mutex::new(vec![])),
                 selected: vec![],
+                expanded: HashSet::new(),
+                anchor: None,
                 include_stacked: cfg.include_stacked,
                 delete_after: false,
                 dest: cfg.source.to_string_lossy().into(),
@@ -456,9 +479,10 @@ impl App {
             };
             // Stats jobs only read; reloading would clear the result and loop.
             reload |= job.name != "Statistics";
-            if job.name == "Scanning telescope" {
+            if job.name.ends_with(" telescope") {
                 let n = self.scope.files.lock().unwrap().len();
-                self.scope.selected = vec![true; n];
+                self.scope.selected = vec![false; n];
+                self.scope.anchor = None;
             }
         }
         if reload {
@@ -1307,22 +1331,47 @@ impl App {
 
         let files = self.scope.files.lock().unwrap().clone();
         if self.scope.selected.len() != files.len() {
-            self.scope.selected = vec![true; files.len()];
+            self.scope.selected = vec![false; files.len()];
         }
         if files.is_empty() {
             return;
         }
         ui.separator();
+        // One row per folder, as laid out on the telescope; its files are
+        // listed underneath when expanded.
+        let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
+        let mut by_dir: HashMap<&str, usize> = HashMap::new();
+        for (i, f) in files.iter().enumerate() {
+            let dir = f.local_dir.as_str();
+            let g = *by_dir.entry(dir).or_insert_with(|| {
+                groups.push((dir, Vec::new()));
+                groups.len() - 1
+            });
+            groups[g].1.push(i);
+        }
+        let mut rows: Vec<ScopeRow> = Vec::new();
+        for (g, (dir, idx)) in groups.iter().enumerate() {
+            rows.push(ScopeRow::Folder(g));
+            if self.scope.expanded.contains(*dir) {
+                rows.extend(idx.iter().map(|&i| ScopeRow::File(i)));
+            }
+        }
+
         let sel_n = self.scope.selected.iter().filter(|s| **s).count();
+        let sel_folders = groups
+            .iter()
+            .filter(|(_, idx)| idx.iter().any(|&i| self.scope.selected[i]))
+            .count();
         let sel_size: u64 = files
             .iter()
             .zip(&self.scope.selected)
             .filter(|(_, s)| **s)
             .map(|(f, _)| f.size)
             .sum();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(format!(
-                "{sel_n} of {} selected ({})",
+                "{sel_folders} of {} folders, {sel_n} of {} files selected ({})",
+                groups.len(),
                 files.len(),
                 util::human_size(sel_size)
             ));
@@ -1331,6 +1380,12 @@ impl App {
             }
             if ui.button("None").clicked() {
                 self.scope.selected.iter_mut().for_each(|s| *s = false);
+            }
+            if ui.button("Expand all").clicked() {
+                self.scope.expanded = groups.iter().map(|(d, _)| d.to_string()).collect();
+            }
+            if ui.button("Collapse all").clicked() {
+                self.scope.expanded.clear();
             }
             if ui
                 .add_enabled(
@@ -1345,40 +1400,136 @@ impl App {
                     self.start_import(false);
                 }
             }
+            if ui
+                .add_enabled(
+                    sel_n > 0,
+                    egui::Button::new(
+                        RichText::new("🗑 Delete selected").color(Color32::from_rgb(230, 120, 60)),
+                    ),
+                )
+                .on_hover_text("Delete from the telescope without importing")
+                .clicked()
+            {
+                // A fully ticked folder goes as a whole, previews included.
+                let mut folders = Vec::new();
+                let mut single = Vec::new();
+                for (_, idx) in &groups {
+                    let picked: Vec<usize> = idx
+                        .iter()
+                        .copied()
+                        .filter(|&i| self.scope.selected[i])
+                        .collect();
+                    let dir = files[idx[0]].path.rsplit_once('/').map(|(d, _)| d);
+                    match dir {
+                        Some(d) if picked.len() == idx.len() => folders.push(d.to_string()),
+                        _ => single.extend(picked.into_iter().map(|i| files[i].clone())),
+                    }
+                }
+                self.confirm = Some(Confirm::DeleteFromTelescope {
+                    folders,
+                    files: single,
+                });
+            }
+            ui.weak("Shift-click a folder's checkbox to tick a range.");
         });
         TableBuilder::new(ui)
             .striped(true)
             .column(Column::exact(24.0))
-            .column(Column::initial(90.0).clip(true))
-            .column(Column::initial(260.0).clip(true))
+            .column(
+                Column::initial(460.0)
+                    .at_least(160.0)
+                    .clip(true)
+                    .resizable(true),
+            )
+            .column(Column::initial(80.0).clip(true))
             .column(Column::initial(80.0).clip(true))
             .column(Column::remainder().clip(true))
             .header(20.0, |mut h| {
-                for l in ["", "Kind", "Folder", "Size", "File"] {
+                for l in ["", "Folder / file", "Files", "Size", "Kind"] {
                     h.col(|ui| {
                         ui.strong(l);
                     });
                 }
             })
             .body(|body| {
-                body.rows(20.0, files.len(), |mut row| {
-                    let i = row.index();
-                    let f = &files[i];
-                    row.col(|ui| {
-                        ui.checkbox(&mut self.scope.selected[i], "");
-                    });
-                    row.col(|ui| {
-                        ui.label(f.kind);
-                    });
-                    row.col(|ui| {
-                        ui.label(&f.folder);
-                    });
-                    row.col(|ui| {
-                        ui.label(util::human_size(f.size));
-                    });
-                    row.col(|ui| {
-                        ui.label(&f.name);
-                    });
+                body.rows(20.0, rows.len(), |mut row| match rows[row.index()] {
+                    ScopeRow::Folder(g) => {
+                        let (dir, idx) = &groups[g];
+                        let n_sel = idx.iter().filter(|&&i| self.scope.selected[i]).count();
+                        row.col(|ui| {
+                            let mut on = n_sel == idx.len();
+                            let partly = n_sel > 0 && !on;
+                            if ui
+                                .add(egui::Checkbox::without_text(&mut on).indeterminate(partly))
+                                .clicked()
+                            {
+                                let range = match self.scope.anchor {
+                                    Some(a) if ui.input(|i| i.modifiers.shift) => {
+                                        let a = a.min(groups.len() - 1);
+                                        a.min(g)..=a.max(g)
+                                    }
+                                    _ => g..=g,
+                                };
+                                for (_, idx) in &groups[range] {
+                                    for &i in idx {
+                                        self.scope.selected[i] = on;
+                                    }
+                                }
+                                self.scope.anchor = Some(g);
+                            }
+                        });
+                        row.col(|ui| {
+                            let open = self.scope.expanded.contains(*dir);
+                            let arrow = if open { "⏷" } else { "⏵" };
+                            let label = RichText::new(format!("{arrow} 📁 {dir}")).strong();
+                            if ui.selectable_label(false, label).clicked() {
+                                if open {
+                                    self.scope.expanded.remove(*dir);
+                                } else {
+                                    self.scope.expanded.insert(dir.to_string());
+                                }
+                            }
+                        });
+                        row.col(|ui| {
+                            ui.label(if n_sel == idx.len() {
+                                idx.len().to_string()
+                            } else {
+                                format!("{n_sel} / {}", idx.len())
+                            });
+                        });
+                        row.col(|ui| {
+                            let size: u64 = idx.iter().map(|&i| files[i].size).sum();
+                            ui.label(util::human_size(size));
+                        });
+                        row.col(|ui| {
+                            let mut kinds: Vec<&str> = Vec::new();
+                            for &i in idx {
+                                if !kinds.contains(&files[i].kind) {
+                                    kinds.push(files[i].kind);
+                                }
+                            }
+                            ui.label(kinds.join(", "));
+                        });
+                    }
+                    ScopeRow::File(i) => {
+                        let f = &files[i];
+                        row.col(|ui| {
+                            ui.checkbox(&mut self.scope.selected[i], "");
+                        });
+                        row.col(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.add_space(34.0);
+                                ui.label(&f.name);
+                            });
+                        });
+                        row.col(|_| {});
+                        row.col(|ui| {
+                            ui.label(util::human_size(f.size));
+                        });
+                        row.col(|ui| {
+                            ui.label(f.kind);
+                        });
+                    }
                 });
             });
     }
@@ -1411,6 +1562,30 @@ impl App {
             }
             // Rescan so the list reflects what is left on the telescope.
             if let Ok(left) = s.scan(true) {
+                *slot.lock().unwrap() = left;
+            }
+            Ok(r.summary())
+        });
+    }
+
+    fn start_delete(&mut self, folders: Vec<String>, files: Vec<RemoteFile>) {
+        let scopes = telescope::all();
+        let t = scopes[self.scope.telescope.min(scopes.len() - 1)];
+        let link = if self.scope.usb {
+            Link::Usb(PathBuf::from(&self.scope.usb_path))
+        } else {
+            Link::Network(self.scope.host.clone())
+        };
+        let stacked = self.scope.include_stacked;
+        let slot = self.scope.files.clone();
+        self.spawn_read("Deleting from telescope", move |_, cfg, p| {
+            let mut s = telescope::connect(cfg, t, &link)?;
+            let r = s.delete(&folders, &files, p);
+            for (path, e) in &r.failed {
+                log::warn!("{path}: {e}");
+            }
+            // Rescan so the list reflects what is left on the telescope.
+            if let Ok(left) = s.scan(stacked) {
                 *slot.lock().unwrap() = left;
             }
             Ok(r.summary())
@@ -2343,6 +2518,22 @@ impl App {
             }
             Confirm::ClearSessions => "Remove all sessions? Files are kept; you can re-create sessions any time.".to_string(),
             Confirm::ImportWithDelete => "Files will be DELETED from the telescope after they are safely catalogued. Continue?".to_string(),
+            Confirm::DeleteFromTelescope { folders, files } => {
+                let mut what = Vec::new();
+                if !folders.is_empty() {
+                    what.push(format!(
+                        "{} folder(s) with everything in them (previews, thumbnails and files not listed here)",
+                        folders.len()
+                    ));
+                }
+                if !files.is_empty() {
+                    what.push(format!("{} file(s)", files.len()));
+                }
+                format!(
+                    "Permanently DELETE {} from the telescope WITHOUT importing? This cannot be undone.",
+                    what.join(" and ")
+                )
+            }
             Confirm::QuitDuringJob => "A task is still running. Quit anyway? Work finished so far is kept.".to_string(),
         };
         let mut answer = None;
@@ -2390,6 +2581,9 @@ impl App {
                         self.reload();
                     }
                     Confirm::ImportWithDelete => self.start_import(true),
+                    Confirm::DeleteFromTelescope { folders, files } => {
+                        self.start_delete(folders, files)
+                    }
                     Confirm::QuitDuringJob => {
                         self.queued.clear();
                         for job in &self.jobs {
