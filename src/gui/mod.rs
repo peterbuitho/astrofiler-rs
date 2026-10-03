@@ -843,6 +843,23 @@ fn interaction_style(s: &mut egui::Style) {
     s.interaction.resize_grab_radius_side = 8.0;
 }
 
+/// Status line for a bulk edit; the files that failed go to the log.
+fn edit_summary(r: &batch::EditReport) -> String {
+    for (f, e) in &r.errors {
+        log::warn!("Not changed: {f} ({e})");
+    }
+    format!(
+        "{} updated, {} moved{}",
+        r.updated,
+        r.moved,
+        if r.errors.is_empty() {
+            String::new()
+        } else {
+            format!(", {} errors (see Log)", r.errors.len())
+        }
+    )
+}
+
 fn opt(s: &Option<String>) -> &str {
     s.as_deref().unwrap_or("")
 }
@@ -1802,12 +1819,7 @@ impl App {
             };
             self.spawn("Merge objects", move |conn, cfg, p| {
                 let r = batch::merge_objects(conn, cfg, &from, &to, opts, p)?;
-                Ok(format!(
-                    "{} updated, {} moved, {} errors",
-                    r.updated,
-                    r.moved,
-                    r.errors.len()
-                ))
+                Ok(edit_summary(&r))
             });
         }
         ui.separator();
@@ -2493,12 +2505,7 @@ impl App {
                         };
                         self.spawn("Edit files", move |conn, cfg, p| {
                             let r = batch::set_field(conn, cfg, &ids, &field, &value, opts, p)?;
-                            Ok(format!(
-                                "{} updated, {} moved, {} errors",
-                                r.updated,
-                                r.moved,
-                                r.errors.len()
-                            ))
+                            Ok(edit_summary(&r))
                         });
                         self.edit.open = false;
                     }

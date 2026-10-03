@@ -62,6 +62,9 @@ pub fn set_field(
     let card = card.to_uppercase();
     let mut report = EditReport::default();
     let tx = conn.transaction()?;
+    let mappings = db::mappings(&tx)?;
+    // Folders the files left, and where they went.
+    let mut moved_dirs: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
     for (i, id) in ids.iter().enumerate() {
         progress.update(i + 1, ids.len(), &format!("Updating {card}"));
         let Some(file) = db::file_by_id(&tx, id)? else {
@@ -78,14 +81,23 @@ pub fn set_field(
         let mut new_path = path.clone();
         let mut new_hash = file.hash.clone();
         if (opts.update_headers || opts.refile) && path.exists() {
-            match edit_file(cfg, &path, &card, value, opts) {
-                Ok((p, h)) => {
-                    if p != path {
+            match edit_file(cfg, &path, &card, value, opts, &mappings) {
+                Ok(edited) => {
+                    if edited.path != path {
                         report.moved += 1;
+                        if let (Some(old), Some(new)) = (path.parent(), edited.path.parent()) {
+                            if old != new {
+                                moved_dirs.insert(old.to_path_buf(), new.to_path_buf());
+                            }
+                        }
                     }
-                    new_path = p;
-                    if let Some(h) = h {
+                    new_path = edited.path;
+                    if let Some(h) = edited.hash {
                         new_hash = Some(h);
+                    }
+                    // The header is rewritten, so the catalogue follows.
+                    if let Some(e) = edited.not_moved {
+                        report.errors.push((file.name.clone(), e));
                     }
                 }
                 Err(e) => {
@@ -101,45 +113,97 @@ pub fn set_field(
         report.updated += 1;
     }
     tx.commit()?;
+    for (old, new) in &moved_dirs {
+        move_sidecars(old, new);
+    }
     Ok(report)
 }
 
-/// Rewrite the header and/or move one file. Returns the new path and new hash.
+/// Move the companion files (session info, stack previews) of a folder whose
+/// frames have all been re-filed to where the frames went.
+fn move_sidecars(old: &Path, new: &Path) {
+    let files: Vec<PathBuf> = match std::fs::read_dir(old) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .collect(),
+        Err(_) => return,
+    };
+    if files
+        .iter()
+        .any(|p| util::is_supported_file(p) && !util::is_sidecar(p))
+    {
+        return;
+    }
+    for p in files.iter().filter(|p| util::is_sidecar(p)) {
+        let Some(name) = p.file_name() else {
+            continue;
+        };
+        if let Err(e) = util::move_file(p, &util::unique_path(&new.join(name))) {
+            log::warn!("Not moved: {} ({e:#})", p.display());
+        }
+    }
+}
+
+struct Edited {
+    path: PathBuf,
+    /// New checksum, when the header was rewritten.
+    hash: Option<String>,
+    /// Why the file stayed where it was after its header was rewritten.
+    not_moved: Option<String>,
+}
+
+/// Rewrite the header and/or move one file. Nothing is changed when the
+/// file's new place can't be worked out.
 fn edit_file(
     cfg: &Config,
     path: &Path,
     card: &str,
     value: &str,
     opts: EditOptions,
-) -> Result<(PathBuf, Option<String>)> {
+    mappings: &[db::Mapping],
+) -> Result<Edited> {
     let mut header = fits::read_primary_header(path)?;
     header.set(card, Value::Str(value.to_string()));
-    let mut hash = None;
-    if opts.update_headers {
-        if fits::is_gzip(path) {
-            bail!("can't rewrite the header of a gzip-compressed file");
-        }
-        fits::rewrite_primary_header(path, &header)?;
-        hash = Some(util::sha256_file(path)?);
+    if opts.update_headers && fits::is_gzip(path) {
+        bail!("can't rewrite the header of a gzip-compressed file");
     }
-    let mut new_path = path.to_path_buf();
+    let mut target = None;
     if opts.refile && path.starts_with(&cfg.repo) {
-        let (mut name, dir) = ingest::destination(&header, cfg)?;
-        if ingest::is_stacked(&header) {
+        // File by the header as ingest sees it (e.g. DWARF files carry no
+        // IMAGETYP); the edited value wins over the mappings.
+        let mut filed = header.clone();
+        ingest::normalize_header(&mut filed, path, mappings)?;
+        filed.set(card, Value::Str(value.to_string()));
+        let (mut name, dir) = ingest::destination(&filed, cfg)?;
+        if ingest::is_stacked(&filed) {
             name = path
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned();
         }
-        let target = dir.join(name);
-        if target != path {
-            let target = util::unique_path(&target);
-            util::move_file(path, &target)?;
-            new_path = target;
+        target = Some(dir.join(name)).filter(|t| t != path);
+    }
+    let mut edited = Edited {
+        path: path.to_path_buf(),
+        hash: None,
+        not_moved: None,
+    };
+    if opts.update_headers {
+        fits::rewrite_primary_header(path, &header)?;
+        edited.hash = Some(util::sha256_file(path)?);
+    }
+    if let Some(target) = target {
+        let target = util::unique_path(&target);
+        match util::move_file(path, &target) {
+            Ok(()) => edited.path = target,
+            Err(e) if opts.update_headers => edited.not_moved = Some(format!("{e:#}")),
+            Err(e) => return Err(e),
         }
     }
-    Ok((new_path, hash))
+    Ok(edited)
 }
 
 /// Rename an object across the catalogue (the original's "Merge Objects").
@@ -165,6 +229,7 @@ pub fn merge_objects(
     )?;
     if opts.refile {
         remove_empty_dirs(&cfg.repo.join("Light"));
+        remove_empty_dirs(&cfg.repo.join("Stacked"));
     }
     Ok(report)
 }
@@ -860,6 +925,77 @@ mod tests {
         assert!(names.contains(&util::normalize_path(&new)), "{names:?}");
         assert!(names.contains(&util::normalize_path(&kept)), "{names:?}");
         assert!(layout_plan(&conn, &cfg).unwrap().is_empty());
+    }
+
+    #[test]
+    fn merge_refiles_files_whose_header_needs_normalising() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            repo: tmp.path().join("repo"),
+            ..Default::default()
+        };
+        // A filed DWARF light: no IMAGETYP, camera in CAMERA.
+        let dir = cfg
+            .repo
+            .join("Light/NGC281_-_Pacman_Nebula/DWARF_3/TELE/20261002");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = make_frame(
+            &dir,
+            "1.fits",
+            "Light",
+            Some("NGC281 - Pacman Nebula"),
+            "2026-10-02T20:24:36",
+            30.0,
+            Some("Duo-Band"),
+            1.0,
+        );
+        let mut h = fits::read_primary_header(&p).unwrap();
+        h.remove("IMAGETYP");
+        h.set("TELESCOP", Value::Str("DWARF 3".into()));
+        h.set("INSTRUME", Value::Str("DWARF 3".into()));
+        h.set("CAMERA", Value::Str("TELE".into()));
+        fits::rewrite_primary_header(&p, &h).unwrap();
+        std::fs::write(dir.join("shotsInfo.json"), "{}").unwrap();
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        ingest::ingest_folder(
+            &mut conn,
+            &cfg,
+            &cfg.repo,
+            crate::ingest::IngestOptions::IN_PLACE,
+            &NoProgress,
+        )
+        .unwrap();
+        let r = merge_objects(
+            &mut conn,
+            &cfg,
+            "NGC281 - Pacman Nebula",
+            "NGC 281",
+            EditOptions {
+                update_headers: true,
+                refile: true,
+            },
+            &NoProgress,
+        )
+        .unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!((r.updated, r.moved), (1, 1));
+        let files = db::all_files(&conn, false).unwrap();
+        let f = &files[0];
+        assert_eq!(f.object.as_deref(), Some("NGC 281"));
+        let new_dir = cfg
+            .repo
+            .join("Light/NGC_281_Pacman_Nebula/DWARF_3/TELE/20261002");
+        assert_eq!(Path::new(&f.name).parent(), Some(new_dir.as_path()));
+        assert_eq!(
+            util::sha256_file(Path::new(&f.name)).unwrap(),
+            f.hash.clone().unwrap()
+        );
+        // The header keeps what the telescope wrote, apart from the edit.
+        let h = fits::read_primary_header(Path::new(&f.name)).unwrap();
+        assert_eq!(h.get_str("OBJECT").as_deref(), Some("NGC 281"));
+        assert!(!h.contains("IMAGETYP"));
+        assert!(new_dir.join("shotsInfo.json").exists());
+        assert!(!cfg.repo.join("Light/NGC281_-_Pacman_Nebula").exists());
     }
 
     #[test]
