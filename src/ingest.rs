@@ -10,7 +10,7 @@ use crate::db::{self, FitsFile, Mapping};
 use crate::fits::{self, Header, Value};
 use crate::progress::Progress;
 use crate::util::{self, sanitize, FrameKind};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use rayon::prelude::*;
 use rusqlite::Connection;
 use std::collections::HashSet;
@@ -517,7 +517,7 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
 }
 
 /// A FITS file ready to register. `temp` marks files we produced ourselves
-/// (unzipped, decompressed, converted from XISF) that can always be moved.
+/// (unzipped, decompressed) that can always be moved.
 struct Staged {
     input: PathBuf,
     path: PathBuf,
@@ -629,9 +629,8 @@ fn ingest_inner(
             progress.update(done + within, total, &msg);
         };
 
-        // Unpack containers (zip, xisf, gz) into plain FITS files, then
-        // parse, normalise and hash them, one input file per task. Progress
-        // counts input files, so slow XISF conversions move it too.
+        // Unpack containers (zip, gz) into plain FITS files, then parse,
+        // normalise and hash them, one input file per task.
         let read = AtomicUsize::new(0);
         let steps = chunk.len();
         type Read = (PathBuf, Result<Vec<(PathBuf, Result<Prepared>)>>);
@@ -641,7 +640,7 @@ fn ingest_inner(
                 .map(|p| {
                     let started = read.load(Ordering::Relaxed);
                     tick(started, steps, 0, format!("Reading {}", label(p)));
-                    let r = unpack(p, cfg, opts, work).map(|staged| {
+                    let r = unpack(p, opts, work).map(|staged| {
                         staged
                             .into_par_iter()
                             .map(|st| (st.input.clone(), prepare(st, cfg, opts, &mappings)))
@@ -816,10 +815,15 @@ fn file_prepared(
                             .unwrap_or_default()
                             .to_string_lossy()
                             .to_string();
+                        let ext = Path::new(&new_name)
+                            .extension()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
                         let mut d = util::unique_path(&target);
                         let mut k = 1;
                         while state.planned.contains(&d) {
-                            d = dest_dir.join(format!("{stem}_{k:03}.fits"));
+                            d = dest_dir.join(format!("{stem}_{k:03}.{ext}"));
                             k += 1;
                         }
                         d
@@ -967,7 +971,7 @@ fn replace_file(from: &Path, to: &Path, moving: bool) -> Result<()> {
 }
 
 /// Turn one input file into the FITS file(s) to register.
-fn unpack(path: &Path, cfg: &Config, opts: IngestOptions, work: &Path) -> Result<Vec<Staged>> {
+fn unpack(path: &Path, opts: IngestOptions, work: &Path) -> Result<Vec<Staged>> {
     let lower = path.to_string_lossy().to_lowercase();
     let moving = opts.placement == Placement::Move && !opts.dry_run;
     // Where intermediate files go: next to the source when we own it (moving
@@ -1007,26 +1011,12 @@ fn unpack(path: &Path, cfg: &Config, opts: IngestOptions, work: &Path) -> Result
         }
         return Ok(out);
     }
-    if lower.ends_with(".xisf") {
-        let sibling = path.with_extension("fits");
-        if opts.placement == Placement::InPlace && sibling.exists() {
-            return Ok(vec![]); // already converted in an earlier sync
-        }
-        let fname = sibling.file_name().unwrap_or_default().to_os_string();
-        let (fits_path, temp) = scratch(&fname)?;
-        crate::xisf::convert_to_fits(path, &fits_path)
-            .with_context(|| format!("converting {}", path.display()))?;
-        if moving {
-            // Keep the original XISF, out of the way.
-            let archive = util::unique_path(
-                &cfg.repo
-                    .join("Archive")
-                    .join("XISF")
-                    .join(path.file_name().unwrap()),
-            );
-            util::move_file(path, &archive)?;
-        }
-        return Ok(vec![staged(fits_path, temp)]);
+    if lower.ends_with(".xisf")
+        && opts.placement == Placement::InPlace
+        && path.with_extension("fits").exists()
+    {
+        // Converted by an earlier version: its FITS twin is the catalogued file.
+        return Ok(vec![]);
     }
     if lower.ends_with(".gz") && opts.placement != Placement::InPlace {
         let name = path.file_stem().unwrap_or_default().to_os_string();
@@ -1039,6 +1029,17 @@ fn unpack(path: &Path, cfg: &Config, opts: IngestOptions, work: &Path) -> Result
         return Ok(vec![staged(out, temp)]);
     }
     Ok(vec![staged(path.to_path_buf(), false)])
+}
+
+/// A descriptive name ends in .fits; an XISF file keeps its own extension.
+pub(crate) fn keep_format(name: String, source: &Path) -> String {
+    let xisf = source
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("xisf"));
+    match name.strip_suffix(".fits") {
+        Some(stem) if xisf => format!("{stem}.xisf"),
+        _ => name,
+    }
 }
 
 /// Whether a master frame is a bias, dark or flat, from its file name,
@@ -1107,11 +1108,12 @@ fn prepare(
     let (mut new_name, dest_dir) = destination(&header, cfg)?;
     if is_stacked(&header) {
         // Stacked results keep the name the telescope or stacking program
-        // gave them (converted XISF files end in .fits).
+        // gave them.
         if let Some(n) = st.path.file_name() {
             new_name = n.to_string_lossy().into_owned();
         }
     }
+    let new_name = keep_format(new_name, &st.path);
     let rewrite = modified && cfg.save_modified_headers && !fits::is_gzip(&st.path);
     // The stored hash is of the file as it will be written, so re-loading the
     // same original later is still recognised as a duplicate.

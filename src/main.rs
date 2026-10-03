@@ -259,14 +259,7 @@ fn run(cli: Cli) -> Result<()> {
         return config_cmd(&mut cfg, action.as_ref());
     }
     if let Cmd::Header { file } = &command {
-        let h = if file
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("xisf"))
-        {
-            xisf::read(file)?.header
-        } else {
-            fits::read_primary_header(file)?
-        };
+        let h = fits::read_primary_header(file)?;
         for c in &h.cards {
             match &c.value {
                 fits::Value::Commentary(t) => println!("{:<8} {t}", c.key),

@@ -405,13 +405,17 @@ pub fn is_gzip(path: &Path) -> bool {
         && magic == [0x1f, 0x8b]
 }
 
-/// Read only the primary header. This is the hot path of repository ingest, so it
+/// Read only the primary header (of an XISF file: its FITS keywords). This is the hot path of repository ingest, so it
 /// touches only the first few 2880-byte blocks of each file.
 pub fn read_primary_header(path: &Path) -> Result<Header> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     // Sniff gzip from the same handle: every extra open is a round trip to a NAS.
     let mut buffered = BufReader::with_capacity(BLOCK * 4, file);
-    let gzip = std::io::BufRead::fill_buf(&mut buffered)?.starts_with(&[0x1f, 0x8b]);
+    let start = std::io::BufRead::fill_buf(&mut buffered)?;
+    if start.starts_with(b"XISF0100") {
+        return crate::xisf::read_header(path);
+    }
+    let gzip = start.starts_with(&[0x1f, 0x8b]);
     let mut reader: Box<dyn Read> = if gzip {
         Box::new(GzDecoder::new(buffered))
     } else {
@@ -724,7 +728,7 @@ pub fn write_image(
     Ok(())
 }
 
-fn tmp_path(path: &Path) -> PathBuf {
+pub(crate) fn tmp_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".astrofiler-tmp");
     path.with_file_name(name)
@@ -734,6 +738,9 @@ fn tmp_path(path: &Path) -> PathBuf {
 /// `header`, computed without writing anything.
 pub fn sha256_with_header(path: &Path, header: &Header) -> Result<String> {
     use sha2::{Digest, Sha256};
+    if crate::xisf::is_xisf(path) {
+        return crate::xisf::sha256_with_header(path, header);
+    }
     let mut file = File::open(path)?;
     let (_, old_len) =
         read_header(&mut BufReader::new(&mut file))?.ok_or_else(|| anyhow!("empty FITS file"))?;
@@ -751,8 +758,12 @@ pub fn sha256_with_header(path: &Path, header: &Header) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Replace the primary header of an uncompressed FITS file, keeping the data.
+/// Replace the primary header of an uncompressed FITS file (or the FITS
+/// keywords of an XISF file), keeping the data.
 pub fn rewrite_primary_header(path: &Path, header: &Header) -> Result<()> {
+    if crate::xisf::is_xisf(path) {
+        return crate::xisf::rewrite_header(path, header);
+    }
     if is_gzip(path) {
         bail!("refusing to rewrite header of gzip-compressed file");
     }

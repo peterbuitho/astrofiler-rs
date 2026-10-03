@@ -64,7 +64,11 @@ libraries to install. It comes in three parts:
   files are never copied twice, and empty or half-copied leftovers of an
   interrupted copy are always replaced.
 - **FITS and XISF**: `.fits/.fit/.fts`, gzip-compressed FITS, `.zip` archives, and
-  PixInsight `.xisf` (zlib/LZ4/Zstd, byte-shuffled), which is converted to FITS on import.
+  PixInsight `.xisf`. XISF files are catalogued and filed as they are, with no
+  FITS copy: their FITS keywords are read from the XISF header, and header
+  edits (Edit field, Merge objects) are written back into it, including the
+  matching PixInsight properties. `astrofiler convert` still makes a FITS
+  file from one when you want it.
 - **Smart telescopes**: ZWO **Seestar** and **DWARF**, over **Wi-Fi or USB-C**.
   FITS files are transferred together with the telescopes' stacked-result
   previews (Seestar `Stacked_*.jpg`, DWARF `stacked.jpg` / `stacked-*.png`) and

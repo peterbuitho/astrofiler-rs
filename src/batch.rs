@@ -183,7 +183,7 @@ fn edit_file(
                 .to_string_lossy()
                 .into_owned();
         }
-        target = Some(dir.join(name)).filter(|t| t != path);
+        target = Some(dir.join(ingest::keep_format(name, path))).filter(|t| t != path);
     }
     let mut edited = Edited {
         path: path.to_path_buf(),
@@ -243,14 +243,15 @@ pub struct LayoutMigration {
 }
 
 /// The name a stacked result is kept under: its original file name, with
-/// converted XISF files ending in .fits and gzip files unpacked.
-fn kept_name(original: &str) -> Option<String> {
+/// gzip files unpacked. An XISF file converted by an earlier version (`filed`
+/// is a FITS file) ends in .fits.
+fn kept_name(original: &str, filed: &Path) -> Option<String> {
     let name = original.rsplit(['/', '\\']).next()?;
     let lower = name.to_lowercase();
     if lower.ends_with(".zip") || name.is_empty() {
         return None; // the name inside the archive wasn't recorded
     }
-    Some(if lower.ends_with(".xisf") {
+    Some(if lower.ends_with(".xisf") && util::is_fits_name(filed) {
         format!("{}.fits", &name[..name.len() - 5])
     } else if lower.ends_with(".gz") {
         name[..name.len() - 3].to_string()
@@ -293,7 +294,7 @@ pub fn layout_plan(conn: &Connection, cfg: &Config) -> Result<Vec<(PathBuf, Path
         if !f.stacked {
             continue;
         }
-        let Some(kept) = f.original.as_deref().and_then(kept_name) else {
+        let Some(kept) = f.original.as_deref().and_then(|o| kept_name(o, &path)) else {
             continue;
         };
         let (Some(dir), Some(old_stem), Some(new_stem)) = (
@@ -1098,6 +1099,109 @@ mod tests {
         assert!(night.join("b.fits").exists() && !night.join("stack").exists());
 
         assert!(move_to_inbox(&entries, &tmp.path().join("missing"), &NoProgress).is_err());
+    }
+
+    #[test]
+    fn xisf_files_are_filed_and_edited_as_they_are() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("in");
+        std::fs::create_dir_all(&src).unwrap();
+        let keys = |object: &'static str, typ: &'static str, time: &'static str| {
+            vec![
+                ("IMAGETYP", typ),
+                ("OBJECT", object),
+                ("DATE-OBS", time),
+                ("EXPTIME", "30."),
+                ("TELESCOP", "'RedCat 51'"),
+                ("INSTRUME", "'ASI2600'"),
+                ("FILTER", "'L'"),
+            ]
+        };
+        crate::xisf::tests::write_xisf(
+            &src.join("sub.xisf"),
+            &keys("'Andromeda'", "'Light'", "'2026-09-02T21:00:00'"),
+            1,
+        );
+        crate::xisf::tests::write_xisf(
+            &src.join("masterLight_BIN-1.xisf"),
+            &keys("'Andromeda'", "'Master Light'", "'2026-09-02T22:00:00'"),
+            2,
+        );
+        let cfg = Config {
+            repo: tmp.path().join("repo"),
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        let r = ingest::ingest_folder(
+            &mut conn,
+            &cfg,
+            &src,
+            crate::ingest::IngestOptions::MOVE,
+            &NoProgress,
+        )
+        .unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        // No FITS copies, no archive: the files themselves are filed.
+        let names = |conn: &Connection| -> Vec<String> {
+            let mut v: Vec<String> = db::all_files(conn, false)
+                .unwrap()
+                .into_iter()
+                .map(|f| f.name.replace(&util::normalize_path(&cfg.repo), ""))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            names(&conn),
+            [
+                "/Light/Andromeda/RedCat_51/ASI2600/20260902/Andromeda-RedCat_51-ASI2600-L-20260902210000-30.0s-1x1-t0.xisf",
+                "/Stacked/Andromeda/RedCat_51/ASI2600/masterLight_BIN-1.xisf",
+            ]
+        );
+        assert!(!cfg.repo.join("Archive").exists());
+        assert!(ingest::collect_files(&src, &[]).is_empty());
+
+        let r = merge_objects(
+            &mut conn,
+            &cfg,
+            "Andromeda",
+            "M 31",
+            EditOptions {
+                update_headers: true,
+                refile: true,
+            },
+            &NoProgress,
+        )
+        .unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!((r.updated, r.moved), (2, 2));
+        assert_eq!(
+            names(&conn),
+            [
+                "/Light/M_31_Andromeda_Galaxy/RedCat_51/ASI2600/20260902/M_31-RedCat_51-ASI2600-L-20260902210000-30.0s-1x1-t0.xisf",
+                "/Stacked/M_31_Andromeda_Galaxy/RedCat_51/ASI2600/masterLight_BIN-1.xisf",
+            ]
+        );
+        for f in db::all_files(&conn, false).unwrap() {
+            let h = fits::read_primary_header(Path::new(&f.name)).unwrap();
+            assert_eq!(h.get_str("OBJECT").as_deref(), Some("M 31"));
+        }
+        let v = verify(&conn, true, &NoProgress).unwrap();
+        assert!(v.missing.is_empty() && v.mismatched.is_empty());
+        // Nothing is out of place for the layout check, and a sync adds nothing.
+        assert!(layout_plan(&conn, &cfg).unwrap().is_empty());
+        let again = ingest::ingest_folder(
+            &mut conn,
+            &cfg,
+            &cfg.repo,
+            crate::ingest::IngestOptions::IN_PLACE,
+            &NoProgress,
+        )
+        .unwrap();
+        assert_eq!(again.registered, 0);
+        assert!(ingest::collect_files(&cfg.repo, &[])
+            .iter()
+            .all(|p| !util::is_fits_name(p)));
     }
 
     #[test]
