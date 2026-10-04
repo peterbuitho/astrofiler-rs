@@ -7,13 +7,20 @@ use crate::config::Config;
 use crate::names;
 use rusqlite::{params, Connection};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Words that end a nickname: what telescopes and processing add to a name.
 const NOT_NAMES: &[&str] = &[
     "exp",
     "gain",
     "xisf",
+    "png",
+    "jpg",
+    "jpeg",
+    "tif",
+    "tiff",
+    "fts",
+    "json",
     "fits",
     "fit",
     "stacked",
@@ -160,7 +167,18 @@ pub fn load(conn: &Connection) -> BTreeMap<String, String> {
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect()
     };
-    read().unwrap_or_default()
+    // Words a telescope or a file extension adds are not nicknames; one that
+    // got in (an older version read "C_7.png" as "C 7 = png") is ignored.
+    read()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, n)| !is_junk(n))
+        .collect()
+}
+
+fn is_junk(nick: &str) -> bool {
+    nick.split_whitespace()
+        .all(|w| NOT_NAMES.contains(&w.to_lowercase().as_str()))
 }
 
 /// Replaces the stored nicknames (the Settings page).
@@ -190,7 +208,7 @@ pub fn merge(cfg: &mut Config, nicknames: BTreeMap<String, String>) {
 
 /// Learns nicknames from folder and picture names, for objects that have no
 /// common name yet, and adds them to `cfg`. Of several spellings the most
-/// used wins, then the shortest. Stored unless `dry_run`.
+/// used wins, then the longest. Stored unless `dry_run`.
 pub fn learn(
     conn: &Connection,
     cfg: &mut Config,
@@ -213,7 +231,7 @@ pub fn learn(
             || cfg.object_names.keys().any(|o| names::key(o) == key);
         let best = nicks
             .into_iter()
-            .max_by(|a, b| a.1.cmp(&b.1).then(b.0.len().cmp(&a.0.len())));
+            .max_by(|a, b| a.1.cmp(&b.1).then(a.0.len().cmp(&b.0.len())));
         if let (false, Some((nick, _))) = (known, best) {
             learned.push((object, nick));
         }
@@ -222,7 +240,7 @@ pub fn learn(
         if !dry_run {
             let stored = ensure(conn).and_then(|()| {
                 conn.execute(
-                    "INSERT OR IGNORE INTO objectNickname (objectKey, object, nickname) VALUES (?1, ?2, ?3)",
+                    "INSERT OR REPLACE INTO objectNickname (objectKey, object, nickname) VALUES (?1, ?2, ?3)",
                     params![names::key(object), object, nick],
                 )
             });
@@ -244,11 +262,14 @@ pub fn effective(conn: &Connection, cfg: &Config) -> Config {
 }
 
 /// The names nicknames are learned from under `dir`: the folders and the
-/// processed pictures. `depth` limits how far down it looks.
-pub fn names_under(dir: &Path, depth: usize, out: &mut Vec<String>) {
+/// processed pictures. `depth` limits how far down it looks. The folders
+/// under `generated` are named after the nicknames already known, so their
+/// names say nothing new; the pictures in them still count.
+pub fn names_under(dir: &Path, depth: usize, generated: &[PathBuf], out: &mut Vec<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    let own = generated.iter().any(|g| dir.starts_with(g));
     for e in entries.flatten() {
         let path = e.path();
         let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
@@ -261,9 +282,11 @@ pub fn names_under(dir: &Path, depth: usize, out: &mut Vec<String>) {
             continue;
         };
         if is_dir {
-            out.push(name);
+            if !own && !generated.contains(&path) {
+                out.push(name);
+            }
             if depth > 0 {
-                names_under(&path, depth - 1, out);
+                names_under(&path, depth - 1, generated, out);
             }
         } else if crate::pictures::is_picture(&path) {
             out.push(name);
@@ -278,12 +301,16 @@ pub fn learn_from(
     dir: &Path,
     dry_run: bool,
 ) -> Vec<(String, String)> {
+    let generated: Vec<PathBuf> = crate::ingest::MANAGED_DIRS
+        .iter()
+        .map(|d| cfg.repo.join(d))
+        .collect();
     let mut found: Vec<String> = dir
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .into_iter()
         .collect();
-    names_under(dir, 4, &mut found);
+    names_under(dir, 4, &generated, &mut found);
     learn(conn, cfg, found, dry_run)
 }
 
@@ -334,6 +361,8 @@ mod tests {
             ("DWARF_RAW_TELE_M 67_EXP_30_GAIN_60", None),
             ("DWARF_RAW_TELE_NGC6997_57Cyg_Manual", None),
             ("M 31 final", None),
+            ("C_7_png", None),
+            ("C 7.png", None),
             // Seestar keeps the sub-frames of M 2 in "M 2_sub".
             ("M 2_sub", None),
             ("M 2_mosaic_sub", None),
@@ -371,5 +400,44 @@ mod tests {
             load(&conn).get("C 7").map(String::as_str),
             Some("Spiral Galaxy")
         );
+    }
+
+    #[test]
+    fn folders_named_after_nicknames_teach_nothing_and_bad_ones_heal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        // What a bad nickname left behind: a generated folder, and the user's
+        // own picture next to the frames.
+        let obj = repo.join("Light/C_7_png/Seestar_S50");
+        std::fs::create_dir_all(&obj).unwrap();
+        std::fs::create_dir_all(repo.join("PNG")).unwrap();
+        std::fs::write(repo.join("PNG/C 7 Spiral Galaxy.png"), b"p").unwrap();
+        std::fs::write(repo.join("PNG/C 7.png"), b"p").unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        ensure(&conn).unwrap();
+        conn.execute("INSERT INTO objectNickname VALUES ('C7', 'C 7', 'png')", [])
+            .unwrap();
+        // The stored "png" is not used...
+        assert!(load(&conn).is_empty());
+        // ...so the picture's nickname is learned over it; the generated
+        // folder "C_7_png" is not read.
+        let mut cfg = Config {
+            repo: repo.to_path_buf(),
+            ..Default::default()
+        };
+        let learned = learn_from(&conn, &mut cfg, repo, false);
+        assert_eq!(
+            learned,
+            vec![("C 7".to_string(), "Spiral Galaxy".to_string())]
+        );
+        assert_eq!(
+            load(&conn).get("C 7").map(String::as_str),
+            Some("Spiral Galaxy")
+        );
+        // The longest spelling wins a tie.
+        let mut cfg = Config::default();
+        let found = ["C 36 Koi Fish", "C 36 Koi Fish Galaxy"].map(String::from);
+        let learned = learn(&conn, &mut cfg, found, true);
+        assert_eq!(learned[0].1, "Koi Fish Galaxy");
     }
 }
