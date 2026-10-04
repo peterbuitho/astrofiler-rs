@@ -136,6 +136,12 @@ pub struct IngestReport {
     pub new_ids: Vec<String>,
     /// Input path -> final (or, in a dry run, planned) path of each filed file.
     pub placed: Vec<(PathBuf, PathBuf)>,
+    /// Processed pictures filed with the frames.
+    pub pictures: usize,
+    /// Object nicknames learned from folder and picture names.
+    pub nicknames: Vec<(String, String)>,
+    /// Files that were catalogued in place under the source and are now filed.
+    pub refiled: usize,
     pub dry_run: bool,
 }
 
@@ -159,6 +165,15 @@ impl IngestReport {
             out.push_str(&format!(", {} skipped", self.skipped));
         }
         let would = if self.dry_run { "would be " } else { "" };
+        if self.pictures > 0 {
+            out.push_str(&format!(
+                ", {} processed pictures {would}filed",
+                self.pictures
+            ));
+        }
+        if !self.nicknames.is_empty() {
+            out.push_str(&format!(", {} nicknames learned", self.nicknames.len()));
+        }
         if !self.conflicts.is_empty() {
             out.push_str(&format!(
                 ", {} {would}skipped because a different file already has that name",
@@ -254,6 +269,23 @@ pub fn ingest_folder(
     if !source.is_dir() {
         bail!("source folder {} does not exist", source.display());
     }
+    // The folder and the pictures in it may give an object a nickname, which
+    // then goes into the name of its folder.
+    let mut cfg = crate::nick::effective(conn, cfg);
+    let nicknames = crate::nick::learn_from(conn, &mut cfg, source, opts.dry_run);
+    let cfg = &cfg;
+    // Files a sync catalogued where they lie would be taken for "loaded
+    // before" and left there. Forget them first, so a move files them.
+    let mut refiled = 0;
+    if opts.placement == Placement::Move && !opts.dry_run {
+        refiled = forget_unfiled(conn, cfg, source)?;
+        if refiled > 0 {
+            log::info!(
+                "{refiled} files were catalogued in place under {}",
+                source.display()
+            );
+        }
+    }
     progress.update(0, 0, "Scanning for files...");
     // Never re-read the repository's own organised folders as input
     // (the repository may live inside the folder being loaded).
@@ -279,7 +311,41 @@ pub fn ingest_folder(
         );
         files.extend(more);
     }
-    ingest_files(conn, cfg, files, opts, progress)
+    let mut report = ingest_files(conn, cfg, files, opts, progress)?;
+    report.nicknames = nicknames;
+    report.refiled = refiled;
+    // Pictures the user made from the frames go where the frames went.
+    if opts.placement != Placement::InPlace {
+        let mut filed = report.placed.clone();
+        filed.extend(
+            report
+                .duplicates
+                .iter()
+                .map(|(a, b)| (a.clone(), PathBuf::from(b)))
+                .filter(|(_, b)| b.is_absolute()),
+        );
+        report.pictures = crate::pictures::file(cfg, source, &filed, opts);
+    }
+    Ok(report)
+}
+
+/// Drop the catalogue rows of files under `src` that are not in the
+/// repository's own folders yet. The files are not touched.
+fn forget_unfiled(conn: &Connection, cfg: &Config, src: &Path) -> Result<usize> {
+    let under = |p: &Path| format!("{}/", util::normalize_path(p).trim_end_matches('/'));
+    let n = conn.execute(
+        "DELETE FROM fitsFile WHERE substr(fitsFileName, 1, length(?1)) = ?1 \
+         AND substr(fitsFileName, 1, length(?2)) <> ?2 \
+         AND substr(fitsFileName, 1, length(?3)) <> ?3 \
+         AND substr(fitsFileName, 1, length(?4)) <> ?4",
+        rusqlite::params![
+            under(src),
+            under(&cfg.repo.join("Light")),
+            under(&cfg.repo.join("Stacked")),
+            under(&cfg.repo.join("Calibrate")),
+        ],
+    )?;
+    Ok(n)
 }
 
 /// A Seestar keeps each target in two sibling folders: `M 2` (stacked
@@ -543,6 +609,7 @@ pub fn ingest_files(
     opts: IngestOptions,
     progress: &dyn Progress,
 ) -> Result<IngestReport> {
+    let cfg = &crate::nick::effective(conn, cfg);
     let mut report = IngestReport {
         dry_run: opts.dry_run,
         ..Default::default()

@@ -35,6 +35,13 @@ libraries to install. It comes in three parts:
   Caldwell and popular NGC/IC objects). You can add names or change them in
   Settings, or in the `[object_names]` section of the config file.
 
+  Your own name for an object is kept too. When the folder you load, or a
+  processed picture in it, is called "C 7 Spiral Galaxy", that nickname is
+  remembered in the catalogue and the folder becomes `Light/C_7_Spiral_Galaxy/`.
+
+  Pictures you made from the frames (JPG, PNG, TIFF) are filed with them, under
+  their own names; the telescope's thumbnails and per-frame previews stay behind.
+
   A Seestar writes its serial number as the telescope ("S50_1a2b3c4d") and its
   model as the camera, so its files get a single `Seestar_S50` level instead:
   `Light/M_2/Seestar_S50/20260926/M_2-Seestar_S50-IRCUT-…fits`.
@@ -51,11 +58,10 @@ libraries to install. It comes in three parts:
   A Seestar keeps each target in two folders on its drive: `M 2` (stacked results
   and previews) and `M 2_sub` (the sub-frames). Loading either one brings in the other.
 
-  Reorganising files that are already on the NAS is quickest with **Move** and
-  **Quick move**: files are renamed on the NAS rather than copied (like moving
-  them in the NAS's web interface), and only their headers are read. Their
-  checksums, used to spot duplicates, are filled in by a background task
-  afterwards (`astrofiler load --quick`, then `astrofiler checksums`).
+  Reorganising files that are already on the NAS is quickest with the web
+  version, which runs on the NAS itself. From the command line, a move within
+  one share renames the files instead of copying them; `astrofiler load --quick`
+  also skips their checksums, which `astrofiler checksums` fills in afterwards.
 
   You choose to **move**, **copy** (originals untouched) or **catalogue in place**,
   and a **dry run** shows exactly where every file would go first.
@@ -102,7 +108,9 @@ Download the archive for your platform from the
 - `astrofiler-gui` (`astrofiler-gui.exe` on Windows): the desktop app
 - `astrofiler`: the command-line tool (`astrofiler` with no arguments also opens the app)
 
-On macOS, the first time you run it, right-click → Open (the binaries are not notarised).
+On macOS there is also `AstroFiler-<version>-arm64.dmg`: open it and drag
+AstroFiler to Applications. The first time you run it, right-click → Open (it
+is not notarised). `scripts/macos-dmg.sh` builds the same DMG from source.
 
 To build from source (needs [Rust](https://rustup.rs)):
 

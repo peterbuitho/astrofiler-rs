@@ -58,6 +58,7 @@ pub fn set_field(
     opts: EditOptions,
     progress: &dyn Progress,
 ) -> Result<EditReport> {
+    let cfg = &crate::nick::effective(conn, cfg);
     let (column, _) = column_for(card)?;
     let card = card.to_uppercase();
     let mut report = EditReport::default();
@@ -269,6 +270,7 @@ fn kept_name(original: &str, filed: &Path) -> Option<String> {
 /// - stacked results renamed by earlier versions (`Stacked-M_2-…fits`), which
 ///   get their original name back.
 pub fn layout_plan(conn: &Connection, cfg: &Config) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let cfg = &crate::nick::effective(conn, cfg);
     let repo = &cfg.repo;
     let prefix = format!("{}/", util::normalize_path(repo));
     let files = db::files_where(conn, "substr(fitsFileName, 1, length(?1)) = ?1", &[&prefix])?;
@@ -391,6 +393,12 @@ pub fn migrate_layout(
     progress: &dyn Progress,
 ) -> Result<LayoutMigration> {
     let mut report = LayoutMigration::default();
+    // Nicknames in the names of folders and pictures in the repository go
+    // into the object folders' names.
+    let mut cfg = crate::nick::effective(conn, cfg);
+    let repo = cfg.repo.clone();
+    crate::nick::learn_from(conn, &mut cfg, &repo, dry_run);
+    let cfg = &cfg;
     let plan = layout_plan(conn, cfg)?;
     let tx = conn.transaction()?;
     for (i, (old, new)) in plan.iter().enumerate() {
@@ -424,6 +432,7 @@ pub fn migrate_layout(
     }
     tx.commit()?;
     if !dry_run {
+        crate::pictures::follow(cfg, &report.moved);
         for top in ["Light", "Stacked", "Calibrate"] {
             remove_empty_dirs(&cfg.repo.join(top));
         }

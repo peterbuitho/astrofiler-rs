@@ -651,6 +651,7 @@ fn run(cli: Cli) -> Result<()> {
                 s.first_date.unwrap_or_default(),
                 s.last_date.unwrap_or_default()
             );
+            let cfg = astrofiler::nick::effective(&conn, &cfg);
             println!("\nTop objects by integration:");
             for (o, n, e) in s.by_object.iter().take(15) {
                 let o = match astrofiler::names::common_name(o, &cfg.object_names) {

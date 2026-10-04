@@ -27,7 +27,7 @@ jobs:
             os: macos-14
             archive: tar.gz
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install Linux GUI libraries
         if: runner.os == 'Linux'
@@ -61,13 +61,25 @@ jobs:
             tar czf ../astrofiler-${{ matrix.name }}.tar.gz astrofiler
           fi
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: astrofiler-${{ matrix.name }}
           path: astrofiler-${{ matrix.name }}.${{ matrix.archive }}
 
+      - name: macOS app (DMG)
+        if: runner.os == 'macOS'
+        run: scripts/macos-dmg.sh
+
+      - uses: actions/upload-artifact@v7
+        if: runner.os == 'macOS'
+        with:
+          name: astrofiler-macos-dmg
+          path: dist/*.dmg
+
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
-          files: astrofiler-${{ matrix.name }}.${{ matrix.archive }}
+          files: |
+            astrofiler-${{ matrix.name }}.${{ matrix.archive }}
+            dist/*.dmg

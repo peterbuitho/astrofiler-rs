@@ -12,6 +12,8 @@ pub mod fits;
 pub mod ingest;
 pub mod logging;
 pub mod names;
+pub mod nick;
+pub mod pictures;
 pub mod progress;
 pub mod sessions;
 pub mod stats;

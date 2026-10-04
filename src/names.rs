@@ -203,7 +203,7 @@ pub fn object_folder(object: &str, custom: &BTreeMap<String, String>) -> String 
 }
 
 /// Catalogue prefixes recognised at the start of a folder name.
-const CATALOGUES: &[&str] = &[
+pub(crate) const CATALOGUES: &[&str] = &[
     "MESSIER", "CALDWELL", "BARNARD", "ABELL", "SH2", "NGC", "IC", "SH", "LDN", "LBN", "VDB",
     "ARP", "UGC", "PGC", "MEL", "CR", "TR", "HCG", "CED", "GUM", "RCW", "M", "C", "B",
 ];
