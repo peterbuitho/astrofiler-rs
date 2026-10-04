@@ -1132,6 +1132,23 @@ fn master_calibration_kind(path: &Path, h: &Header) -> Option<FrameKind> {
         .or_else(|| from(&h.get_str("OBJECT").unwrap_or_default()))
 }
 
+/// A processed result that carries no IMAGETYP: a StackingWizard or
+/// PixInsight stack (it says how many frames it holds), or a file with no
+/// observation keywords at all (a stack converted from XISF by an older
+/// version) in a folder that names its target.
+fn is_processed_result(h: &Header, path: &Path) -> bool {
+    if h.get_truthy("IMAGETYP").is_some() || h.get_truthy("FRAME").is_some() {
+        return false;
+    }
+    let frames = ["NCOMBINE", "STACKCNT", "WZNSUBS"]
+        .iter()
+        .any(|k| h.get_i64(k).unwrap_or(0) > 1);
+    let bare = ["OBJECT", "DATE-OBS", "EXPTIME", "EXPOSURE"]
+        .iter()
+        .all(|k| h.get_truthy(k).is_none());
+    frames || (bare && crate::names::object_from_folders(path).is_some())
+}
+
 fn is_master_path(path: &Path) -> bool {
     if path
         .components()
@@ -1151,6 +1168,13 @@ fn prepare(
     mappings: &[Mapping],
 ) -> Result<Prepared> {
     let mut header = fits::read_primary_header(&st.path)?;
+    if is_processed_result(&header, &st.input) {
+        log::info!(
+            "{}: no IMAGETYP, filed as a stacked result",
+            st.input.display()
+        );
+        header.set("IMAGETYP", Value::Str("Master Light".into()));
+    }
     let imagetyp = header
         .get_str("IMAGETYP")
         .unwrap_or_default()
@@ -1247,10 +1271,30 @@ pub fn normalize_header(h: &mut Header, path: &Path, mappings: &[Mapping]) -> Re
             None => bail!("missing required IMAGETYP or FRAME keyword"),
         }
     }
+    let imagetyp = h.get_str("IMAGETYP").unwrap_or_default();
+    // A stacked result may not say when or how long; its file does.
+    let master_light = imagetyp.to_uppercase().contains("MASTER")
+        && FrameKind::classify(&imagetyp) == Some(FrameKind::Light);
+    if master_light && h.get("EXPTIME").or_else(|| h.get("EXPOSURE")).is_none() {
+        let total = h.get_f64("LIVETIME").unwrap_or(0.0);
+        h.set("EXPTIME", Value::Float(total));
+    }
+    if master_light && h.get_truthy("DATE-OBS").is_none() {
+        if let Some(t) = path
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .map(chrono::DateTime::<chrono::Local>::from)
+        {
+            h.set(
+                "DATE-OBS",
+                Value::Str(t.format("%Y-%m-%dT%H:%M:%S").to_string()),
+            );
+        }
+    }
     if h.get("EXPTIME").or_else(|| h.get("EXPOSURE")).is_none() {
         bail!("missing required EXPTIME/EXPOSURE keyword");
     }
-    let imagetyp = h.get_str("IMAGETYP").unwrap_or_default();
     match FrameKind::classify(&imagetyp) {
         Some(FrameKind::Light) | None => {}
         Some(kind) => {
@@ -1547,6 +1591,110 @@ pub(crate) mod tests {
             h.set("STACKCNT", Value::Int(n));
         }
         fits::rewrite_primary_header(path, &h).unwrap();
+    }
+
+    /// Rewrite a test frame's header: remove IMAGETYP and the given keys, add others.
+    fn processed(path: &Path, drop: &[&str], add: &[(&str, Value)]) {
+        let mut h = fits::read_primary_header(path).unwrap();
+        for k in drop.iter().chain(["IMAGETYP"].iter()) {
+            h.remove(k);
+        }
+        for (k, v) in add {
+            h.set(k, v.clone());
+        }
+        fits::write_image(
+            path,
+            &h,
+            ImageShape {
+                width: 16,
+                height: 8,
+                planes: 1,
+            },
+            &(0..128).map(|i| 500.0 + i as f32).collect::<Vec<f32>>(),
+            OutType::U16,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn stacked_results_without_imagetyp_are_filed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("incoming/C4 Iris Nebula");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A StackingWizard result: says what it is, but not IMAGETYP.
+        let a = make_frame(
+            &dir,
+            "wizardstack.fits",
+            "Light",
+            Some("NGC 7023"),
+            "2026-03-22T22:03:46",
+            10.0,
+            Some("IRCUT"),
+            1.0,
+        );
+        processed(&a, &[], &[("NCOMBINE", Value::Int(684))]);
+        // A stack converted from XISF long ago: no observation keywords at all.
+        let b = make_frame(
+            &dir,
+            "C4 Iris Nebula.fits",
+            "Light",
+            Some("X"),
+            "2026-03-22T22:03:46",
+            10.0,
+            None,
+            2.0,
+        );
+        processed(
+            &b,
+            &[
+                "OBJECT", "DATE-OBS", "EXPTIME", "TELESCOP", "INSTRUME", "XBINNING", "YBINNING",
+                "CCD-TEMP",
+            ],
+            &[],
+        );
+        // A picture of the first.
+        std::fs::write(dir.join("wizardstack.png"), b"png").unwrap();
+        // An ordinary file without IMAGETYP and without anything to say what
+        // it is is still refused.
+        std::fs::create_dir_all(tmp.path().join("incoming/other")).unwrap();
+        let c = make_frame(
+            &tmp.path().join("incoming/other"),
+            "x.fits",
+            "Light",
+            Some("M 1"),
+            "2026-03-22T22:03:46",
+            10.0,
+            None,
+            3.0,
+        );
+        processed(&c, &[], &[]);
+
+        let repo = tmp.path().join("repo");
+        let cfg = Config {
+            repo: repo.clone(),
+            source: tmp.path().join("incoming"),
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        let r = ingest_folder(&mut conn, &cfg, &dir, IngestOptions::MOVE, &NoProgress).unwrap();
+        assert_eq!((r.registered, r.errors.len()), (2, 0), "{r:?}");
+        assert_eq!(r.pictures, 1);
+        let files = db::all_files(&conn, false).unwrap();
+        assert!(files.iter().all(|f| f.stacked), "{files:?}");
+        assert!(files
+            .iter()
+            .any(|f| f.object.as_deref() == Some("NGC 7023")));
+        assert!(files.iter().any(|f| f.object.as_deref() == Some("C4")));
+        assert!(files.iter().all(|f| f.name.contains("/Stacked/")));
+        let r = ingest_folder(
+            &mut conn,
+            &cfg,
+            &tmp.path().join("incoming/other"),
+            IngestOptions::MOVE,
+            &NoProgress,
+        )
+        .unwrap();
+        assert_eq!(r.errors.len(), 1, "{r:?}");
     }
 
     #[test]
