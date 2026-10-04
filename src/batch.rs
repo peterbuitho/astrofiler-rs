@@ -277,6 +277,8 @@ pub fn layout_plan(conn: &Connection, cfg: &Config) -> Result<Vec<(PathBuf, Path
     // Object of each object folder, and new names of stacked results and of
     // the companions that share their name.
     let mut objects: HashMap<PathBuf, String> = HashMap::new();
+    // Object of the files in each folder: tells the panels of a mosaic apart.
+    let mut dir_objects: HashMap<PathBuf, String> = HashMap::new();
     let mut renames: HashMap<PathBuf, String> = HashMap::new();
     let mut stem_renames: HashMap<(PathBuf, String), String> = HashMap::new();
     for f in &files {
@@ -291,6 +293,11 @@ pub fn layout_plan(conn: &Connection, cfg: &Config) -> Result<Vec<(PathBuf, Path
                 objects
                     .entry(repo.join(top).join(object_dir))
                     .or_insert_with(|| object.clone());
+                if let Some(dir) = path.parent() {
+                    dir_objects
+                        .entry(dir.to_path_buf())
+                        .or_insert_with(|| object.clone());
+                }
             }
         }
         if !f.stacked {
@@ -363,15 +370,34 @@ pub fn layout_plan(conn: &Connection, cfg: &Config) -> Result<Vec<(PathBuf, Path
                 parts.remove(1);
             }
             if top != "Calibrate" {
-                let object = objects
-                    .get(&object_dir)
+                let beside = old.parent().and_then(|d| dir_objects.get(d));
+                let object = beside
+                    .or_else(|| objects.get(&object_dir))
                     .cloned()
                     .unwrap_or_else(|| parts[0].clone());
-                let base = util::sanitize(&object);
+                let is =
+                    |name: &str, base: &str| name == base || name.starts_with(&format!("{base}_"));
+                let (mosaic, mut panel) = crate::names::mosaic(&object);
+                let (full, base) = (util::sanitize(&object), util::sanitize(&mosaic));
+                // The panel is certain for files beside catalogued frames and
+                // for anything in a folder that is still named after a panel.
+                if beside.is_none() && !is(&parts[0], &full) {
+                    panel = None;
+                }
                 // Only add or update the common name; never move files to a
-                // different object.
-                if parts[0] == base || parts[0].starts_with(&format!("{base}_")) {
-                    parts[0] = crate::names::object_folder(&object, &cfg.object_names);
+                // different object. A mosaic's panels share its folder.
+                if is(&parts[0], &full) || is(&parts[0], &base) {
+                    parts[0] = crate::names::object_folder(&mosaic, &cfg.object_names);
+                }
+                // Panels get a folder below the telescope: before the day
+                // for frames, at the end for stacked results.
+                let filed = parts.iter().any(|p| p.starts_with("Panel_"));
+                if let (Some(n), false, true) = (panel, filed, parts.len() >= 2) {
+                    let day = parts
+                        .last()
+                        .is_some_and(|p| p.len() == 8 && p.chars().all(|c| c.is_ascii_digit()));
+                    let at = if day { parts.len() - 1 } else { parts.len() };
+                    parts.insert(at, crate::names::panel_folder(n));
                 }
             }
             let new = top_dir.join(parts.iter().collect::<PathBuf>()).join(name);
@@ -983,6 +1009,86 @@ mod tests {
     use super::*;
     use crate::ingest::tests::{make_frame, make_seestar};
     use crate::progress::NoProgress;
+
+    #[test]
+    fn mosaic_panels_share_a_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let cfg = Config {
+            repo: repo.clone(),
+            source: tmp.path().join("incoming"),
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        // Panels filed before mosaics were known: one object folder each.
+        for n in 1..=2 {
+            let object = format!("HD 199479({n})");
+            let dir = repo.join(format!(
+                "Light/HD_199479({n})/RedCat_51/ZWO_ASI2600MM/20260909"
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            make_frame(
+                &dir,
+                &format!("p{n}.fits"),
+                "Light",
+                Some(&object),
+                &format!("2026-09-09T22:0{n}:00"),
+                30.0,
+                Some("Duo-Band"),
+                n as f32,
+            );
+            // A preview next to the frame goes along.
+            std::fs::write(dir.join(format!("p{n}.jpg")), b"jpg").unwrap();
+        }
+        let in_place = ingest::IngestOptions::IN_PLACE;
+        ingest::ingest_folder(&mut conn, &cfg, &repo, in_place, &NoProgress).unwrap();
+
+        let r = migrate_layout(&mut conn, &cfg, false, &NoProgress).unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let base = repo.join("Light/HD_199479/RedCat_51/ZWO_ASI2600MM");
+        for n in 1..=2 {
+            let dir = base.join(format!("Panel_{n}/20260909"));
+            assert!(dir.join(format!("p{n}.fits")).exists(), "{}", dir.display());
+            assert!(dir.join(format!("p{n}.jpg")).exists());
+            assert!(!repo.join(format!("Light/HD_199479({n})")).exists());
+        }
+        // The panels are still objects of their own in the catalogue.
+        let objects: std::collections::BTreeSet<_> = db::all_files(&conn, false)
+            .unwrap()
+            .into_iter()
+            .filter_map(|f| f.object)
+            .collect();
+        assert_eq!(objects.len(), 2, "{objects:?}");
+        // Nothing more to move, and a new frame of a panel lands beside them.
+        assert!(layout_plan(&conn, &cfg).unwrap().is_empty());
+        let inbox = tmp.path().join("incoming");
+        std::fs::create_dir_all(&inbox).unwrap();
+        make_frame(
+            &inbox,
+            "new.fits",
+            "Light",
+            Some("HD 199479(2)"),
+            "2026-09-10T22:00:00",
+            30.0,
+            Some("Duo-Band"),
+            7.0,
+        );
+        let r = ingest::ingest_folder(
+            &mut conn,
+            &cfg,
+            &inbox,
+            ingest::IngestOptions::MOVE,
+            &NoProgress,
+        )
+        .unwrap();
+        assert_eq!(r.registered, 1, "{r:?}");
+        assert!(
+            r.placed[0].1.starts_with(base.join("Panel_2/20260910")),
+            "{:?}",
+            r.placed
+        );
+        assert!(layout_plan(&conn, &cfg).unwrap().is_empty());
+    }
 
     #[test]
     fn layout_migration() {

@@ -192,6 +192,29 @@ pub fn common_name(object: &str, custom: &BTreeMap<String, String>) -> Option<St
         .map(|(_, n)| n.to_string())
 }
 
+/// A mosaic panel: a telescope names the panels of a mosaic "HD 199479(1)",
+/// "HD 199479(2)"... Returns the mosaic's own name and the panel number;
+/// any other object comes back as it is, with no panel.
+pub fn mosaic(object: &str) -> (String, Option<u32>) {
+    let o = object.trim();
+    let split = || {
+        let rest = o.strip_suffix(')')?;
+        let (base, n) = rest.rsplit_once('(')?;
+        let base = base.trim();
+        let panel = n.trim().parse::<u32>().ok()?;
+        (!base.is_empty() && !n.is_empty()).then(|| (base.to_string(), panel))
+    };
+    match split() {
+        Some((base, n)) => (base, Some(n)),
+        None => (o.to_string(), None),
+    }
+}
+
+/// Folder of a mosaic panel, below the telescope's folder.
+pub fn panel_folder(panel: u32) -> String {
+    format!("Panel_{panel}")
+}
+
 /// Folder name for an object: "M 76" -> "M_76_Barbell_Nebula"; objects
 /// without a common name keep just their designation.
 pub fn object_folder(object: &str, custom: &BTreeMap<String, String>) -> String {
@@ -315,6 +338,18 @@ pub fn object_from_folders(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mosaic_panels() {
+        assert_eq!(mosaic("HD 199479(1)"), ("HD 199479".into(), Some(1)));
+        assert_eq!(mosaic("M 31 (12) "), ("M 31".into(), Some(12)));
+        assert_eq!(mosaic("HD 199479"), ("HD 199479".into(), None));
+        assert_eq!(
+            mosaic("NGC 4631 (Whale)"),
+            ("NGC 4631 (Whale)".into(), None)
+        );
+        assert_eq!(mosaic("(1)"), ("(1)".into(), None));
+    }
 
     #[test]
     fn objects_from_folder_names() {

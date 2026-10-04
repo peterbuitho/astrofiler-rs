@@ -46,6 +46,11 @@ libraries to install. It comes in three parts:
   model as the camera, so its files get a single `Seestar_S50` level instead:
   `Light/M_2/Seestar_S50/20260926/M_2-Seestar_S50-IRCUT-…fits`.
 
+  The panels of a mosaic, which a telescope names "HD 199479(1)", "HD
+  199479(2)"..., share the mosaic's folder and get one each below the
+  telescope: `Light/HD_199479/<Telescope>/<Camera>/Panel_1/<YYYYMMDD>/`. In
+  the catalogue each panel keeps its own name.
+
   Stacked results (Seestar `Stacked_*.fit`, DWARF `stacked-*.fits`, PixInsight
   master lights) keep the name they were given, and so do their previews. A
   PixInsight master light without an OBJECT keyword takes its target from the

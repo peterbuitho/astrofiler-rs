@@ -1447,8 +1447,10 @@ fn device_folder(h: &Header) -> (String, PathBuf) {
 /// Descriptive file name and repository folder (same scheme as the original).
 pub fn destination(h: &Header, cfg: &Config) -> Result<(String, PathBuf)> {
     let repo = &cfg.repo;
-    let object_dir =
-        || crate::names::object_folder(&val(h, "OBJECT", "Unknown"), &cfg.object_names);
+    // The panels of a mosaic share the mosaic's folder and get one of their
+    // own below the telescope: Light/HD_199479/DWARF_3/TELE/Panel_1/<day>.
+    let (mosaic, panel) = crate::names::mosaic(&val(h, "OBJECT", "Unknown"));
+    let object_dir = || crate::names::object_folder(&mosaic, &cfg.object_names);
     let imagetyp = val(h, "IMAGETYP", "");
     let (stamp, day) = parse_date_obs(&val(h, "DATE-OBS", ""))?;
     let exposure = h
@@ -1457,6 +1459,10 @@ pub fn destination(h: &Header, cfg: &Config) -> Result<(String, PathBuf)> {
         .map(|v| v.to_py_string())
         .unwrap_or_default();
     let (device, device_dir) = device_folder(h);
+    let device_dir = match panel {
+        Some(n) => device_dir.join(crate::names::panel_folder(n)),
+        None => device_dir,
+    };
     let xbin = val(h, "XBINNING", "1");
     let ybin = val(h, "YBINNING", "1");
     let temp = val(h, "CCD-TEMP", "0");
