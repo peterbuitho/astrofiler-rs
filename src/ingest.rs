@@ -138,6 +138,8 @@ pub struct IngestReport {
     pub placed: Vec<(PathBuf, PathBuf)>,
     /// Processed pictures filed with the frames.
     pub pictures: usize,
+    /// Folders deleted after a move because nothing was left in them.
+    pub folders_removed: usize,
     /// Object nicknames learned from folder and picture names.
     pub nicknames: Vec<(String, String)>,
     /// Files that were catalogued in place under the source and are now filed.
@@ -170,6 +172,9 @@ impl IngestReport {
                 ", {} processed pictures {would}filed",
                 self.pictures
             ));
+        }
+        if self.folders_removed > 0 {
+            out.push_str(&format!(", {} empty folders removed", self.folders_removed));
         }
         if !self.nicknames.is_empty() {
             out.push_str(&format!(", {} nicknames learned", self.nicknames.len()));
@@ -302,8 +307,9 @@ pub fn ingest_folder(
         files.len(),
         source.display()
     );
-    for other in seestar_companions(source) {
-        let more = collect_files(&other, &excluded);
+    let companions = seestar_companions(source);
+    for other in &companions {
+        let more = collect_files(other, &excluded);
         log::info!(
             "Also loading {} files from {} (the other half of this Seestar target)",
             more.len(),
@@ -325,6 +331,12 @@ pub fn ingest_folder(
                 .filter(|(_, b)| b.is_absolute()),
         );
         report.pictures = crate::pictures::file(cfg, source, &filed, opts);
+    }
+    // A folder that was moved out of is not needed any more.
+    if opts.placement == Placement::Move && !opts.dry_run {
+        for dir in std::iter::once(&source.to_path_buf()).chain(&companions) {
+            report.folders_removed += crate::batch::prune_source(cfg, dir);
+        }
     }
     Ok(report)
 }
@@ -1617,6 +1629,83 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_emptied_source_folder_is_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = tmp.path().join("inbox");
+        let emptied = inbox.join("M 31 night 1");
+        let kept = inbox.join("M 31 night 2");
+        for (dir, name, date) in [
+            (&emptied, "a.fits", "2026-01-20T01:00:00"),
+            (&kept, "b.fits", "2026-01-22T01:00:00"),
+        ] {
+            std::fs::create_dir_all(dir.join("sub")).unwrap();
+            make_frame(
+                &dir.join("sub"),
+                name,
+                "Light",
+                Some("M 31"),
+                date,
+                30.0,
+                None,
+                1.0,
+            );
+        }
+        // What a NAS leaves behind does not count; a telescope thumbnail does.
+        std::fs::create_dir_all(emptied.join("sub/@eaDir/a.fits")).unwrap();
+        std::fs::write(emptied.join(".DS_Store"), b"x").unwrap();
+        std::fs::write(kept.join("sub/thumb.jpg"), b"x").unwrap();
+        let cfg = Config {
+            repo: tmp.path().join("repo"),
+            source: inbox.clone(),
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        let r = ingest_folder(&mut conn, &cfg, &emptied, IngestOptions::MOVE, &NoProgress).unwrap();
+        assert_eq!((r.registered, r.folders_removed), (1, 2), "{r:?}");
+        assert!(!emptied.exists());
+        // A dry run, a copy and the incoming folder itself stay.
+        let other = inbox.join("M 31 night 3");
+        std::fs::create_dir_all(&other).unwrap();
+        make_frame(
+            &other,
+            "c.fits",
+            "Light",
+            Some("M 31"),
+            "2026-01-21T01:00:00",
+            30.0,
+            None,
+            5.0,
+        );
+        let r = ingest_folder(&mut conn, &cfg, &other, IngestOptions::COPY, &NoProgress).unwrap();
+        assert_eq!(r.folders_removed, 0);
+        let dry = IngestOptions {
+            dry_run: true,
+            ..IngestOptions::MOVE
+        };
+        ingest_folder(&mut conn, &cfg, &kept, dry, &NoProgress).unwrap();
+        assert!(kept.join("sub/b.fits").exists() && other.exists());
+        std::fs::remove_file(kept.join("sub/thumb.jpg")).unwrap();
+        let r = ingest_folder(&mut conn, &cfg, &inbox, IngestOptions::MOVE, &NoProgress).unwrap();
+        assert!(inbox.is_dir(), "{r:?}");
+        let left: Vec<_> = walkdir::WalkDir::new(&kept)
+            .into_iter()
+            .flatten()
+            .map(|e| e.into_path())
+            .collect();
+        assert!(!kept.exists(), "{left:?} {r:?}");
+        // c.fits was copied before, so its original is left (it is a
+        // duplicate now) and so is its folder.
+        assert!(other.exists());
+        // The repository is never removed, even when it is what was loaded.
+        std::fs::create_dir_all(tmp.path().join("repo/Light/Empty")).unwrap();
+        assert_eq!(
+            crate::batch::prune_source(&cfg, &tmp.path().join("repo")),
+            0
+        );
+        assert!(tmp.path().join("repo/Light/Empty").exists());
+    }
+
+    #[test]
     fn stacked_results_without_imagetyp_are_filed() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("incoming/C4 Iris Nebula");
@@ -2285,6 +2374,9 @@ pub(crate) mod tests {
         .unwrap();
         conn.execute("UPDATE fitsFile SET fitsFileOriginalFile = NULL", [])
             .unwrap();
+        // The folder went with its frames.
+        assert!(!src.exists());
+        std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("shotsInfo.json"), br#"{"target": "C 13"}"#).unwrap();
         let r = ingest_folder(
             &mut conn,

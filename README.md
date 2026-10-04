@@ -63,6 +63,11 @@ libraries to install. It comes in three parts:
   one share renames the files instead of copying them; `astrofiler load --quick`
   also skips their checksums, which `astrofiler checksums` fills in afterwards.
 
+  After a **move**, the folder you loaded from is deleted when nothing is left
+  in it (a NAS's `@eaDir` and `.DS_Store` don't count; a telescope thumbnail
+  that stayed behind does). The repository and the incoming folder itself are
+  never deleted.
+
   You choose to **move**, **copy** (originals untouched) or **catalogue in place**,
   and a **dry run** shows exactly where every file would go first.
   If a different file already has the same name in the repository, you choose to

@@ -793,6 +793,86 @@ pub fn move_to_inbox(
     Ok(report)
 }
 
+/// Names file managers and NASes leave in folders; a folder holding only
+/// these counts as empty.
+fn is_litter(name: &str) -> bool {
+    matches!(
+        name,
+        "@eaDir" | ".DS_Store" | "Thumbs.db" | "desktop.ini" | "#recycle"
+    ) || name.starts_with("._")
+}
+
+/// Remove `dir` if nothing but litter is left in it, after doing the same
+/// to the folders inside. True when it is gone.
+fn prune(dir: &Path, count: &mut usize) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut litter = Vec::new();
+    let mut empty = true;
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let path = e.path();
+        if is_litter(&name) {
+            litter.push(path);
+        } else if e.file_type().is_ok_and(|t| t.is_dir()) {
+            if !prune(&path, count) {
+                empty = false;
+            }
+        } else {
+            empty = false;
+        }
+    }
+    if !empty {
+        return false;
+    }
+    for l in litter {
+        if l.is_dir() {
+            std::fs::remove_dir_all(&l).ok();
+        } else {
+            std::fs::remove_file(&l).ok();
+        }
+    }
+    let gone = std::fs::remove_dir(dir).is_ok();
+    if gone {
+        *count += 1;
+    }
+    gone
+}
+
+/// After a move: delete the folder it was loaded from, and the empty folders
+/// inside it, when nothing is left in them. Never the repository (or a folder
+/// holding it) and never the incoming folder itself. Returns how many
+/// folders were removed.
+pub fn prune_source(cfg: &Config, source: &Path) -> usize {
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    };
+    let repo = cfg.repo.canonicalize().unwrap_or_else(|_| cfg.repo.clone());
+    let root = source
+        .canonicalize()
+        .unwrap_or_else(|_| source.to_path_buf());
+    if repo.starts_with(&root) || !source.is_dir() {
+        return 0;
+    }
+    let mut count = 0;
+    if same(source, &cfg.source) {
+        // The inbox stays; what is inside it may go.
+        if let Ok(entries) = std::fs::read_dir(source) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if !is_litter(&name) && e.file_type().is_ok_and(|t| t.is_dir()) {
+                    prune(&e.path(), &mut count);
+                }
+            }
+        }
+    } else {
+        prune(source, &mut count);
+    }
+    count
+}
+
 pub fn remove_empty_dirs(root: &Path) -> usize {
     let mut removed = 0;
     let dirs: Vec<PathBuf> = walkdir::WalkDir::new(root)
