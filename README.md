@@ -53,6 +53,8 @@ libraries to install. It comes in three parts:
 
   Stacked results (Seestar `Stacked_*.fit`, DWARF `stacked-*.fits`, PixInsight
   master lights) keep the name they were given, and so do their previews. A
+  preview whose stacked FITS was not kept goes to the Stacked folder of its
+  sub-frames. A
   PixInsight master light without an OBJECT keyword takes its target from the
   folder it is in ("NGC 1333 Embryo Nebula" → NGC 1333). Master bias, darks
   and flats are catalogued like other calibration frames.

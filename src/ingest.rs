@@ -387,15 +387,32 @@ pub fn seestar_companions(source: &Path) -> Vec<PathBuf> {
     .collect()
 }
 
+/// Where the stacked results of the sub-frames in `light_dir` belong: the
+/// same folders under Stacked, without the one for the day.
+pub(crate) fn stacked_dir(repo: &Path, light_dir: &Path) -> Option<PathBuf> {
+    let rel = light_dir.strip_prefix(repo.join("Light")).ok()?;
+    let mut parts: Vec<Component> = rel.components().collect();
+    let day = parts.last().is_some_and(|c| {
+        let s = c.as_os_str().to_string_lossy();
+        s.len() == 8 && s.chars().all(|c| c.is_ascii_digit())
+    });
+    if day {
+        parts.pop();
+    }
+    Some(repo.join("Stacked").join(parts.iter().collect::<PathBuf>()))
+}
+
 /// Place companion files next to the frames that came from the same folder:
 /// session info (DWARF `shotsInfo.json`) beside the light frames, stack
 /// previews (Seestar/DWARF stacked JPG/PNG) beside the stacked FITS. A preview
 /// with the same name as a stacked FITS takes over that file's new name;
 /// others are prefixed with their original folder name so sessions filed into
-/// one directory don't collide. Frames filed in an earlier run are found
-/// through their recorded original path.
+/// one directory don't collide. A preview without a stacked FITS goes to the
+/// Stacked folder of the folder's sub-frames. Frames filed in an earlier run
+/// are found through their recorded original path.
 fn place_sidecars(
     conn: &Connection,
+    repo: &Path,
     sidecars: &[PathBuf],
     opts: IngestOptions,
     report: &mut IngestReport,
@@ -409,25 +426,29 @@ fn place_sidecars(
         };
         let want_stacked = kind == util::SidecarKind::StackPreview;
         let is_stacked_dest = |d: &Path| d.components().any(|c| c.as_os_str() == "Stacked");
-        // (original path, filed path) of this folder's matching frames.
-        let mut frames: Vec<(PathBuf, PathBuf)> = report
-            .placed
-            .iter()
-            .filter(|(i, d)| {
-                i.parent() == Some(src_dir)
-                    && util::is_fits_name(d)
-                    && is_stacked_dest(d) == want_stacked
-            })
-            .cloned()
-            .collect();
-        if frames.is_empty() {
+        // (original path, filed path) of this folder's frames: sub-frames or
+        // stacked results.
+        let find = |stacked: bool| -> Result<Vec<(PathBuf, PathBuf)>> {
+            let frames: Vec<(PathBuf, PathBuf)> = report
+                .placed
+                .iter()
+                .filter(|(i, d)| {
+                    i.parent() == Some(src_dir)
+                        && util::is_fits_name(d)
+                        && is_stacked_dest(d) == stacked
+                })
+                .cloned()
+                .collect();
+            if !frames.is_empty() {
+                return Ok(frames);
+            }
             let prefix = format!("{}/", util::normalize_path(src_dir));
             let rows = db::files_where(
                 conn,
                 "substr(fitsFileOriginalFile, 1, length(?1)) = ?1 AND COALESCE(fitsFileStacked,0) = ?2",
-                &[&prefix, &(want_stacked as i64)],
+                &[&prefix, &(stacked as i64)],
             )?;
-            frames = rows
+            Ok(rows
                 .into_iter()
                 .map(|f| {
                     (
@@ -435,7 +456,14 @@ fn place_sidecars(
                         PathBuf::from(f.name),
                     )
                 })
-                .collect();
+                .collect())
+        };
+        let mut frames = find(want_stacked)?;
+        // A preview whose stacked FITS did not come along (deleted, or never
+        // downloaded) goes where that would have gone.
+        let beside_subs = want_stacked && frames.is_empty();
+        if beside_subs {
+            frames = find(false)?;
         }
         if frames.is_empty() && kind == util::SidecarKind::SessionInfo {
             // Frames catalogued without an original path (older runs, or a
@@ -458,8 +486,12 @@ fn place_sidecars(
         let mut counts: std::collections::HashMap<PathBuf, usize> =
             std::collections::HashMap::new();
         for (_, d) in &frames {
-            if let Some(p) = d.parent() {
-                *counts.entry(p.to_path_buf()).or_default() += 1;
+            let dir = match d.parent() {
+                Some(p) if beside_subs => stacked_dir(repo, p),
+                p => p.map(Path::to_path_buf),
+            };
+            if let Some(p) = dir {
+                *counts.entry(p).or_default() += 1;
             }
         }
         let Some((dest_dir, _)) = counts.into_iter().max_by_key(|(_, n)| *n) else {
@@ -482,9 +514,9 @@ fn place_sidecars(
             .extension()
             .map(|e| e.to_string_lossy().to_string())
             .unwrap_or_default();
-        let twin = frames
-            .iter()
-            .find(|(i, _)| i.file_stem().is_some() && i.file_stem() == sidecar.file_stem());
+        let twin = frames.iter().find(|(i, _)| {
+            !beside_subs && i.file_stem().is_some() && i.file_stem() == sidecar.file_stem()
+        });
         let file_name = match twin {
             Some((_, filed)) => format!(
                 "{}.{ext}",
@@ -649,7 +681,7 @@ pub fn ingest_files(
         std::fs::remove_dir_all(&work).ok();
     }
     result?;
-    place_sidecars(conn, &sidecars, opts, &mut report)?;
+    place_sidecars(conn, &cfg.repo, &sidecars, opts, &mut report)?;
     progress.update(total, total, "Done");
     log::info!("Ingest finished: {}", report.summary());
     Ok(report)
@@ -2257,6 +2289,77 @@ pub(crate) mod tests {
         std::fs::write(&json, b"").unwrap();
         let r = again(OnConflict::Skip);
         assert_eq!((r.sidecars, r.repaired), (1, 1), "{r:?}");
+    }
+
+    #[test]
+    fn dwarf_stacks_without_a_frame_count_are_stacked_results() {
+        let tmp = tempfile::tempdir().unwrap();
+        let night = |n: &str| {
+            let dir = tmp.path().join(format!(
+                "in/DWARF_RAW_TELE_C 9_EXP_60_GAIN_60_2025-10-0{n}-20-25-05-997"
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        };
+        let frame = |dir: &Path, name: &str, date: &str, exp: f64, seed: f32| {
+            let p = make_frame(dir, name, "Light", Some("C 9"), date, exp, None, seed);
+            processed(&p, &[], &[]);
+        };
+        // The telescope's stack, its previews and a sub-frame.
+        let (first, second) = (night("1"), night("2"));
+        let stack = "stacked-16_C 9_60s60_Duo-Band_20251001-202510704";
+        frame(
+            &first,
+            "C 9_60s60_0001.fits",
+            "2025-10-01T20:26:00",
+            60.0,
+            1.0,
+        );
+        frame(
+            &first,
+            &format!("{stack}.fits"),
+            "2025-10-01T23:00:00",
+            11040.0,
+            2.0,
+        );
+        std::fs::write(first.join(format!("{stack}.png")), b"png").unwrap();
+        std::fs::write(first.join("stacked.jpg"), b"jpg").unwrap();
+        // A night whose stacked FITS was not kept.
+        frame(
+            &second,
+            "C 9_60s60_0001.fits",
+            "2025-10-02T20:26:00",
+            60.0,
+            3.0,
+        );
+        std::fs::write(second.join("stacked.jpg"), b"jpg 2").unwrap();
+
+        let repo = tmp.path().join("repo");
+        let cfg = Config {
+            repo: repo.clone(),
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        let source = tmp.path().join("in");
+        let r = ingest_folder(&mut conn, &cfg, &source, IngestOptions::MOVE, &NoProgress).unwrap();
+        assert_eq!(
+            (r.registered, r.sidecars, r.errors.len()),
+            (3, 3, 0),
+            "{r:?}"
+        );
+        let stacked = repo.join("Stacked/C_9_Cave_Nebula/RedCat_51/TELE");
+        let folder = |d: &Path| d.file_name().unwrap().to_string_lossy().into_owned();
+        for name in [
+            format!("{stack}.fits"),
+            format!("{stack}.png"),
+            format!("{}_stacked.jpg", folder(&first)),
+            format!("{}_stacked.jpg", folder(&second)),
+        ] {
+            assert!(stacked.join(&name).exists(), "{name} {r:?}");
+        }
+        let files = db::all_files(&conn, false).unwrap();
+        assert_eq!(files.iter().filter(|f| f.stacked).count(), 1, "{files:?}");
+        assert!(!source.exists(), "nothing is left behind");
     }
 
     #[test]

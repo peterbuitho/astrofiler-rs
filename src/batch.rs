@@ -268,7 +268,9 @@ fn kept_name(original: &str, filed: &Path) -> Option<String> {
 /// - object folders without the object's common name (`M_76` becomes
 ///   `M_76_Barbell_Nebula`), or with a common name that has since changed;
 /// - stacked results renamed by earlier versions (`Stacked-M_2-…fits`), which
-///   get their original name back.
+///   get their original name back;
+/// - a telescope's own stack filed with the sub-frames (`stacked-16_*.fits` of
+///   older DWARF firmware), which goes to Stacked under its original name.
 pub fn layout_plan(conn: &Connection, cfg: &Config) -> Result<Vec<(PathBuf, PathBuf)>> {
     let cfg = &crate::nick::effective(conn, cfg);
     let repo = &cfg.repo;
@@ -281,6 +283,9 @@ pub fn layout_plan(conn: &Connection, cfg: &Config) -> Result<Vec<(PathBuf, Path
     let mut dir_objects: HashMap<PathBuf, String> = HashMap::new();
     let mut renames: HashMap<PathBuf, String> = HashMap::new();
     let mut stem_renames: HashMap<(PathBuf, String), String> = HashMap::new();
+    // A telescope's own stack that an earlier version took for a sub-frame
+    // (DWARF `stacked-16_*.fits` without a frame count), and its name.
+    let mut restacked: HashMap<PathBuf, String> = HashMap::new();
     for f in &files {
         let path = PathBuf::from(&f.name);
         let Ok(rel) = path.strip_prefix(repo) else {
@@ -300,12 +305,15 @@ pub fn layout_plan(conn: &Connection, cfg: &Config) -> Result<Vec<(PathBuf, Path
                 }
             }
         }
-        if !f.stacked {
-            continue;
-        }
         let Some(kept) = f.original.as_deref().and_then(|o| kept_name(o, &path)) else {
             continue;
         };
+        if !f.stacked {
+            if rel.starts_with("Light") && kept.to_lowercase().starts_with("stacked") {
+                restacked.insert(path.clone(), kept);
+            }
+            continue;
+        }
         let (Some(dir), Some(old_stem), Some(new_stem)) = (
             path.parent(),
             path.file_stem(),
@@ -400,7 +408,14 @@ pub fn layout_plan(conn: &Connection, cfg: &Config) -> Result<Vec<(PathBuf, Path
                     parts.insert(at, crate::names::panel_folder(n));
                 }
             }
-            let new = top_dir.join(parts.iter().collect::<PathBuf>()).join(name);
+            let dir = top_dir.join(parts.iter().collect::<PathBuf>());
+            let new = match restacked.get(&old) {
+                Some(kept) => match ingest::stacked_dir(repo, &dir) {
+                    Some(stacked) => stacked.join(kept),
+                    None => dir.join(name),
+                },
+                None => dir.join(name),
+            };
             if new != old {
                 out.push((old, new));
             }
@@ -453,6 +468,14 @@ pub fn migrate_layout(
                 "UPDATE fitsFile SET fitsFileName=?1 WHERE fitsFileName=?2",
                 params![util::normalize_path(new), util::normalize_path(old)],
             )?;
+            // A stack that was filed with the sub-frames is a stacked result.
+            if old.starts_with(repo.join("Light")) && new.starts_with(repo.join("Stacked")) {
+                tx.execute(
+                    "UPDATE fitsFile SET fitsFileStacked=1, fitsFileType='MASTER LIGHT', \
+                     fitsFileSession=NULL WHERE fitsFileName=?1",
+                    [util::normalize_path(new)],
+                )?;
+            }
         }
         report.moved.push((old.clone(), new.clone()));
     }
@@ -1088,6 +1111,69 @@ mod tests {
             r.placed
         );
         assert!(layout_plan(&conn, &cfg).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_stack_filed_with_the_sub_frames_moves_to_stacked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let cfg = Config {
+            repo: repo.clone(),
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        let folder = tmp
+            .path()
+            .join("in/DWARF_RAW_TELE_C 9_EXP_60_GAIN_60_2025-10-01-20-25-05-997");
+        std::fs::create_dir_all(&folder).unwrap();
+        for (name, date, exp, seed) in [
+            ("sub.fits", "2025-10-01T20:26:00", 60.0, 1.0),
+            ("stack.fits", "2025-10-01T23:00:00", 11040.0, 2.0),
+        ] {
+            make_frame(&folder, name, "Light", Some("C 9"), date, exp, None, seed);
+        }
+        let r = ingest::ingest_folder(
+            &mut conn,
+            &cfg,
+            &folder,
+            ingest::IngestOptions::COPY,
+            &NoProgress,
+        )
+        .unwrap();
+        assert_eq!(r.registered, 2, "{r:?}");
+        // As 0.8.0 left it: the telescope's stack among the sub-frames.
+        let original = folder.join("stacked-16_C 9_60s60_Duo-Band_20251001-202510704.fits");
+        conn.execute(
+            "UPDATE fitsFile SET fitsFileOriginalFile=?1 WHERE fitsFileOriginalFile=?2",
+            params![
+                util::normalize_path(&original),
+                util::normalize_path(&folder.join("stack.fits"))
+            ],
+        )
+        .unwrap();
+
+        let r = migrate_layout(&mut conn, &cfg, false, &NoProgress).unwrap();
+        assert_eq!((r.moved.len(), r.errors.len()), (1, 0), "{r:?}");
+        let new = repo
+            .join("Stacked/C_9_Cave_Nebula/RedCat_51/ZWO_ASI2600MM")
+            .join(original.file_name().unwrap());
+        assert!(new.exists(), "{r:?}");
+        let files = db::all_files(&conn, false).unwrap();
+        let stacked: Vec<&FitsFile> = files.iter().filter(|f| f.stacked).collect();
+        assert_eq!(stacked.len(), 1, "{files:?}");
+        assert_eq!(stacked[0].name, util::normalize_path(&new));
+        assert!(layout_plan(&conn, &cfg).unwrap().is_empty());
+        // The previews left in the telescope's folder follow on the next load.
+        std::fs::write(original.with_extension("png"), b"png").unwrap();
+        ingest::ingest_folder(
+            &mut conn,
+            &cfg,
+            &folder,
+            ingest::IngestOptions::MOVE,
+            &NoProgress,
+        )
+        .unwrap();
+        assert!(new.with_extension("png").exists());
     }
 
     #[test]

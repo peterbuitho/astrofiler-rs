@@ -327,6 +327,15 @@ impl Telescope for Dwarf {
                 h.set("INSTRUME", Value::Str(cam.trim().to_string()));
             }
         }
+        // The telescope's own stack (`stacked-16_*.fits`): older firmware
+        // does not say how many frames it holds, so the name has to.
+        let imagetyp = h.get_str("IMAGETYP").unwrap_or_default();
+        if file.to_lowercase().starts_with("stacked")
+            && crate::util::FrameKind::classify(&imagetyp) == Some(crate::util::FrameKind::Light)
+            && !imagetyp.to_uppercase().contains("MASTER")
+        {
+            h.set("IMAGETYP", Value::Str("Master Light".into()));
+        }
         Ok(())
     }
 }
