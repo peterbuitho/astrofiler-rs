@@ -266,6 +266,18 @@ pub fn collect_files(dir: &Path, exclude: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The organised folder of the repository (Light, Stacked, ...) that `path`
+/// is, or lies in. What is there is filed already: it is no source to move
+/// files out of.
+pub fn managed_dir(cfg: &Config, path: &Path) -> Option<&'static str> {
+    let real = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let path = real(path);
+    MANAGED_DIRS
+        .iter()
+        .copied()
+        .find(|d| path.starts_with(real(&cfg.repo.join(d))))
+}
+
 /// Load every supported file under `source` (e.g. an incoming folder or an
 /// existing archive on a NAS).
 pub fn ingest_folder(
@@ -286,6 +298,14 @@ pub fn ingest_folder(
     let source = fast.as_path();
     if !source.is_dir() {
         bail!("source folder {} does not exist", source.display());
+    }
+    if opts.placement == Placement::Move {
+        if let Some(dir) = managed_dir(cfg, source) {
+            bail!(
+                "{} is in the repository's {dir} folder: files there are already filed and are not moved again",
+                source.display()
+            );
+        }
     }
     // The folder and the pictures in it may give an object a nickname, which
     // then goes into the name of its folder.
@@ -2431,6 +2451,40 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read(&filed).unwrap(), whole);
         assert!(!a.exists());
         assert_eq!(db::all_files(&conn, false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_repository_folders_are_no_source_to_move_from() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("in");
+        std::fs::create_dir_all(&src).unwrap();
+        make_frame(
+            &src,
+            "a.fits",
+            "Light",
+            Some("M 97"),
+            "2026-01-01T21:00:00",
+            30.0,
+            None,
+            1.0,
+        );
+        let cfg = Config {
+            repo: tmp.path().join("repo"),
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        let r = ingest_folder(&mut conn, &cfg, &src, IngestOptions::MOVE, &NoProgress).unwrap();
+        let filed = r.placed[0].1.clone();
+        for dir in [cfg.repo.join("Light"), filed.parent().unwrap().to_path_buf()] {
+            let e = ingest_folder(&mut conn, &cfg, &dir, IngestOptions::MOVE, &NoProgress)
+                .unwrap_err();
+            assert!(format!("{e}").contains("Light folder"), "{e}");
+        }
+        assert!(filed.is_file());
+        assert_eq!(managed_dir(&cfg, &cfg.repo), None);
+        assert_eq!(managed_dir(&cfg, &src), None);
+        // Cataloguing what lies there stays possible.
+        ingest_folder(&mut conn, &cfg, &cfg.repo, IngestOptions::IN_PLACE, &NoProgress).unwrap();
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "astrofiler"
-version = "0.8.3"
+version = "0.8.4"
 edition = "2021"
 description = "Fast astronomical FITS image filing, cataloguing and calibration (Rust port of AstroFiler)"
 license = "GPL-3.0-or-later"
