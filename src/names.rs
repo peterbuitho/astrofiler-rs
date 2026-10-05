@@ -231,8 +231,8 @@ pub(crate) const CATALOGUES: &[&str] = &[
     "ARP", "UGC", "PGC", "MEL", "CR", "TR", "HCG", "CED", "GUM", "RCW", "M", "C", "B",
 ];
 
-/// Folders that stacking programs and archives put results in; the target
-/// is named by the folder above.
+/// Folders that stacking programs, telescopes and archives put results or
+/// sub-frames in; the target is named by the folder above.
 const OUTPUT_FOLDERS: &[&str] = &[
     "stacked",
     "stack",
@@ -252,6 +252,8 @@ const OUTPUT_FOLDERS: &[&str] = &[
     "xisf",
     "registered",
     "calibrated",
+    "sub",
+    "subs",
 ];
 
 /// Folder names that say nothing about the target: looking further up would

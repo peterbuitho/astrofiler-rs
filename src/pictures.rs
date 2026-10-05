@@ -46,6 +46,38 @@ fn pictures_under(dir: &Path, skip: &[PathBuf], out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Where a picture goes when the catalogue no longer knows which frames came
+/// from its folder (they were loaded from another path, or the catalogue was
+/// regenerated): the folder the repository already has for the object its
+/// folder is named after, next to a result of the same name if there is one.
+fn by_folder_name(cfg: &Config, pic: &Path) -> Option<PathBuf> {
+    let stem = pic.file_stem()?.to_string_lossy().to_lowercase();
+    pic.ancestors().take(3).find_map(|from| {
+        let object = crate::names::object_from_folders(from)?;
+        let folder = crate::names::object_folder(&object, &cfg.object_names);
+        ["Stacked", "Light"].iter().find_map(|top| {
+            let dir = cfg.repo.join(top).join(&folder);
+            if !dir.is_dir() {
+                return None;
+            }
+            let twin = walkdir::WalkDir::new(&dir)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .map(|e| e.into_path())
+                .find(|p| {
+                    util::is_supported_file(p)
+                        && !util::is_sidecar(p)
+                        && p.file_stem()
+                            .is_some_and(|s| s.to_string_lossy().to_lowercase() == stem)
+                });
+            Some(
+                twin.and_then(|t| t.parent().map(Path::to_path_buf))
+                    .unwrap_or(dir),
+            )
+        })
+    })
+}
+
 /// Move or copy the user's processed pictures under `src` to where the frames
 /// of their folder were filed (`filed`: input -> place in the repository).
 /// Returns how many were (or, in a dry run, would be) filed.
@@ -89,7 +121,8 @@ pub fn file(cfg: &Config, src: &Path, filed: &[(PathBuf, PathBuf)], opts: Ingest
             continue;
         }
         // Next to the result it was made from, else next to a stacked result
-        // of the same folder, else in the object folder of the frames below.
+        // of the same folder, else in the object folder of the frames below,
+        // else in the folder of the object its own folder is named after.
         let dest_dir = twin
             .or_else(|| {
                 beside
@@ -104,7 +137,8 @@ pub fn file(cfg: &Config, src: &Path, filed: &[(PathBuf, PathBuf)], opts: Ingest
                     .or_else(|| filed.iter().find(|(a, _)| a.starts_with(dir)))?;
                 let mut parts = b.strip_prefix(&cfg.repo).ok()?.components();
                 Some(cfg.repo.join(parts.next()?).join(parts.next()?))
-            });
+            })
+            .or_else(|| by_folder_name(cfg, pic));
         let Some(dest_dir) = dest_dir else {
             log::info!(
                 "{}: left, no frames of its folder were filed",

@@ -79,6 +79,9 @@ pub struct IngestOptions {
     /// within one drive or share), so nothing but their header is read. The
     /// checksums are filled in later by [`crate::batch::fill_checksums`].
     pub quick: bool,
+    /// A light frame whose header names no target (no OBJECT) takes the
+    /// name of the folder it is in, instead of being refused.
+    pub object_from_folder: bool,
 }
 
 impl IngestOptions {
@@ -87,22 +90,32 @@ impl IngestOptions {
         dry_run: false,
         on_conflict: OnConflict::Skip,
         quick: false,
+        object_from_folder: false,
     };
     pub const COPY: Self = IngestOptions {
         placement: Placement::Copy,
         dry_run: false,
         on_conflict: OnConflict::Skip,
         quick: false,
+        object_from_folder: false,
     };
     pub const IN_PLACE: Self = IngestOptions {
         placement: Placement::InPlace,
         dry_run: false,
         on_conflict: OnConflict::Skip,
         quick: false,
+        object_from_folder: false,
     };
 
     pub fn quick(self, quick: bool) -> Self {
         IngestOptions { quick, ..self }
+    }
+
+    pub fn object_from_folder(self, object_from_folder: bool) -> Self {
+        IngestOptions {
+            object_from_folder,
+            ..self
+        }
     }
 
     pub fn with_conflict(self, on_conflict: OnConflict) -> Self {
@@ -1271,8 +1284,21 @@ fn prepare(
             None => header.set("IMAGETYP", Value::Str("Master Light".into())),
         }
     }
+    // A frame taken without a chosen target: the folder it was put in says
+    // what it shows. Calibration frames get their own name below.
+    let mut named = false;
+    if opts.object_from_folder && header.get_truthy("OBJECT").is_none() {
+        if let Some(o) = crate::names::object_from_folders(&st.input) {
+            log::info!(
+                "{}: no OBJECT keyword, using \"{o}\" from the folder name",
+                st.input.display()
+            );
+            header.set("OBJECT", Value::Str(o));
+            named = true;
+        }
+    }
     // Header fixes read folder names, so use the original location.
-    let modified = normalize_header(&mut header, &st.input, mappings)?;
+    let modified = normalize_header(&mut header, &st.input, mappings)? || named;
     let (mut new_name, dest_dir) = destination(&header, cfg)?;
     if is_stacked(&header) {
         // Stacked results keep the name the telescope or stacking program
@@ -2325,6 +2351,51 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn frames_without_a_target_can_take_their_folder_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("in/M 66 group Leo Triplet");
+        for (dir, name, seed) in [
+            (src.clone(), "a.fits", 1.0),
+            (src.join("sub"), "b.fits", 2.0),
+        ] {
+            std::fs::create_dir_all(&dir).unwrap();
+            let p = make_frame(
+                &dir,
+                name,
+                "Light",
+                Some("X"),
+                "2026-03-20T22:04:21",
+                10.0,
+                None,
+                seed,
+            );
+            let mut h = fits::read_primary_header(&p).unwrap();
+            h.remove("OBJECT");
+            fits::rewrite_primary_header(&p, &h).unwrap();
+        }
+        let cfg = Config {
+            repo: tmp.path().join("repo"),
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        // Refused unless asked for.
+        let r = ingest_folder(&mut conn, &cfg, &src, IngestOptions::MOVE, &NoProgress).unwrap();
+        assert_eq!((r.registered, r.errors.len()), (0, 2), "{r:?}");
+        let opts = IngestOptions::MOVE.object_from_folder(true);
+        let r = ingest_folder(&mut conn, &cfg, &src, opts, &NoProgress).unwrap();
+        assert_eq!((r.registered, r.errors.len()), (2, 0), "{r:?}");
+        let files = db::all_files(&conn, false).unwrap();
+        assert!(
+            files.iter().all(|f| f.object.as_deref() == Some("M 66")),
+            "{files:?}"
+        );
+        assert!(
+            files.iter().all(|f| f.name.contains("/Light/M_66")),
+            "{files:?}"
+        );
+    }
+
+    #[test]
     fn a_catalogued_copy_that_was_cut_short_is_replaced() {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("in");
@@ -2416,6 +2487,71 @@ pub(crate) mod tests {
             .iter()
             .any(|(_, b)| b.to_string_lossy().contains("/Stacked/")));
         assert!(!src.exists(), "{r:?}");
+    }
+
+    #[test]
+    fn pictures_go_to_the_folder_of_the_object_their_folder_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            repo: tmp.path().join("repo"),
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        // Filed from somewhere else, so the catalogue does not connect the
+        // frames with the folder the pictures are in.
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let st = make_frame(
+            &elsewhere,
+            "Pacman Nebula NGC 281.fits",
+            "Light",
+            Some("NGC 281"),
+            "2025-07-17T23:39:00",
+            30.0,
+            None,
+            1.0,
+        );
+        make_seestar(&st, Some(210));
+        let r = ingest_folder(
+            &mut conn,
+            &cfg,
+            &elsewhere,
+            IngestOptions::MOVE,
+            &NoProgress,
+        )
+        .unwrap();
+        assert_eq!(r.registered, 1, "{r:?}");
+        let stacked = r.placed[0].1.parent().unwrap().to_path_buf();
+        let object_dir = cfg.repo.join("Stacked").join(
+            stacked
+                .strip_prefix(cfg.repo.join("Stacked"))
+                .unwrap()
+                .components()
+                .next()
+                .unwrap(),
+        );
+
+        let src = tmp.path().join("in/NGC 281 Pacman Nebula");
+        let night = src.join("DWARF_RAW_TELE_NGC 281_EXP_30_GAIN_60_2025-07-17-23-39-24-988");
+        std::fs::create_dir_all(&night).unwrap();
+        std::fs::write(src.join("Pacman Nebula NGC 281.png"), b"png").unwrap();
+        std::fs::write(src.join("Pacman Nebula (NGC 281).jpg"), b"jpg").unwrap();
+        std::fs::write(night.join("NGC_281_combined_labelled.jpg"), b"jpg 2").unwrap();
+        // A folder that names nothing the repository has: left alone.
+        let other = tmp.path().join("in/Planets");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("Jupiter.jpg"), b"jup").unwrap();
+        let source = tmp.path().join("in");
+        let r = ingest_folder(&mut conn, &cfg, &source, IngestOptions::MOVE, &NoProgress).unwrap();
+        assert_eq!(r.pictures, 3, "{r:?}");
+        assert!(
+            stacked.join("Pacman Nebula NGC 281.png").exists(),
+            "beside its result"
+        );
+        assert!(object_dir.join("Pacman Nebula (NGC 281).jpg").exists());
+        assert!(object_dir.join("NGC_281_combined_labelled.jpg").exists());
+        assert!(other.join("Jupiter.jpg").exists());
+        assert!(!src.exists());
     }
 
     #[test]

@@ -58,6 +58,10 @@ enum Cmd {
         /// one drive or NAS share); fill them in later with `checksums`
         #[arg(long)]
         quick: bool,
+        /// Light frames whose header names no target (no OBJECT) take the
+        /// name of the folder they are in, instead of being refused
+        #[arg(long)]
+        object_from_folder: bool,
     },
     /// Fill in checksums skipped by `load --quick`
     Checksums,
@@ -338,6 +342,7 @@ fn run(cli: Cli) -> Result<()> {
             plan,
             on_conflict,
             quick,
+            object_from_folder,
         } => {
             let src = source.unwrap_or_else(|| cfg.source.clone());
             let placement = if no_move {
@@ -357,6 +362,7 @@ fn run(cli: Cli) -> Result<()> {
                     dry_run,
                     on_conflict: on_conflict.unwrap_or(cfg.on_conflict),
                     quick,
+                    object_from_folder,
                 },
                 &bar,
             )?;
