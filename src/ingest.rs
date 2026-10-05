@@ -330,6 +330,18 @@ pub fn ingest_folder(
                 .map(|(a, b)| (a.clone(), PathBuf::from(b)))
                 .filter(|(_, b)| b.is_absolute()),
         );
+        // Frames of this folder that an earlier load filed.
+        let prefix = format!("{}/", util::normalize_path(source));
+        let earlier = db::files_where(
+            conn,
+            "substr(fitsFileOriginalFile, 1, length(?1)) = ?1",
+            &[&prefix],
+        )?;
+        filed.extend(
+            earlier
+                .into_iter()
+                .filter_map(|f| Some((PathBuf::from(f.original?), PathBuf::from(f.name)))),
+        );
         report.pictures = crate::pictures::file(cfg, source, &filed, opts);
     }
     // A folder that was moved out of is not needed any more.
@@ -834,12 +846,27 @@ fn file_prepared(
             };
             if let Some(hash) = &hash {
                 if let Some(existing) = db::hash_exists(conn, hash)? {
+                    let kept = Path::new(&existing);
                     // Already catalogued. When syncing in place this is the same file.
-                    if !paths_equal(Path::new(&existing), &staged.path) {
-                        report.already_catalogued += 1;
-                        report.duplicates.push((staged.input, existing));
+                    let same = paths_equal(kept, &staged.path);
+                    if same || !is_incomplete(kept, &staged.path) {
+                        if !same {
+                            report.already_catalogued += 1;
+                            report.duplicates.push((staged.input, existing));
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
+                    // The copy in the repository was cut short: it is not a
+                    // copy to keep, and this file takes its place.
+                    log::warn!(
+                        "{existing} is only the beginning of {}: replacing it",
+                        staged.input.display()
+                    );
+                    if !opts.dry_run && kept != target {
+                        std::fs::remove_file(kept).ok();
+                        conn.execute("DELETE FROM fitsFile WHERE fitsFileName=?1", [&existing])?;
+                        report.repaired += 1;
+                    }
                 }
                 if !state.seen.insert(hash.clone()) {
                     report
@@ -1027,14 +1054,10 @@ enum Action {
 /// `hash` is the content hash the filed file will have (after any header
 /// rewrite); `source` is the file as it is now.
 fn existing_file(target: &Path, source: &Path, hash: &str) -> Existing {
-    let Ok(meta) = std::fs::metadata(target) else {
+    if !target.exists() {
         return Existing::Free;
-    };
-    if meta.len() == 0 {
-        return Existing::Incomplete;
     }
-    let source_len = std::fs::metadata(source).map(|m| m.len()).unwrap_or(0);
-    if meta.len() < source_len && is_prefix_of(target, source).unwrap_or(false) {
+    if is_incomplete(target, source) {
         return Existing::Incomplete;
     }
     if util::sha256_file(target).is_ok_and(|h| h == hash) {
@@ -1042,6 +1065,16 @@ fn existing_file(target: &Path, source: &Path, hash: &str) -> Existing {
     } else {
         Existing::Different
     }
+}
+
+/// Whether `target` is what a failed or interrupted copy of `source` left:
+/// an empty file, or only its beginning.
+fn is_incomplete(target: &Path, source: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(target) else {
+        return false;
+    };
+    let source_len = std::fs::metadata(source).map(|m| m.len()).unwrap_or(0);
+    meta.len() == 0 || (meta.len() < source_len && is_prefix_of(target, source).unwrap_or(false))
 }
 
 /// Whether the whole of `short` equals the start of `long`.
@@ -1177,9 +1210,9 @@ fn master_calibration_kind(path: &Path, h: &Header) -> Option<FrameKind> {
 }
 
 /// A processed result that carries no IMAGETYP: a StackingWizard or
-/// PixInsight stack (it says how many frames it holds), or a file with no
-/// observation keywords at all (a stack converted from XISF by an older
-/// version) in a folder that names its target.
+/// PixInsight stack (it says how many frames it holds), or a file that names
+/// neither target nor exposure (a stretched picture saved as XISF, a stack
+/// converted from XISF by an older version) in a folder that names its target.
 fn is_processed_result(h: &Header, path: &Path) -> bool {
     if h.get_truthy("IMAGETYP").is_some() || h.get_truthy("FRAME").is_some() {
         return false;
@@ -1187,7 +1220,7 @@ fn is_processed_result(h: &Header, path: &Path) -> bool {
     let frames = ["NCOMBINE", "STACKCNT", "WZNSUBS"]
         .iter()
         .any(|k| h.get_i64(k).unwrap_or(0) > 1);
-    let bare = ["OBJECT", "DATE-OBS", "EXPTIME", "EXPOSURE"]
+    let bare = ["OBJECT", "EXPTIME", "EXPOSURE"]
         .iter()
         .all(|k| h.get_truthy(k).is_none());
     frames || (bare && crate::names::object_from_folders(path).is_some())
@@ -2289,6 +2322,100 @@ pub(crate) mod tests {
         std::fs::write(&json, b"").unwrap();
         let r = again(OnConflict::Skip);
         assert_eq!((r.sidecars, r.repaired), (1, 1), "{r:?}");
+    }
+
+    #[test]
+    fn a_catalogued_copy_that_was_cut_short_is_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("in");
+        std::fs::create_dir_all(&src).unwrap();
+        let a = make_frame(
+            &src,
+            "a.fits",
+            "Light",
+            Some("M 31"),
+            "2026-01-01T21:00:00",
+            30.0,
+            None,
+            1.0,
+        );
+        let cfg = Config {
+            repo: tmp.path().join("repo"),
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        let r = ingest_folder(&mut conn, &cfg, &src, IngestOptions::COPY, &NoProgress).unwrap();
+        assert_eq!(r.registered, 1, "{r:?}");
+        let filed = r.placed[0].1.clone();
+        let whole = std::fs::read(&a).unwrap();
+        assert_eq!(std::fs::read(&filed).unwrap(), whole);
+        // The copy was interrupted, but the catalogue has the file's checksum.
+        std::fs::write(&filed, &whole[..3000]).unwrap();
+        let r = ingest_folder(&mut conn, &cfg, &src, IngestOptions::MOVE, &NoProgress).unwrap();
+        assert_eq!(
+            (r.registered, r.repaired, r.duplicates.len()),
+            (1, 1, 0),
+            "{r:?}"
+        );
+        assert_eq!(std::fs::read(&filed).unwrap(), whole);
+        assert!(!a.exists());
+        assert_eq!(db::all_files(&conn, false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pictures_follow_frames_filed_by_an_earlier_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("in/M 97 Owl Nebula");
+        std::fs::create_dir_all(&src).unwrap();
+        make_frame(
+            &src,
+            "a.fits",
+            "Light",
+            Some("M 97"),
+            "2026-01-01T21:00:00",
+            30.0,
+            None,
+            1.0,
+        );
+        let cfg = Config {
+            repo: tmp.path().join("repo"),
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        let r = ingest_folder(&mut conn, &cfg, &src, IngestOptions::MOVE, &NoProgress).unwrap();
+        assert_eq!(r.registered, 1, "{r:?}");
+        // Saved to the folder afterwards: a picture, and a stretched XISF
+        // that only says when it was taken.
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("Owl Nebula.png"), b"png").unwrap();
+        let x = make_frame(
+            &src,
+            "M97 Owl Nebula.fits",
+            "Light",
+            Some("X"),
+            "2025-12-30T00:59:59",
+            1.0,
+            None,
+            2.0,
+        );
+        processed(
+            &x,
+            &[
+                "OBJECT", "EXPTIME", "TELESCOP", "INSTRUME", "XBINNING", "YBINNING", "CCD-TEMP",
+            ],
+            &[],
+        );
+        let r = ingest_folder(&mut conn, &cfg, &src, IngestOptions::MOVE, &NoProgress).unwrap();
+        assert_eq!(
+            (r.registered, r.pictures, r.errors.len()),
+            (1, 1, 0),
+            "{r:?}"
+        );
+        assert!(r
+            .placed
+            .iter()
+            .any(|(_, b)| b.to_string_lossy().contains("/Stacked/")));
+        assert!(!src.exists(), "{r:?}");
     }
 
     #[test]
