@@ -46,6 +46,9 @@ fn read_xml(file: &mut std::fs::File) -> Result<String> {
         bail!("not an XISF 1.0 file");
     }
     let hlen = u32::from_le_bytes(pre[8..12].try_into().unwrap()) as usize;
+    if hlen > 64 << 20 {
+        bail!("XISF header too large ({hlen} bytes); the file is probably damaged");
+    }
     let mut xml = vec![0u8; hlen];
     file.read_exact(&mut xml)
         .map_err(|_| anyhow!("truncated XISF header"))?;

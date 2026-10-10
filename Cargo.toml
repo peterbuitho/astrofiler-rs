@@ -1,6 +1,6 @@
 [package]
 name = "astrofiler"
-version = "0.8.4"
+version = "0.8.5"
 edition = "2021"
 description = "Fast astronomical FITS image filing, cataloguing and calibration (Rust port of AstroFiler)"
 license = "GPL-3.0-or-later"
@@ -24,7 +24,6 @@ flate2 = "1"
 indicatif = "0.17"
 log = { version = "0.4", features = ["std"] }
 lz4_flex = "0.11"
-md-5 = "0.10"
 smb2 = "0.26"
 tokio = { version = "1", features = ["rt", "net", "time", "io-util"] }
 rayon = "1.10"

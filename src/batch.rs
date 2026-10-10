@@ -10,7 +10,7 @@ use crate::progress::Progress;
 use crate::util::{self, FrameKind};
 use anyhow::{bail, Result};
 use rayon::prelude::*;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, TransactionBehavior};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -62,7 +62,9 @@ pub fn set_field(
     let (column, _) = column_for(card)?;
     let card = card.to_uppercase();
     let mut report = EditReport::default();
-    let tx = conn.transaction()?;
+    // The write lock is taken before any file is touched: once files move,
+    // their rows must follow.
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mappings = db::mappings(&tx)?;
     // Folders the files left, and where they went.
     let mut moved_dirs: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
@@ -107,11 +109,17 @@ pub fn set_field(
                 }
             }
         }
-        tx.execute(
+        // The file may already have moved, so a failed update must not undo
+        // the rows of the files before it.
+        match tx.execute(
             &format!("UPDATE fitsFile SET \"{column}\"=?1, fitsFileName=?2, fitsFileHash=?3 WHERE fitsFileId=?4"),
             params![value, util::normalize_path(&new_path), new_hash, id],
-        )?;
-        report.updated += 1;
+        ) {
+            Ok(_) => report.updated += 1,
+            Err(e) => report
+                .errors
+                .push((file.name.clone(), format!("updating the catalogue: {e}"))),
+        }
     }
     tx.commit()?;
     for (old, new) in &moved_dirs {
@@ -441,7 +449,12 @@ pub fn migrate_layout(
     crate::nick::learn_from(conn, &mut cfg, &repo, dry_run);
     let cfg = &cfg;
     let plan = layout_plan(conn, cfg)?;
-    let tx = conn.transaction()?;
+    // As in `set_field`: lock first, then move files. A dry run only reads.
+    let tx = conn.transaction_with_behavior(if dry_run {
+        TransactionBehavior::Deferred
+    } else {
+        TransactionBehavior::Immediate
+    })?;
     for (i, (old, new)) in plan.iter().enumerate() {
         progress.update(i + 1, plan.len(), "Moving files to the current layout");
         if progress.cancelled() {
@@ -464,17 +477,30 @@ pub fn migrate_layout(
                 report.errors.push((old.clone(), format!("{e:#}")));
                 continue;
             }
-            report.catalogued += tx.execute(
-                "UPDATE fitsFile SET fitsFileName=?1 WHERE fitsFileName=?2",
-                params![util::normalize_path(new), util::normalize_path(old)],
-            )?;
-            // A stack that was filed with the sub-frames is a stacked result.
-            if old.starts_with(repo.join("Light")) && new.starts_with(repo.join("Stacked")) {
-                tx.execute(
-                    "UPDATE fitsFile SET fitsFileStacked=1, fitsFileType='MASTER LIGHT', \
-                     fitsFileSession=NULL WHERE fitsFileName=?1",
-                    [util::normalize_path(new)],
-                )?;
+            // The file has moved: keep going, so the rows before it stay.
+            let name = util::normalize_path(new);
+            let updated = tx
+                .execute(
+                    "UPDATE fitsFile SET fitsFileName=?1 WHERE fitsFileName=?2",
+                    params![name, util::normalize_path(old)],
+                )
+                .and_then(|n| {
+                    // A stack that was filed with the sub-frames is a stacked result.
+                    if old.starts_with(repo.join("Light")) && new.starts_with(repo.join("Stacked"))
+                    {
+                        tx.execute(
+                            "UPDATE fitsFile SET fitsFileStacked=1, fitsFileType='MASTER LIGHT', \
+                             fitsFileSession=NULL WHERE fitsFileName=?1",
+                            [&name],
+                        )?;
+                    }
+                    Ok(n)
+                });
+            match updated {
+                Ok(n) => report.catalogued += n,
+                Err(e) => report
+                    .errors
+                    .push((new.clone(), format!("updating the catalogue: {e}"))),
             }
         }
         report.moved.push((old.clone(), new.clone()));
@@ -583,10 +609,13 @@ pub fn export_files(
             Ok(p) => {
                 n += 1;
                 if move_files {
-                    conn.execute(
+                    // The file has moved: keep going, so later rows follow theirs.
+                    if let Err(e) = conn.execute(
                         "UPDATE fitsFile SET fitsFileName=?1 WHERE fitsFileId=?2",
                         params![util::normalize_path(&p), id],
-                    )?;
+                    ) {
+                        log::warn!("{}: catalogue not updated: {e}", p.display());
+                    }
                 }
             }
             Err(e) => log::warn!("export failed: {e:#}"),
@@ -755,6 +784,15 @@ pub fn regenerate(
     cfg: &Config,
     progress: &dyn Progress,
 ) -> Result<ingest::IngestReport> {
+    // Checked before anything is deleted: an unmounted repository would
+    // otherwise leave the catalogue empty.
+    // An empty folder is what an unmounted share looks like.
+    if !std::fs::read_dir(&cfg.repo).is_ok_and(|mut rd| rd.next().is_some()) {
+        bail!(
+            "repository {} is missing or empty; catalogue left as it is",
+            cfg.repo.display()
+        );
+    }
     {
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM fitsFile", [])?;
@@ -965,21 +1003,28 @@ pub fn clean_previews(root: &Path, dry_run: bool) -> Result<(Vec<PathBuf>, u64)>
         .map(|m| m.len())
         .sum();
     if !dry_run {
-        for p in &previews {
-            std::fs::remove_file(p)?;
-        }
-        let thumbs: Vec<PathBuf> = walkdir::WalkDir::new(root)
-            .contents_first(true)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_dir() && e.file_name() == "Thumbnail")
-            .map(|e| e.into_path())
-            .collect();
-        for d in thumbs {
-            std::fs::remove_dir(&d).ok(); // only succeeds when empty
-        }
+        delete_previews(root, &previews)?;
     }
     Ok((previews, bytes))
+}
+
+/// Delete `previews` (as listed by a dry run of [`clean_previews`]), then
+/// remove any `Thumbnail` folders under `root` left empty.
+pub fn delete_previews(root: &Path, previews: &[PathBuf]) -> Result<()> {
+    for p in previews {
+        std::fs::remove_file(p)?;
+    }
+    let thumbs: Vec<PathBuf> = walkdir::WalkDir::new(root)
+        .contents_first(true)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_dir() && e.file_name() == "Thumbnail")
+        .map(|e| e.into_path())
+        .collect();
+    for d in thumbs {
+        std::fs::remove_dir(&d).ok(); // only succeeds when empty
+    }
+    Ok(())
 }
 
 /// Groups of catalogued files that share the same SHA-256.
@@ -1004,18 +1049,52 @@ pub fn duplicate_groups(conn: &Connection) -> Result<Vec<Vec<FitsFile>>> {
 /// Delete every duplicate except one kept copy per group (the first that
 /// exists on disk). Returns (files removed, bytes freed).
 pub fn remove_duplicates(conn: &mut Connection) -> Result<(usize, u64)> {
+    let groups = duplicate_groups(conn)?;
+    let first = groups
+        .first()
+        .map(|g| PathBuf::from(&g[0].name))
+        .unwrap_or_default();
+    // The stored checksums may be stale (a file edited by another program),
+    // so the files themselves are compared before deleting. Per group: the
+    // kept file, and whether each other file is still a copy of it.
+    let checked: Vec<(usize, Vec<bool>)> = util::with_io_pool(&[&first], || {
+        groups
+            .par_iter()
+            .map(|group| {
+                let keep = group
+                    .iter()
+                    .position(|f| Path::new(&f.name).exists())
+                    .unwrap_or(0);
+                let kept_hash = util::sha256_file(Path::new(&group[keep].name)).ok();
+                let same = group
+                    .par_iter()
+                    .map(|f| {
+                        let path = Path::new(&f.name);
+                        f.name == group[keep].name
+                            || !path.exists()
+                            || (kept_hash.is_some() && util::sha256_file(path).ok() == kept_hash)
+                    })
+                    .collect();
+                (keep, same)
+            })
+            .collect()
+    });
     let mut to_delete = Vec::new();
     let mut freed = 0;
-    for group in duplicate_groups(conn)? {
-        let keep = group
-            .iter()
-            .position(|f| Path::new(&f.name).exists())
-            .unwrap_or(0);
+    for (group, (keep, same)) in groups.iter().zip(checked) {
         for (i, f) in group.iter().enumerate() {
             if i != keep {
                 // Never delete the kept file even if two rows point at the same path.
                 if f.name == group[keep].name {
                     conn.execute("DELETE FROM fitsFile WHERE fitsFileId=?1", [&f.id])?;
+                    continue;
+                }
+                if !same[i] {
+                    log::warn!(
+                        "{}: no longer the same as {}, not deleted",
+                        f.name,
+                        group[keep].name
+                    );
                     continue;
                 }
                 freed += std::fs::metadata(&f.name).map(|m| m.len()).unwrap_or(0);
@@ -1583,6 +1662,207 @@ mod tests {
         assert!(d.join("a.fits").exists() && d.join("shotsInfo.json").exists());
         assert!(d.join("stacked.jpg").exists(), "stacked preview kept");
         assert!(!d.join("img.png").exists() && !d.join("Thumbnail").exists());
+    }
+
+    #[test]
+    fn regenerate_keeps_the_catalogue_when_the_repository_is_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        make_frame(
+            &repo,
+            "x.fits",
+            "Light",
+            Some("M1"),
+            "2024-10-01T21:00:00",
+            60.0,
+            None,
+            1.0,
+        );
+        let cfg = Config {
+            repo: repo.clone(),
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        regenerate(&mut conn, &cfg, &NoProgress).unwrap();
+        assert_eq!(db::all_files(&conn, false).unwrap().len(), 1);
+        // e.g. the NAS is not mounted: no folder, or an empty mount point
+        std::fs::remove_dir_all(&repo).unwrap();
+        assert!(regenerate(&mut conn, &cfg, &NoProgress).is_err());
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(regenerate(&mut conn, &cfg, &NoProgress).is_err());
+        assert_eq!(db::all_files(&conn, false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_locked_catalogue_stops_an_edit_before_files_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let src = tmp.path().join("in");
+        std::fs::create_dir_all(&src).unwrap();
+        make_frame(
+            &src,
+            "x.fits",
+            "Light",
+            Some("M1"),
+            "2024-10-01T21:00:00",
+            60.0,
+            None,
+            1.0,
+        );
+        let cfg = Config {
+            repo: repo.clone(),
+            ..Default::default()
+        };
+        let db_path = tmp.path().join("t.db");
+        let mut conn = db::open(&db_path).unwrap();
+        let r = ingest::ingest_folder(
+            &mut conn,
+            &cfg,
+            &src,
+            ingest::IngestOptions::MOVE,
+            &NoProgress,
+        )
+        .unwrap();
+        let filed = r.placed[0].1.clone();
+        // Another program is writing to the catalogue.
+        let other = db::open(&db_path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let opts = EditOptions {
+            update_headers: false,
+            refile: true,
+        };
+        assert!(merge_objects(&mut conn, &cfg, "M1", "M2", opts, &NoProgress).is_err());
+        assert!(filed.exists(), "nothing moved");
+        assert!(migrate_layout(&mut conn, &cfg, false, &NoProgress).is_err());
+        assert!(migrate_layout(&mut conn, &cfg, true, &NoProgress).is_ok());
+    }
+
+    #[test]
+    fn a_failed_catalogue_update_keeps_the_other_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("in");
+        std::fs::create_dir_all(&src).unwrap();
+        for (name, object, seed) in [("a.fits", "M1", 1.0), ("b.fits", "M2", 2.0)] {
+            make_frame(
+                &src,
+                name,
+                "Light",
+                Some(object),
+                "2024-10-01T21:00:00",
+                60.0,
+                None,
+                seed,
+            );
+        }
+        let cfg = Config {
+            repo: tmp.path().join("repo"),
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        ingest::ingest_folder(
+            &mut conn,
+            &cfg,
+            &src,
+            ingest::IngestOptions::MOVE,
+            &NoProgress,
+        )
+        .unwrap();
+        // The update of one row fails (think: disk error).
+        conn.execute_batch(
+            "CREATE TRIGGER t BEFORE UPDATE ON fitsFile WHEN old.fitsFileObject='M1' \
+             BEGIN SELECT RAISE(ABORT, 'no'); END",
+        )
+        .unwrap();
+        let ids: Vec<String> = db::all_files(&conn, false)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.id)
+            .collect();
+        let r = set_field(
+            &mut conn,
+            &cfg,
+            &ids,
+            "OBSERVER",
+            "me",
+            EditOptions::default(),
+            &NoProgress,
+        )
+        .unwrap();
+        assert_eq!((r.updated, r.errors.len()), (1, 1), "{r:?}");
+        let observers: Vec<Option<String>> = db::all_files(&conn, false)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.observer)
+            .collect();
+        assert_eq!(observers, [None, Some("me".to_string())]);
+    }
+
+    #[test]
+    fn files_catalogued_in_place_keep_their_own_checksum() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        // A flat without OBJECT: its header would be changed when filed.
+        make_frame(
+            &repo,
+            "flat.fits",
+            "Flat",
+            None,
+            "2024-10-01T08:00:00",
+            1.0,
+            Some("R"),
+            1.0,
+        );
+        let cfg = Config {
+            repo: repo.clone(),
+            save_modified_headers: true,
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        regenerate(&mut conn, &cfg, &NoProgress).unwrap();
+        let v = verify(&conn, true, &NoProgress).unwrap();
+        assert_eq!((v.checked, v.mismatched.len()), (1, 0));
+    }
+
+    #[test]
+    fn changed_files_are_not_removed_as_duplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let frame = |name: &str, seed: f32| {
+            make_frame(
+                &repo,
+                name,
+                "Light",
+                Some("M1"),
+                "2024-10-01T21:00:00",
+                60.0,
+                None,
+                seed,
+            )
+        };
+        frame("a.fits", 1.0);
+        let b = frame("b.fits", 2.0);
+        let cfg = Config {
+            repo: repo.clone(),
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        ingest::ingest_folder(
+            &mut conn,
+            &cfg,
+            &repo,
+            ingest::IngestOptions::IN_PLACE,
+            &NoProgress,
+        )
+        .unwrap();
+        // A stale checksum makes two different files look the same.
+        conn.execute("UPDATE fitsFile SET fitsFileHash='stale'", [])
+            .unwrap();
+        assert_eq!(remove_duplicates(&mut conn).unwrap().0, 0);
+        assert!(b.exists() && repo.join("a.fits").exists());
     }
 
     #[test]

@@ -173,15 +173,16 @@ impl Session {
     }
 
     /// Download `files` into `dest`, in the telescope's own folders. Returns
-    /// each file fetched, its local path and whether its size matched the
-    /// telescope's; the ones that could not be fetched go to `failed`.
+    /// each file fetched and its local path; the ones that could not be
+    /// fetched, or arrived with another size than the telescope reported
+    /// (a broken image, which is removed again), go to `failed`.
     fn fetch_all(
         &mut self,
         files: &[RemoteFile],
         dest: &Path,
         progress: &dyn Progress,
         failed: &mut Vec<(String, String)>,
-    ) -> Vec<(RemoteFile, PathBuf, bool)> {
+    ) -> Vec<(RemoteFile, PathBuf)> {
         let mut downloaded = Vec::new();
         let total_bytes = files.iter().map(|f| f.size).sum::<u64>().max(1);
         let mut bytes = 0u64;
@@ -198,6 +199,13 @@ impl Session {
                     bytes as f64 * 100.0 / total_bytes as f64
                 ),
             );
+            // Names come from the telescope (or whatever answered as one):
+            // never let them point outside `dest`.
+            let safe_dir = f.local_dir.is_empty() || f.local_dir.split('/').all(is_safe_name);
+            if !is_safe_name(&f.name) || !safe_dir {
+                failed.push((f.path.clone(), "unsafe file name, not downloaded".into()));
+                continue;
+            }
             let dir = dest.join(&f.local_dir);
             let local = dir.join(&f.name);
             let fetched = std::fs::create_dir_all(&dir)
@@ -212,11 +220,18 @@ impl Session {
                 Ok(()) => {
                     bytes += f.size;
                     // Before the header fix below, which can change the size.
-                    let complete = std::fs::metadata(&local).is_ok_and(|m| m.len() == f.size);
+                    if !std::fs::metadata(&local).is_ok_and(|m| m.len() == f.size) {
+                        std::fs::remove_file(&local).ok();
+                        failed.push((
+                            f.path.clone(),
+                            "copy is incomplete, kept on the telescope".into(),
+                        ));
+                        continue;
+                    }
                     if let Err(e) = self.telescope.after_download(&local, f) {
                         log::warn!("{}: {e:#}", local.display());
                     }
-                    downloaded.push((f.clone(), local, complete));
+                    downloaded.push((f.clone(), local));
                 }
                 Err(e) => failed.push((f.path.clone(), format!("{e:#}"))),
             }
@@ -225,8 +240,8 @@ impl Session {
     }
 
     /// Download `files` into `dest` and nothing more: no filing, no
-    /// catalogue. If requested, a file is deleted from the telescope once
-    /// its copy has the size the telescope reported.
+    /// catalogue. If requested, the downloaded files are then deleted from
+    /// the telescope.
     pub fn download(
         &mut self,
         files: &[RemoteFile],
@@ -238,19 +253,12 @@ impl Session {
         let downloaded = self.fetch_all(files, dest, progress, &mut report.failed);
         report.downloaded = downloaded.len();
         if delete_on_scope {
-            for (i, (remote, _, complete)) in downloaded.iter().enumerate() {
+            for (i, (remote, _)) in downloaded.iter().enumerate() {
                 progress.update(
                     i + 1,
                     downloaded.len(),
                     &format!("Deleting {} from telescope", remote.name),
                 );
-                if !complete {
-                    report.failed.push((
-                        remote.path.clone(),
-                        "copy is incomplete, kept on the telescope".into(),
-                    ));
-                    continue;
-                }
                 match self.transport.delete(&remote.path) {
                     Ok(()) => report.deleted += 1,
                     Err(e) => report
@@ -275,11 +283,7 @@ impl Session {
         progress: &dyn Progress,
     ) -> Result<ImportReport> {
         let mut report = ImportReport::default();
-        let downloaded: Vec<(RemoteFile, PathBuf)> = self
-            .fetch_all(files, dest, progress, &mut report.failed)
-            .into_iter()
-            .map(|(f, p, _)| (f, p))
-            .collect();
+        let downloaded = self.fetch_all(files, dest, progress, &mut report.failed);
         report.downloaded = downloaded.len();
 
         progress.update(0, downloaded.len(), "Importing into repository...");
@@ -360,6 +364,15 @@ impl Session {
         }
         report
     }
+}
+
+/// Whether a name from the telescope is a plain file or folder name.
+fn is_safe_name(name: &str) -> bool {
+    // "C:x" names a drive on Windows; elsewhere a colon is just a character.
+    !name.is_empty()
+        && name != ".."
+        && !name.contains(['/', '\\'])
+        && !(cfg!(windows) && name.contains(':'))
 }
 
 /// Delete everything under `dir`, then `dir` itself.
@@ -657,6 +670,101 @@ mod tests {
             .all(|f| f.object.as_deref() == Some("NGC 7000")));
         let h = fits::read_primary_header(Path::new(&db_files[0].name)).unwrap();
         assert_eq!(h.get("MOSAIC"), Some(&Value::Bool(false)));
+    }
+
+    /// A link that drops part-way: every file arrives one byte short.
+    struct Short(transport::LocalTransport);
+    impl Transport for Short {
+        fn list(&mut self, dir: &str) -> Result<Vec<Entry>> {
+            self.0.list(dir)
+        }
+        fn fetch(&mut self, path: &str, local: &Path) -> Result<()> {
+            let data = std::fs::read(self.0.root.join(path))?;
+            std::fs::write(local, &data[..data.len() - 1])?;
+            Ok(())
+        }
+        fn delete(&mut self, path: &str) -> Result<()> {
+            self.0.delete(path)
+        }
+        fn remove_dir(&mut self, dir: &str) -> Result<()> {
+            self.0.remove_dir(dir)
+        }
+    }
+
+    #[test]
+    fn incomplete_downloads_stay_on_the_telescope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let usb = tmp.path().join("usb");
+        let sub = usb.join("MyWorks/M 2_sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        make_frame(
+            &sub,
+            "Light_1.fit",
+            "Light",
+            Some("M 2"),
+            "2024-08-01T22:00:00",
+            10.0,
+            Some("IRCUT"),
+            1.0,
+        );
+        let cfg = Config {
+            repo: tmp.path().join("repo"),
+            source: tmp.path().join("incoming"),
+            ..Default::default()
+        };
+        let mut conn = crate::db::open(&tmp.path().join("t.db")).unwrap();
+        let mut s = Session {
+            telescope: find("seestar").unwrap(),
+            link: Link::Usb(usb.clone()),
+            transport: Box::new(Short(transport::LocalTransport { root: usb.clone() })),
+        };
+        let files = s.scan(true).unwrap();
+        let r = s
+            .import(&mut conn, &cfg, &files, &cfg.source, true, &NoProgress)
+            .unwrap();
+        assert_eq!((r.deleted, r.failed.len()), (0, 1), "{r:?}");
+        assert!(sub.join("Light_1.fit").exists());
+        assert_eq!(r.ingest.registered, 0, "a broken image is not filed");
+        // The same when only downloading, with or without deleting.
+        for delete in [false, true] {
+            let r = s
+                .download(&files, &cfg.source, delete, &NoProgress)
+                .unwrap();
+            assert_eq!((r.downloaded, r.deleted, r.failed.len()), (0, 0, 1));
+        }
+        assert!(sub.join("Light_1.fit").exists());
+        assert!(!cfg.source.join("M 2_sub/Light_1.fit").exists());
+    }
+
+    #[test]
+    fn names_from_the_telescope_stay_inside_the_download_folder() {
+        for bad in ["..", "", "../x.fit", "a\\b.fit"] {
+            assert!(!is_safe_name(bad), "{bad}");
+        }
+        assert_eq!(is_safe_name("C:x.fit"), !cfg!(windows));
+        assert!(is_safe_name("Light_M 2_10.0s_IRCUT_20240801-220000.fit"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let usb = tmp.path().join("usb");
+        std::fs::create_dir_all(&usb).unwrap();
+        std::fs::write(tmp.path().join("secret.fit"), b"x").unwrap();
+        let mut s = Session {
+            telescope: find("seestar").unwrap(),
+            link: Link::Usb(usb.clone()),
+            transport: Box::new(transport::LocalTransport { root: usb }),
+        };
+        let evil = RemoteFile {
+            path: "../secret.fit".into(),
+            name: "x.fit".into(),
+            size: 1,
+            folder: "..".into(),
+            local_dir: "../..".into(),
+            kind: "light",
+        };
+        let dest = tmp.path().join("a/b/dest");
+        let r = s.download(&[evil], &dest, false, &NoProgress).unwrap();
+        assert_eq!((r.downloaded, r.failed.len()), (0, 1), "{r:?}");
+        assert!(!tmp.path().join("a/x.fit").exists());
     }
 
     #[test]

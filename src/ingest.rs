@@ -573,7 +573,7 @@ fn place_sidecars(
         let mut target = dest_dir.join(file_name);
         let existing = if !target.exists() {
             Existing::Free
-        } else if std::fs::read(&target).ok() == std::fs::read(sidecar).ok() {
+        } else if same_content(&target, sidecar) {
             Existing::Identical
         } else if std::fs::metadata(&target).is_ok_and(|m| m.len() == 0)
             || is_prefix_of(&target, sidecar).unwrap_or(false)
@@ -736,6 +736,8 @@ pub fn ingest_files(
 /// then move on. This keeps scratch space small (only one batch of converted
 /// XISF files exists at a time), makes progress visible to other readers of
 /// the catalogue, and means an interrupted load loses at most one batch.
+/// Files of that batch already moved into the repository are then missing
+/// from the catalogue; loading the repository in place picks them up.
 const BATCH: usize = 64;
 
 struct FileState {
@@ -1110,6 +1112,12 @@ fn is_incomplete(target: &Path, source: &Path) -> bool {
     meta.len() == 0 || (meta.len() < source_len && is_prefix_of(target, source).unwrap_or(false))
 }
 
+/// Whether both files can be read and hold the same bytes (companion files
+/// are small). A file that can't be read is never "the same".
+fn same_content(a: &Path, b: &Path) -> bool {
+    matches!((std::fs::read(a), std::fs::read(b)), (Ok(a), Ok(b)) if a == b)
+}
+
 /// Whether the whole of `short` equals the start of `long`.
 fn is_prefix_of(short: &Path, long: &Path) -> Result<bool> {
     use std::io::Read;
@@ -1328,7 +1336,11 @@ fn prepare(
         }
     }
     let new_name = keep_format(new_name, &st.path);
-    let rewrite = modified && cfg.save_modified_headers && !fits::is_gzip(&st.path);
+    // A file that stays where it is keeps its header, and so its checksum.
+    // (A later copy of the same original, filed with a rewritten header, is
+    // then reported as a name conflict rather than as a duplicate.)
+    let stays = opts.placement == Placement::InPlace || dest_dir.join(&new_name) == st.path;
+    let rewrite = modified && cfg.save_modified_headers && !fits::is_gzip(&st.path) && !stays;
     // The stored hash is of the file as it will be written, so re-loading the
     // same original later is still recognised as a duplicate.
     // A quick move renames files without reading them; their checksums are
@@ -2317,6 +2329,17 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn unreadable_files_are_not_the_same() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        assert!(!same_content(&a, &b), "both missing");
+        std::fs::write(&a, b"x").unwrap();
+        assert!(!same_content(&a, &b));
+        std::fs::write(&b, b"x").unwrap();
+        assert!(same_content(&a, &b));
+    }
+
+    #[test]
     fn companion_conflicts() {
         let tmp = tempfile::tempdir().unwrap();
         let folder = tmp
@@ -2475,16 +2498,26 @@ pub(crate) mod tests {
         let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
         let r = ingest_folder(&mut conn, &cfg, &src, IngestOptions::MOVE, &NoProgress).unwrap();
         let filed = r.placed[0].1.clone();
-        for dir in [cfg.repo.join("Light"), filed.parent().unwrap().to_path_buf()] {
-            let e = ingest_folder(&mut conn, &cfg, &dir, IngestOptions::MOVE, &NoProgress)
-                .unwrap_err();
+        for dir in [
+            cfg.repo.join("Light"),
+            filed.parent().unwrap().to_path_buf(),
+        ] {
+            let e =
+                ingest_folder(&mut conn, &cfg, &dir, IngestOptions::MOVE, &NoProgress).unwrap_err();
             assert!(format!("{e}").contains("Light folder"), "{e}");
         }
         assert!(filed.is_file());
         assert_eq!(managed_dir(&cfg, &cfg.repo), None);
         assert_eq!(managed_dir(&cfg, &src), None);
         // Cataloguing what lies there stays possible.
-        ingest_folder(&mut conn, &cfg, &cfg.repo, IngestOptions::IN_PLACE, &NoProgress).unwrap();
+        ingest_folder(
+            &mut conn,
+            &cfg,
+            &cfg.repo,
+            IngestOptions::IN_PLACE,
+            &NoProgress,
+        )
+        .unwrap();
     }
 
     #[test]

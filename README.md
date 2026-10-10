@@ -173,6 +173,7 @@ astrofiler export ~/stack-me --session <session-id> --by-object
 astrofiler duplicates --remove
 astrofiler verify --hash
 astrofiler clean-previews /mnt/nas/astro --dry-run
+astrofiler clean-previews /mnt/nas/astro    # lists the files and asks first; --yes skips the question
 astrofiler migrate-layout --dry-run      # list files an older version filed differently
 astrofiler stats
 astrofiler mapping add TELESCOP "S50_1a2b3c4d" "Seestar S50"

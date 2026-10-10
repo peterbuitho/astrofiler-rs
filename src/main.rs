@@ -176,6 +176,9 @@ enum Cmd {
         /// Only show what would be deleted
         #[arg(long)]
         dry_run: bool,
+        /// Delete without asking first
+        #[arg(long, short)]
+        yes: bool,
     },
     /// Repository statistics
     Stats,
@@ -289,13 +292,31 @@ fn run(cli: Cli) -> Result<()> {
         println!("wrote {}", out.display());
         return Ok(());
     }
-    if let Cmd::CleanPreviews { dir, dry_run } = &command {
-        let (files, bytes) = batch::clean_previews(dir, *dry_run)?;
+    if let Cmd::CleanPreviews { dir, dry_run, yes } = &command {
+        // Every JPG/PNG that isn't a stacked-result preview goes, the user's
+        // own pictures included: show them and ask before deleting.
+        let (files, bytes) = batch::clean_previews(dir, true)?;
         for f in files.iter().take(20) {
             println!("{}", f.display());
         }
         if files.len() > 20 {
             println!("... and {} more", files.len() - 20);
+        }
+        if !*dry_run && !files.is_empty() {
+            if !*yes {
+                eprint!(
+                    "Delete these {} files ({})? [y/N] ",
+                    files.len(),
+                    util::human_size(bytes)
+                );
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                if !answer.trim().eq_ignore_ascii_case("y") {
+                    println!("nothing deleted");
+                    return Ok(());
+                }
+            }
+            batch::delete_previews(dir, &files)?;
         }
         let verb = if *dry_run { "would delete" } else { "deleted" };
         println!(

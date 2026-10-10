@@ -152,7 +152,7 @@ pub fn create_all(conn: &mut Connection, progress: &dyn Progress) -> Result<Sess
         &tx,
         &darks,
         |_| "Dark".into(),
-        |a, b| same_base(a, b) && a.exptime == b.exptime,
+        |a, b| same_base(a, b) && exposures_match(a.exptime.as_deref(), b.exptime.as_deref()),
     )?;
 
     progress.update(3, 5, "Grouping flat frames...");
@@ -317,5 +317,26 @@ mod tests {
         assert_eq!(r.flat, 1);
         let again = create_all(&mut conn, &crate::progress::NoProgress).unwrap();
         assert_eq!(again.total(), 0);
+    }
+
+    #[test]
+    fn darks_group_by_exposure_as_a_number() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        // The same exposure as written by two programs.
+        for (id, exptime) in [("a", "300"), ("b", "300.0")] {
+            FitsFile {
+                id: id.into(),
+                name: format!("/repo/{id}.fits"),
+                date: Some("2024-10-01T08:00:00".into()),
+                image_type: Some("DARK".into()),
+                exptime: Some(exptime.into()),
+                ..Default::default()
+            }
+            .insert(&conn)
+            .unwrap();
+        }
+        let r = create_all(&mut conn, &crate::progress::NoProgress).unwrap();
+        assert_eq!(r.dark, 1);
     }
 }
