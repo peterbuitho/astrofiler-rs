@@ -5,3 +5,4 @@
 *.db-shm
 astrofiler.ini
 astrofiler.log
+.codegraph/
