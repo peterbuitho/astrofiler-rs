@@ -2572,7 +2572,7 @@ pub(crate) mod tests {
         assert!(r
             .placed
             .iter()
-            .any(|(_, b)| b.to_string_lossy().contains("/Stacked/")));
+            .any(|(_, b)| util::normalize_path(b).contains("/Stacked/")));
         assert!(!src.exists(), "{r:?}");
     }
 
