@@ -666,9 +666,15 @@ impl App {
             )
             .column(Column::initial(80.0).clip(true))
             .column(Column::initial(80.0).clip(true))
+            .column(
+                Column::initial(150.0)
+                    .at_least(110.0)
+                    .clip(true)
+                    .resizable(true),
+            )
             .column(Column::remainder().clip(true))
             .header(20.0, |mut h| {
-                for l in ["", "Folder / file", "Files", "Size", "Kind"] {
+                for l in ["", "Folder / file", "Files", "Size", "Date", "Kind"] {
                     h.col(|ui| {
                         ui.strong(l);
                     });
@@ -725,6 +731,27 @@ impl App {
                             ui.label(util::human_size(size));
                         });
                         row.col(|ui| {
+                            // Date range of the folder's files.
+                            let mut dates: Vec<_> =
+                                idx.iter().filter_map(|&i| files[i].mtime).collect();
+                            dates.sort();
+                            match (dates.first(), dates.last()) {
+                                (Some(&first), Some(&last)) if first != last => {
+                                    ui.label(format!(
+                                        "{} – {}",
+                                        telescope::format_mtime(first),
+                                        telescope::format_mtime(last)
+                                    ));
+                                }
+                                (Some(&only), _) => {
+                                    ui.label(telescope::format_mtime(only));
+                                }
+                                _ => {
+                                    ui.weak("—");
+                                }
+                            }
+                        });
+                        row.col(|ui| {
                             let mut kinds: Vec<&str> = Vec::new();
                             for &i in idx {
                                 if !kinds.contains(&files[i].kind) {
@@ -748,6 +775,14 @@ impl App {
                         row.col(|_| {});
                         row.col(|ui| {
                             ui.label(util::human_size(f.size));
+                        });
+                        row.col(|ui| match f.date() {
+                            Some(d) => {
+                                ui.label(d);
+                            }
+                            None => {
+                                ui.weak("—");
+                            }
                         });
                         row.col(|ui| {
                             ui.label(f.kind);

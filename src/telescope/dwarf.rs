@@ -110,6 +110,7 @@ impl Telescope for Dwarf {
                     folder: dir.name.clone(),
                     local_dir: dir.name.clone(),
                     kind,
+                    mtime: f.mtime,
                 });
             }
         }
@@ -126,6 +127,7 @@ impl Telescope for Dwarf {
                             folder: cam.into(),
                             local_dir: rel(&dpath),
                             kind: "master",
+                            mtime: f.mtime,
                         });
                     }
                 }
@@ -145,6 +147,7 @@ impl Telescope for Dwarf {
                     folder: "DWARF_DARK".into(),
                     local_dir: "DWARF_DARK".into(),
                     kind: "dark library",
+                    mtime: f.mtime,
                 });
             }
         }

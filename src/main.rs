@@ -463,7 +463,14 @@ fn run(cli: Cli) -> Result<()> {
             println!("{} files ({}) found", files.len(), util::human_size(size));
             if list {
                 for f in &files {
-                    println!("  [{}] {} ({})", f.kind, f.path, util::human_size(f.size));
+                    let date = f.date().unwrap_or_default();
+                    println!(
+                        "  [{}] {} ({}) {}",
+                        f.kind,
+                        f.path,
+                        util::human_size(f.size),
+                        date
+                    );
                 }
                 return Ok(());
             }

@@ -5,13 +5,15 @@ use anyhow::{anyhow, Context, Result};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
+    /// Last modification time, when the transport can report one.
+    pub mtime: Option<SystemTime>,
 }
 
 pub trait Transport {
@@ -67,6 +69,7 @@ impl Transport for LocalTransport {
                 name: e.file_name().to_string_lossy().into_owned(),
                 is_dir: md.is_dir(),
                 size: md.len(),
+                mtime: md.modified().ok(),
             });
         }
         Ok(out)
@@ -122,6 +125,7 @@ impl Transport for SmbTransport {
                 name: e.name,
                 is_dir: e.is_directory,
                 size: e.size,
+                mtime: e.modified.to_system_time(),
             })
             .collect())
     }
@@ -188,6 +192,7 @@ impl Transport for FtpTransport {
                         name,
                         is_dir: f.is_directory(),
                         size: f.size() as u64,
+                        mtime: Some(f.modified()),
                     });
                 }
             }

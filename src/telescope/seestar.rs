@@ -82,6 +82,7 @@ impl Telescope for Seestar {
                     folder: dir.name.clone(),
                     local_dir: dir.name.clone(),
                     kind,
+                    mtime: f.mtime,
                 });
             }
         }

@@ -29,7 +29,7 @@ use anyhow::{anyhow, bail, Result};
 use rayon::prelude::*;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 pub use transport::{Entry, Transport};
 
 /// Every supported telescope model.
@@ -141,6 +141,23 @@ pub struct RemoteFile {
     pub local_dir: String,
     /// "light", "stacked", "master", ...
     pub kind: &'static str,
+    /// Last modification time on the telescope, when the transport reported it.
+    pub mtime: Option<SystemTime>,
+}
+
+/// Short local date & time of a telescope file's modification time.
+pub fn format_mtime(t: SystemTime) -> String {
+    chrono::DateTime::<chrono::Local>::from(t)
+        .format("%Y-%m-%d %H:%M")
+        .to_string()
+}
+
+impl RemoteFile {
+    /// When the file was last modified on the telescope, as a short local
+    /// date & time string; `None` when the transport could not report one.
+    pub fn date(&self) -> Option<String> {
+        self.mtime.map(format_mtime)
+    }
 }
 
 pub struct Session {
@@ -601,6 +618,27 @@ mod tests {
     }
 
     #[test]
+    fn scan_reports_file_dates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let usb = tmp.path().join("usb");
+        let sub = usb.join("MyWorks/M 42_sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("Light_1.fit"), b"x").unwrap();
+        let mut s = connect(
+            &Config::default(),
+            find("seestar").unwrap(),
+            &Link::Usb(usb.clone()),
+        )
+        .unwrap();
+        let files = s.scan(true).unwrap();
+        assert_eq!(files.len(), 1, "{files:?}");
+        let f = &files[0];
+        assert!(f.mtime.is_some(), "transport must report the file date");
+        let d = f.date().expect("a date string");
+        assert!(d.contains('-'), "{d:?}");
+    }
+
+    #[test]
     fn usb_seestar_import_with_delete() {
         let tmp = tempfile::tempdir().unwrap();
         let usb = tmp.path().join("usb");
@@ -760,6 +798,7 @@ mod tests {
             folder: "..".into(),
             local_dir: "../..".into(),
             kind: "light",
+            mtime: None,
         };
         let dest = tmp.path().join("a/b/dest");
         let r = s.download(&[evil], &dest, false, &NoProgress).unwrap();
