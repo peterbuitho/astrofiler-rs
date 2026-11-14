@@ -146,6 +146,8 @@ Add `--no-default-features` for a command-line-only build.
    download folder under the telescope's own folder names, ready for stacking.
 4. **Send to inbox** → tick the folders you are done with → *Move selected to
    inbox*. The web version's Load page opens when the move has finished.
+   Folders whose name is in the `inbox_exclude` setting (default `suspect_subs`)
+   stay in the download folder, also when they are inside a folder you move.
 
 Without the web version, the command line does the same filing and
 cataloguing on this computer.
@@ -195,6 +197,9 @@ original). It's looked up in this order:
 
 The database defaults to `astrofiler.db` beside the config file, or the user data
 folder; override it with the `database` key, `--db` or `$ASTROFILER_DB_PATH`.
+
+The `inbox_exclude` setting (default `suspect_subs`) lists the folder names,
+comma-separated, that **Send to inbox** leaves in the download folder.
 
 ## Smart telescopes
 

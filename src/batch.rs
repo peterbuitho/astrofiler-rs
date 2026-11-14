@@ -811,6 +811,8 @@ pub fn regenerate(
 #[derive(Debug, Default)]
 pub struct InboxReport {
     pub moved: usize,
+    /// Entries left where they were because their name is on the exclude list.
+    pub excluded: Vec<PathBuf>,
     /// Files left where they were because the inbox already has one of that name.
     pub skipped: Vec<PathBuf>,
     pub errors: Vec<(PathBuf, String)>,
@@ -819,8 +821,9 @@ pub struct InboxReport {
 impl InboxReport {
     pub fn summary(&self) -> String {
         format!(
-            "{} files moved to the inbox, {} already there, {} errors",
+            "{} files moved to the inbox, {} excluded by name, {} already there, {} errors",
             self.moved,
+            self.excluded.len(),
             self.skipped.len(),
             self.errors.len()
         )
@@ -829,26 +832,39 @@ impl InboxReport {
 
 /// Move folders (or single files) into `inbox` under their own names, e.g.
 /// finished telescope downloads on their way to the machine that keeps the
-/// catalogue. Nothing in the inbox is overwritten.
+/// catalogue. Nothing in the inbox is overwritten, and anything whose name is
+/// on `exclude` is left untouched, also inside a folder that moves.
 pub fn move_to_inbox(
     entries: &[PathBuf],
     inbox: &Path,
+    exclude: &[String],
     progress: &dyn Progress,
 ) -> Result<InboxReport> {
     if !inbox.is_dir() {
         bail!("the inbox {} is not a folder", inbox.display());
     }
+    let excluded_name = |n: &std::ffi::OsStr| exclude.iter().any(|x| x.as_str() == n);
+    // A file at or under a folder whose name is on the exclude list.
+    let excluded_path = |p: &Path| {
+        p.components()
+            .any(|c| matches!(c, std::path::Component::Normal(n) if excluded_name(n)))
+    };
+    let mut report = InboxReport::default();
     // (file, where it goes)
     let mut plan: Vec<(PathBuf, PathBuf)> = Vec::new();
     for entry in entries {
         let Some(name) = entry.file_name() else {
             continue;
         };
+        if excluded_name(name) {
+            report.excluded.push(entry.clone());
+            continue;
+        }
         if entry.is_dir() {
             for e in walkdir::WalkDir::new(entry)
                 .into_iter()
                 .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().is_file())
+                .filter(|e| e.file_type().is_file() && !excluded_path(e.path()))
             {
                 let rel = e.path().strip_prefix(entry).unwrap_or(e.path());
                 plan.push((e.path().to_path_buf(), inbox.join(name).join(rel)));
@@ -857,7 +873,16 @@ pub fn move_to_inbox(
             plan.push((entry.clone(), inbox.join(name)));
         }
     }
-    let mut report = InboxReport::default();
+    // Excluded folders inside a moved entry stay too; report each of them once.
+    for entry in entries.iter().filter(|e| e.is_dir() && !excluded_path(e)) {
+        for d in walkdir::WalkDir::new(entry)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_dir() && excluded_name(e.file_name()))
+        {
+            report.excluded.push(d.path().to_path_buf());
+        }
+    }
     for (i, (from, to)) in plan.iter().enumerate() {
         if progress.cancelled() {
             bail!("cancelled");
@@ -873,11 +898,31 @@ pub fn move_to_inbox(
             Err(e) => report.errors.push((from.clone(), format!("{e:#}"))),
         }
     }
-    for entry in entries.iter().filter(|e| e.is_dir()) {
-        remove_empty_dirs(entry);
+    for entry in entries.iter().filter(|e| e.is_dir() && !excluded_path(e)) {
+        prune_except(entry, exclude);
         std::fs::remove_dir(entry).ok();
     }
     Ok(report)
+}
+
+/// Remove the folders `root` was emptied of, leaving any folder whose name is
+/// on `exclude` (and everything in it) in place. Returns how many were removed.
+fn prune_except(root: &Path, exclude: &[String]) -> usize {
+    let excluded_name = |n: &std::ffi::OsStr| exclude.iter().any(|x| x.as_str() == n);
+    let dirs: Vec<PathBuf> = walkdir::WalkDir::new(root)
+        .contents_first(true)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_dir() && e.path() != root && !excluded_name(e.file_name()))
+        .map(|e| e.into_path())
+        .collect();
+    let mut removed = 0;
+    for d in dirs {
+        if std::fs::remove_dir(&d).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// Names file managers and NASes leave in folders; a folder holding only
@@ -1446,8 +1491,9 @@ mod tests {
         std::fs::write(local.join("loose.fits"), "l").unwrap();
 
         let entries = [night.clone(), local.join("loose.fits")];
-        let r = move_to_inbox(&entries, &inbox, &NoProgress).unwrap();
+        let r = move_to_inbox(&entries, &inbox, &[], &NoProgress).unwrap();
         assert_eq!((r.moved, r.skipped.len(), r.errors.len()), (3, 1, 0));
+        assert!(r.excluded.is_empty());
         let there = inbox.join("DWARF_RAW_TELE_M 31");
         assert!(there.join("a.fits").exists() && there.join("stack/s.fits").exists());
         assert!(inbox.join("loose.fits").exists() && !local.join("loose.fits").exists());
@@ -1458,7 +1504,38 @@ mod tests {
         );
         assert!(night.join("b.fits").exists() && !night.join("stack").exists());
 
-        assert!(move_to_inbox(&entries, &tmp.path().join("missing"), &NoProgress).is_err());
+        assert!(move_to_inbox(&entries, &tmp.path().join("missing"), &[], &NoProgress).is_err());
+    }
+
+    #[test]
+    fn leaves_excluded_entries_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (local, inbox) = (tmp.path().join("local"), tmp.path().join("inbox"));
+        std::fs::create_dir_all(&inbox).unwrap();
+        let suspects = local.join("suspect_subs");
+        let bad = local.join("bad_subs");
+        let night = local.join("DWARF_RAW_TELE_M 31");
+        std::fs::create_dir_all(&suspects).unwrap();
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::create_dir_all(night.join("suspect_subs")).unwrap();
+        std::fs::create_dir_all(night.join("bad_subs")).unwrap();
+        std::fs::write(suspects.join("s.fits"), "s").unwrap();
+        std::fs::write(night.join("a.fits"), "a").unwrap();
+        std::fs::write(night.join("suspect_subs/f.fits"), "f").unwrap();
+
+        let entries = [suspects.clone(), bad.clone(), night.clone()];
+        let exclude = ["suspect_subs".to_string(), "bad_subs".to_string()];
+        let r = move_to_inbox(&entries, &inbox, &exclude, &NoProgress).unwrap();
+        assert_eq!((r.moved, r.excluded.len()), (1, 4));
+        // Excluded folders stay as they were, top level and inside a moved
+        // folder, even when they are empty.
+        assert!(suspects.join("s.fits").exists());
+        assert!(bad.is_dir());
+        assert!(night.join("suspect_subs/f.fits").exists());
+        assert!(night.join("bad_subs").is_dir());
+        assert!(!night.join("a.fits").exists());
+        assert!(inbox.join("DWARF_RAW_TELE_M 31/a.fits").exists());
+        assert!(!inbox.join("DWARF_RAW_TELE_M 31/suspect_subs").exists());
     }
 
     #[test]

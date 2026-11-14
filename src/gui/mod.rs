@@ -111,6 +111,8 @@ struct LocalEntry {
     name: String,
     files: usize,
     bytes: u64,
+    /// Its name is on the `inbox_exclude` setting; not offered to be moved.
+    excluded: bool,
 }
 
 pub struct App {
@@ -857,7 +859,11 @@ impl App {
     fn list_local(&mut self, ctx: &egui::Context) {
         let dir = self.scope.dest.clone();
         self.local_dir = Some(dir.clone());
-        let (slot, ctx) = (self.local.clone(), ctx.clone());
+        let (slot, ctx, exclude) = (
+            self.local.clone(),
+            ctx.clone(),
+            self.cfg.inbox_exclude.clone(),
+        );
         std::thread::spawn(move || {
             let mut entries: Vec<LocalEntry> = std::fs::read_dir(&dir)
                 .into_iter()
@@ -878,11 +884,13 @@ impl App {
                         files += 1;
                         bytes += f.metadata().map(|m| m.len()).unwrap_or(0);
                     }
+                    let name = path.file_name()?.to_string_lossy().into_owned();
                     Some(LocalEntry {
-                        name: path.file_name()?.to_string_lossy().into_owned(),
+                        name: name.clone(),
                         path,
                         files,
                         bytes,
+                        excluded: exclude.iter().any(|x| x == &name),
                     })
                 })
                 .collect();
@@ -898,7 +906,7 @@ impl App {
         }
         let entries = self.local.lock().unwrap().clone();
         self.local_sel
-            .retain(|p| entries.iter().any(|e| &e.path == p));
+            .retain(|p| entries.iter().any(|e| &e.path == p && !e.excluded));
         let inbox = self.cfg.inbox.clone();
         let inbox_set = !inbox.as_os_str().is_empty();
 
@@ -916,6 +924,12 @@ impl App {
                     .color(Color32::from_rgb(230, 150, 60)),
             );
         }
+        if !self.cfg.inbox_exclude.is_empty() {
+            ui.weak(format!(
+                "Kept in the download folder: anything named {} (change in Settings).",
+                self.cfg.inbox_exclude.join(", ")
+            ));
+        }
         ui.add_space(6.0);
 
         let bytes: u64 = entries
@@ -931,7 +945,11 @@ impl App {
                 util::human_size(bytes)
             ));
             if ui.button("All").clicked() {
-                self.local_sel = entries.iter().map(|e| e.path.clone()).collect();
+                self.local_sel = entries
+                    .iter()
+                    .filter(|e| !e.excluded)
+                    .map(|e| e.path.clone())
+                    .collect();
             }
             if ui.button("None").clicked() {
                 self.local_sel.clear();
@@ -953,7 +971,10 @@ impl App {
                     .map(|e| e.path.clone())
                     .collect();
                 self.spawn(MOVE_TO_INBOX, move |cfg, p| {
-                    let r = batch::move_to_inbox(&picked, &cfg.inbox, p)?;
+                    let r = batch::move_to_inbox(&picked, &cfg.inbox, &cfg.inbox_exclude, p)?;
+                    for f in &r.excluded {
+                        log::warn!("Not moved: {} (excluded in Settings)", f.display());
+                    }
                     for f in &r.skipped {
                         log::warn!("Not moved: {} (the inbox already has it)", f.display());
                     }
@@ -983,17 +1004,25 @@ impl App {
                 body.rows(20.0, entries.len(), |mut row| {
                     let e = &entries[row.index()];
                     row.col(|ui| {
-                        let mut on = self.local_sel.contains(&e.path);
-                        if ui.checkbox(&mut on, "").changed() {
-                            if on {
-                                self.local_sel.insert(e.path.clone());
-                            } else {
-                                self.local_sel.remove(&e.path);
+                        if e.excluded {
+                            ui.weak("excluded");
+                        } else {
+                            let mut on = self.local_sel.contains(&e.path);
+                            if ui.checkbox(&mut on, "").changed() {
+                                if on {
+                                    self.local_sel.insert(e.path.clone());
+                                } else {
+                                    self.local_sel.remove(&e.path);
+                                }
                             }
                         }
                     });
                     row.col(|ui| {
-                        ui.label(&e.name);
+                        if e.excluded {
+                            ui.weak(&e.name);
+                        } else {
+                            ui.label(&e.name);
+                        }
                     });
                     row.col(|ui| {
                         ui.label(e.files.to_string());
@@ -1050,6 +1079,20 @@ impl App {
                     "The web version's incoming folder as this computer sees it, e.g. on the mounted NAS share",
                     &mut c.inbox,
                 );
+                ui.label("Inbox excludes")
+                    .on_hover_text("Folders with these names stay in the download folder when you send to the inbox; comma-separated");
+                let mut s = c.inbox_exclude.join(", ");
+                if ui
+                    .add(egui::TextEdit::singleline(&mut s).desired_width(420.0))
+                    .changed()
+                {
+                    c.inbox_exclude = s
+                        .split(',')
+                        .map(|n| n.trim().to_string())
+                        .filter(|n| !n.is_empty())
+                        .collect();
+                }
+                ui.end_row();
                 ui.label("Web version")
                     .on_hover_text("Address of the web version that keeps the catalogue");
                 ui.add(
@@ -1113,6 +1156,8 @@ impl App {
                         self.scope.dest = self.cfg_edit.source.to_string_lossy().into();
                     }
                     self.cfg = self.cfg_edit.clone();
+                    // The excludes may have changed: list the download folder anew.
+                    self.local_dir = None;
                     ctx.style_mut(interaction_style);
                     ctx.set_visuals(if self.cfg.theme == "light" {
                         egui::Visuals::light()

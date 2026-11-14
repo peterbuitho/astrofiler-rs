@@ -229,8 +229,9 @@ enum MappingCmd {
 enum ConfigCmd {
     Show,
     /// Set a key: source, repo, save_modified_headers, external_viewer, theme,
-    /// database, seestar_host, seestar_username,
-    /// seestar_password, dwarf_host, include_stacked, ui_scale (auto or e.g. 1.5)
+    /// database, seestar_host, seestar_username, seestar_password, dwarf_host,
+    /// include_stacked, ui_scale (auto or e.g. 1.5), inbox,
+    /// inbox_exclude (comma-separated folder names)
     Set {
         key: String,
         value: String,
@@ -812,6 +813,7 @@ fn config_cmd(cfg: &mut Config, action: Option<&ConfigCmd>) -> Result<()> {
             println!("on_conflict:           {}", cfg.on_conflict.key());
             println!("web_url:               {}", cfg.web_url);
             println!("inbox:                 {}", cfg.inbox.display());
+            println!("inbox_exclude:         {}", cfg.inbox_exclude.join(", "));
         }
         Some(ConfigCmd::Set { key, value }) => {
             let b = || matches!(value.to_lowercase().as_str(), "1" | "true" | "yes" | "on");
@@ -820,6 +822,13 @@ fn config_cmd(cfg: &mut Config, action: Option<&ConfigCmd>) -> Result<()> {
                 "repo" => cfg.repo = value.into(),
                 "web_url" => cfg.web_url = value.clone(),
                 "inbox" => cfg.inbox = value.into(),
+                "inbox_exclude" => {
+                    cfg.inbox_exclude = value
+                        .split(',')
+                        .map(|n| n.trim().to_string())
+                        .filter(|n| !n.is_empty())
+                        .collect();
+                }
                 "save_modified_headers" => cfg.save_modified_headers = b(),
                 "external_viewer" => cfg.external_viewer = value.clone(),
                 "theme" => cfg.theme = value.clone(),

@@ -39,6 +39,9 @@ pub struct Config {
     /// The web version's incoming folder as this machine sees it (e.g. the
     /// mounted share); finished downloads are moved there.
     pub inbox: PathBuf,
+    /// Folder names that "Send to inbox" leaves where they are, e.g.
+    /// `suspect_subs` (comma-separated in the config file).
+    pub inbox_exclude: Vec<String>,
     /// Where this config was loaded from / will be saved to.
     pub path: PathBuf,
 }
@@ -62,6 +65,7 @@ impl Default for Config {
             object_names: Default::default(),
             web_url: String::new(),
             inbox: PathBuf::new(),
+            inbox_exclude: vec!["suspect_subs".into()],
             path: default_config_path(),
         }
     }
@@ -156,6 +160,13 @@ impl Config {
         if let Some(v) = get("inbox") {
             cfg.inbox = PathBuf::from(v);
         }
+        if let Some(v) = get("inbox_exclude") {
+            cfg.inbox_exclude = v
+                .split(',')
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty())
+                .collect();
+        }
         if let Some(sec) = ini.section(Some("object_names")) {
             cfg.object_names = sec
                 .iter()
@@ -195,6 +206,7 @@ impl Config {
             .set("dwarf_host", self.dwarf_host.clone())
             .set("web_url", self.web_url.clone())
             .set("inbox", self.inbox.to_string_lossy())
+            .set("inbox_exclude", self.inbox_exclude.join(","))
             .set(
                 "include_stacked",
                 if self.include_stacked {
