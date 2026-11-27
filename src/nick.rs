@@ -75,37 +75,6 @@ fn is_catalogue(word: &str) -> bool {
         .any(|c| c.eq_ignore_ascii_case(word))
 }
 
-/// Splits a name that starts with a catalogue number into that number and
-/// the rest: "Sh 2-132_Lion Nebula" -> ("Sh 2-132", "_Lion Nebula").
-fn designation(name: &str) -> Option<(String, &str)> {
-    let prefix_len = name.chars().take_while(|c| c.is_ascii_alphabetic()).count();
-    let prefix = &name[..prefix_len];
-    if !is_catalogue(prefix) {
-        return None;
-    }
-    let rest = &name[prefix_len..];
-    let gap = rest.len() - rest.trim_start_matches([' ', '_']).len();
-    let digits = |s: &str| s.chars().take_while(|c| c.is_ascii_digit()).count();
-    let num = &rest[gap..];
-    let mut end = digits(num);
-    if end == 0 {
-        return None;
-    }
-    // Sharpless numbers carry the catalogue edition: "Sh 2-132".
-    if num[end..].starts_with('-') && digits(&num[end + 1..]) > 0 {
-        end += 1 + digits(&num[end + 1..]);
-    }
-    if num[end..]
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphanumeric())
-    {
-        return None;
-    }
-    let object = format!("{prefix}{}{}", rest[..gap].replace('_', " "), &num[..end]);
-    Some((object, &num[end..]))
-}
-
 /// The object and nickname in a folder or picture name:
 /// "C 7 Spiral Galaxy" -> ("C 7", "Spiral Galaxy"). None when the name does
 /// not start with a catalogue number or nothing name-like follows it.
@@ -116,7 +85,7 @@ pub fn in_name(name: &str) -> Option<(String, String)> {
         .iter()
         .find_map(|p| name.strip_prefix(p))
         .unwrap_or(name);
-    let (object, rest) = designation(name)?;
+    let (object, rest) = names::split_designation(name)?;
     let tokens: Vec<&str> = rest
         .split([' ', '_'])
         .map(|t| t.trim_matches(|c: char| "()[],.".contains(c)))

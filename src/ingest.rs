@@ -171,7 +171,9 @@ impl IngestReport {
             "{} {verb}, {} already in catalogue, {} duplicate copies",
             self.registered,
             self.already_catalogued,
-            self.duplicates.len() - self.already_catalogued,
+            self.duplicates
+                .len()
+                .saturating_sub(self.already_catalogued),
         );
         if self.sidecars > 0 {
             out.push_str(&format!(", {} previews/session info files", self.sidecars));
@@ -252,12 +254,22 @@ impl IngestReport {
 pub const MANAGED_DIRS: &[&str] = &["Light", "Calibrate", "Stacked", "Archive"];
 
 pub fn collect_files(dir: &Path, exclude: &[PathBuf]) -> Vec<PathBuf> {
+    let canonical_exclude: Vec<PathBuf> = exclude
+        .iter()
+        .filter_map(|x| x.canonicalize().ok())
+        .collect();
+    let is_excluded = |p: &Path| {
+        exclude.iter().any(|x| p == x)
+            || p.canonicalize()
+                .ok()
+                .is_some_and(|c| canonical_exclude.contains(&c))
+    };
     WalkDir::new(dir)
         .follow_links(true)
         .into_iter()
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
-            !(exclude.iter().any(|x| e.path() == x) || name.starts_with(".astrofiler-work"))
+            !(is_excluded(e.path()) || name.starts_with(".astrofiler-work"))
         })
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
@@ -327,9 +339,13 @@ pub fn ingest_folder(
     progress.update(0, 0, "Scanning for files...");
     // Never re-read the repository's own organised folders as input
     // (the repository may live inside the folder being loaded).
+    let real_source = source
+        .canonicalize()
+        .unwrap_or_else(|_| source.to_path_buf());
+    let real_repo = cfg.repo.canonicalize().unwrap_or_else(|_| cfg.repo.clone());
     let excluded: Vec<PathBuf> = if opts.placement == Placement::InPlace {
         vec![]
-    } else if cfg.repo.starts_with(source) && !paths_equal(source, &cfg.repo) {
+    } else if real_repo.starts_with(&real_source) && !paths_equal(source, &cfg.repo) {
         vec![cfg.repo.clone()]
     } else {
         MANAGED_DIRS.iter().map(|d| cfg.repo.join(d)).collect()
@@ -340,7 +356,10 @@ pub fn ingest_folder(
         files.len(),
         source.display()
     );
-    let companions = seestar_companions(source);
+    let companions: Vec<PathBuf> = seestar_companions(source)
+        .into_iter()
+        .filter(|other| !(opts.placement == Placement::Move && managed_dir(cfg, other).is_some()))
+        .collect();
     for other in &companions {
         let more = collect_files(other, &excluded);
         log::info!(
@@ -364,7 +383,7 @@ pub fn ingest_folder(
                 .filter(|(_, b)| b.is_absolute()),
         );
         // Frames of this folder that an earlier load filed.
-        let prefix = format!("{}/", util::normalize_path(source));
+        let prefix = util::path_prefix(source);
         let earlier = db::files_where(
             conn,
             "substr(fitsFileOriginalFile, 1, length(?1)) = ?1",
@@ -389,17 +408,18 @@ pub fn ingest_folder(
 /// Drop the catalogue rows of files under `src` that are not in the
 /// repository's own folders yet. The files are not touched.
 fn forget_unfiled(conn: &Connection, cfg: &Config, src: &Path) -> Result<usize> {
-    let under = |p: &Path| format!("{}/", util::normalize_path(p).trim_end_matches('/'));
     let n = conn.execute(
         "DELETE FROM fitsFile WHERE substr(fitsFileName, 1, length(?1)) = ?1 \
          AND substr(fitsFileName, 1, length(?2)) <> ?2 \
          AND substr(fitsFileName, 1, length(?3)) <> ?3 \
-         AND substr(fitsFileName, 1, length(?4)) <> ?4",
+         AND substr(fitsFileName, 1, length(?4)) <> ?4 \
+         AND substr(fitsFileName, 1, length(?5)) <> ?5",
         rusqlite::params![
-            under(src),
-            under(&cfg.repo.join("Light")),
-            under(&cfg.repo.join("Stacked")),
-            under(&cfg.repo.join("Calibrate")),
+            util::path_prefix(src),
+            util::path_prefix(&cfg.repo.join("Light")),
+            util::path_prefix(&cfg.repo.join("Stacked")),
+            util::path_prefix(&cfg.repo.join("Calibrate")),
+            util::path_prefix(&cfg.repo.join("Archive")),
         ],
     )?;
     Ok(n)
@@ -487,14 +507,22 @@ fn place_sidecars(
             if !frames.is_empty() {
                 return Ok(frames);
             }
-            let prefix = format!("{}/", util::normalize_path(src_dir));
+            let prefix = util::path_prefix(src_dir);
             let rows = db::files_where(
                 conn,
                 "substr(fitsFileOriginalFile, 1, length(?1)) = ?1 AND COALESCE(fitsFileStacked,0) = ?2",
                 &[&prefix, &(stacked as i64)],
             )?;
+            let norm_dir = util::normalize_path(src_dir);
+            let norm_dir = norm_dir.trim_end_matches('/');
             Ok(rows
                 .into_iter()
+                .filter(|f| {
+                    f.original.as_deref().is_some_and(|orig| {
+                        let parent = orig.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+                        parent == norm_dir
+                    })
+                })
                 .map(|f| {
                     (
                         PathBuf::from(f.original.unwrap_or_default()),
@@ -791,18 +819,20 @@ fn ingest_inner(
         // normalise and hash them, one input file per task.
         let read = AtomicUsize::new(0);
         let steps = chunk.len();
-        type Read = (PathBuf, Result<Vec<(PathBuf, Result<Prepared>)>>);
+        type Unpacked = (Vec<(PathBuf, Result<Prepared>)>, Option<PathBuf>);
+        type Read = (PathBuf, Result<Unpacked>);
         let results: Vec<Read> = pool.install(|| {
             chunk
                 .par_iter()
                 .map(|p| {
                     let started = read.load(Ordering::Relaxed);
                     tick(started, steps, 0, format!("Reading {}", label(p)));
-                    let r = unpack(p, opts, work).map(|staged| {
-                        staged
+                    let r = unpack(p, opts, work).map(|(staged, remove_after)| {
+                        let prepped = staged
                             .into_par_iter()
                             .map(|st| (st.input.clone(), prepare(st, cfg, opts, &mappings)))
-                            .collect()
+                            .collect();
+                        (prepped, remove_after)
                     });
                     let n = read.fetch_add(1, Ordering::Relaxed) + 1;
                     tick(n, steps, 0, format!("Reading {}", label(p)));
@@ -811,15 +841,23 @@ fn ingest_inner(
                 .collect()
         });
         let mut prepared: Vec<(PathBuf, Result<Prepared>)> = Vec::new();
+        let mut archives_to_remove: Vec<PathBuf> = Vec::new();
         for (input, r) in results {
             match r {
-                Ok(list) => prepared.extend(list),
+                Ok((list, remove_after)) => {
+                    if let Some(archive) = remove_after {
+                        archives_to_remove.push(archive);
+                    }
+                    prepared.extend(list);
+                }
                 Err(e) => report.errors.push((input, format!("{e:#}"))),
             }
         }
 
         // File and catalogue this batch in one transaction.
         let steps = prepared.len();
+        let err_before = report.errors.len();
+        let conflict_before = report.conflicts.len();
         if !opts.dry_run {
             conn.execute_batch("BEGIN IMMEDIATE")?;
         }
@@ -845,6 +883,24 @@ fn ingest_inner(
             conn.execute_batch("COMMIT")?;
         }
         result?;
+        // Only remove unpacked source archives after the batch committed and
+        // none of their entries failed or conflicted.
+        if !opts.dry_run {
+            let bad: HashSet<&Path> = report.errors[err_before..]
+                .iter()
+                .map(|(p, _)| p.as_path())
+                .chain(
+                    report.conflicts[conflict_before..]
+                        .iter()
+                        .map(|(p, _)| p.as_path()),
+                )
+                .collect();
+            for archive in archives_to_remove {
+                if !bad.contains(archive.as_path()) {
+                    std::fs::remove_file(&archive).ok();
+                }
+            }
+        }
         if work.exists() {
             std::fs::remove_dir_all(work).ok();
         }
@@ -873,7 +929,7 @@ fn file_prepared(
             let target = dest_dir.join(&new_name);
             // A skipped checksum is needed after all when the name is taken:
             // that is how a file loaded before is recognised.
-            let hash = match hash {
+            let mut hash = match hash {
                 None if target.exists() || state.planned.contains(&target) => {
                     Some(util::sha256_file(&staged.path)?)
                 }
@@ -1047,6 +1103,8 @@ fn file_prepared(
                             "could not save modified header for {}: {e:#}",
                             dest.display()
                         );
+                        // Keep the catalogue hash consistent with the unmodified file on disk.
+                        hash = util::sha256_file(&dest).ok();
                     }
                 }
                 dest
@@ -1137,33 +1195,80 @@ fn is_prefix_of(short: &Path, long: &Path) -> Result<bool> {
 }
 
 /// Put `from` at `to`, replacing the file there. The new content is written
-/// next to it first, so the existing file survives a failed copy.
+/// next to it first, so both the existing file and `from` survive a failure.
 fn replace_file(from: &Path, to: &Path, moving: bool) -> Result<()> {
-    let mut tmp = to.as_os_str().to_owned();
-    tmp.push(".astrofiler-tmp");
-    let tmp = PathBuf::from(tmp);
-    if moving {
-        util::move_file(from, &tmp)?;
-    } else {
+    let tmp = fits::tmp_path(to);
+    let r = (|| -> Result<()> {
         util::copy_file(from, &tmp)?;
+        if std::fs::rename(&tmp, to).is_err() {
+            // Some network filesystems refuse to rename over an existing file.
+            std::fs::remove_file(to)?;
+            std::fs::rename(&tmp, to)?;
+        }
+        if moving {
+            std::fs::remove_file(from)?;
+        }
+        Ok(())
+    })();
+    if r.is_err() {
+        std::fs::remove_file(&tmp).ok();
     }
-    if std::fs::rename(&tmp, to).is_err() {
-        // Some network filesystems refuse to rename over an existing file.
-        std::fs::remove_file(to)?;
-        std::fs::rename(&tmp, to)?;
+    r
+}
+
+/// Maximum size accepted when unpacking a single `.zip` entry or `.gz` file.
+const MAX_UNPACK_BYTES: u64 = 2 << 30;
+
+fn copy_bounded<R: std::io::Read, W: std::io::Write>(
+    reader: R,
+    writer: &mut W,
+    limit: u64,
+) -> Result<()> {
+    let copied = std::io::copy(&mut std::io::Read::take(reader, limit + 1), writer)?;
+    if copied > limit {
+        bail!("decompressed file exceeds {limit} bytes limit");
     }
     Ok(())
 }
 
-/// Turn one input file into the FITS file(s) to register.
-fn unpack(path: &Path, opts: IngestOptions, work: &Path) -> Result<Vec<Staged>> {
+/// Turn one input file into the FITS file(s) to register, plus an optional
+/// source archive path to delete once the batch commits.
+fn unpack(path: &Path, opts: IngestOptions, work: &Path) -> Result<(Vec<Staged>, Option<PathBuf>)> {
     let lower = path.to_string_lossy().to_lowercase();
     let moving = opts.placement == Placement::Move && !opts.dry_run;
-    // Where intermediate files go: next to the source when we own it (moving
-    // or syncing in place), otherwise into the scratch folder.
+    // Always extract into a per-call unique scratch directory when filing
+    // (avoids parallel filename collisions and preserves archives until commit).
     let scratch = |name: &std::ffi::OsStr| -> Result<(PathBuf, bool)> {
-        if moving || (opts.placement == Placement::InPlace && !opts.dry_run) {
-            Ok((util::unique_path(&path.with_file_name(name)), false))
+        if opts.placement == Placement::InPlace && !opts.dry_run {
+            // Create atomically so parallel tasks never overwrite each other.
+            let base = path.with_file_name(name);
+            let stem = base
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let ext = base
+                .extension()
+                .map(|e| format!(".{}", e.to_string_lossy()))
+                .unwrap_or_default();
+            let parent = base.parent().unwrap_or(Path::new("."));
+            for i in 0u32.. {
+                let candidate = if i == 0 {
+                    base.clone()
+                } else {
+                    parent.join(format!("{stem}_{i:03}{ext}"))
+                };
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&candidate)
+                {
+                    Ok(_) => return Ok((candidate, false)),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            unreachable!()
         } else {
             let dir = work.join(uuid::Uuid::new_v4().simple().to_string());
             std::fs::create_dir_all(&dir)?;
@@ -1179,41 +1284,59 @@ fn unpack(path: &Path, opts: IngestOptions, work: &Path) -> Result<Vec<Staged>> 
     if lower.ends_with(".zip") {
         let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
         let mut out = Vec::new();
+        let mut skipped_non_fits = false;
         for i in 0..archive.len() {
             let mut entry = archive.by_index(i)?;
+            if entry.is_dir() {
+                continue;
+            }
             let Some(name) = entry.enclosed_name() else {
+                skipped_non_fits = true;
                 continue;
             };
             if !util::is_fits_name(&name) {
+                skipped_non_fits = true;
                 continue;
             }
             let (dest, temp) = scratch(name.file_name().unwrap_or_default())?;
-            std::io::copy(&mut entry, &mut std::fs::File::create(&dest)?)?;
+            let mut f = std::fs::File::create(&dest)?;
+            if let Err(e) = copy_bounded(&mut entry, &mut f, MAX_UNPACK_BYTES) {
+                drop(f);
+                std::fs::remove_file(&dest).ok();
+                return Err(e);
+            }
             out.push(staged(dest, temp));
         }
-        if moving {
-            std::fs::remove_file(path).ok();
+        let remove_after = (moving && !skipped_non_fits).then(|| path.to_path_buf());
+        if moving && skipped_non_fits {
+            log::warn!(
+                "{}: kept archive because it contains non-FITS entries",
+                path.display()
+            );
         }
-        return Ok(out);
+        return Ok((out, remove_after));
     }
     if lower.ends_with(".xisf")
         && opts.placement == Placement::InPlace
         && path.with_extension("fits").exists()
     {
         // Converted by an earlier version: its FITS twin is the catalogued file.
-        return Ok(vec![]);
+        return Ok((vec![], None));
     }
     if lower.ends_with(".gz") && opts.placement != Placement::InPlace {
         let name = path.file_stem().unwrap_or_default().to_os_string();
         let (out, temp) = scratch(&name)?;
-        let mut dec = flate2::read::GzDecoder::new(std::fs::File::open(path)?);
-        std::io::copy(&mut dec, &mut std::fs::File::create(&out)?)?;
-        if moving {
-            std::fs::remove_file(path)?;
+        let dec = flate2::read::GzDecoder::new(std::fs::File::open(path)?);
+        let mut f = std::fs::File::create(&out)?;
+        if let Err(e) = copy_bounded(dec, &mut f, MAX_UNPACK_BYTES) {
+            drop(f);
+            std::fs::remove_file(&out).ok();
+            return Err(e);
         }
-        return Ok(vec![staged(out, temp)]);
+        let remove_after = moving.then(|| path.to_path_buf());
+        return Ok((vec![staged(out, temp)], remove_after));
     }
-    Ok(vec![staged(path.to_path_buf(), false)])
+    Ok((vec![staged(path.to_path_buf(), false)], None))
 }
 
 /// A descriptive name ends in .fits; an XISF file keeps its own extension.
@@ -1576,19 +1699,20 @@ pub fn destination(h: &Header, cfg: &Config) -> Result<(String, PathBuf)> {
     let object_dir = || crate::names::object_folder(&mosaic, &cfg.object_names);
     let imagetyp = val(h, "IMAGETYP", "");
     let (stamp, day) = parse_date_obs(&val(h, "DATE-OBS", ""))?;
-    let exposure = h
-        .get("EXPTIME")
-        .or_else(|| h.get("EXPOSURE"))
-        .map(|v| v.to_py_string())
-        .unwrap_or_default();
+    let exposure = sanitize(
+        &h.get("EXPTIME")
+            .or_else(|| h.get("EXPOSURE"))
+            .map(|v| v.to_py_string())
+            .unwrap_or_default(),
+    );
     let (device, device_dir) = device_folder(h);
     let device_dir = match panel {
         Some(n) => device_dir.join(crate::names::panel_folder(n)),
         None => device_dir,
     };
-    let xbin = val(h, "XBINNING", "1");
-    let ybin = val(h, "YBINNING", "1");
-    let temp = val(h, "CCD-TEMP", "0");
+    let xbin = sanitize(&val(h, "XBINNING", "1"));
+    let ybin = sanitize(&val(h, "YBINNING", "1"));
+    let temp = sanitize(&val(h, "CCD-TEMP", "0"));
     let filter = sanitize(&h.get_truthy("FILTER").unwrap_or_else(|| "OSC".into()));
     let kind = FrameKind::classify(&imagetyp)
         .ok_or_else(|| anyhow!("unrecognised IMAGETYP '{imagetyp}'"))?;
@@ -1599,10 +1723,9 @@ pub fn destination(h: &Header, cfg: &Config) -> Result<(String, PathBuf)> {
             .or_else(|| h.get_i64("NCOMBINE"))
             .unwrap_or(0);
         let name = format!("Stacked-{object}-{device}-{filter}-{stamp}-{count}x{exposure}s.fits");
-        return Ok((
-            name,
-            repo.join("Stacked").join(object_dir()).join(&device_dir),
-        ));
+        let dir = repo.join("Stacked").join(object_dir()).join(&device_dir);
+        ensure_within(repo, &dir, &name)?;
+        return Ok((name, dir));
     }
     let name = match kind {
         FrameKind::Light => format!(
@@ -1633,7 +1756,23 @@ pub fn destination(h: &Header, cfg: &Config) -> Result<(String, PathBuf)> {
             .join(other.object_name().to_uppercase())
             .join(&device_dir),
     };
+    ensure_within(repo, &dir, &name)?;
     Ok((name, dir))
+}
+
+fn ensure_within(root: &Path, dir: &Path, name: &str) -> Result<()> {
+    let rel = dir
+        .strip_prefix(root)
+        .map_err(|_| anyhow!("computed destination escapes repository"))?;
+    if rel.components().any(|c| !matches!(c, Component::Normal(_)))
+        || name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains(['/', '\\'])
+    {
+        bail!("unsafe destination path computed from header");
+    }
+    Ok(())
 }
 
 fn file_record(h: &Header, path: &Path, hash: Option<String>, original: &Path) -> FitsFile {
@@ -2875,5 +3014,71 @@ pub(crate) mod tests {
         assert!(apply_mappings(&mut h, &maps));
         assert_eq!(h.get_str("TELESCOP").as_deref(), Some("RedCat 51"));
         assert_eq!(h.get_str("OBSERVER").as_deref(), Some("Me"));
+    }
+
+    #[test]
+    fn traversal_headers_stay_inside_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            repo: tmp.path().join("repo"),
+            ..Default::default()
+        };
+        let mut h = Header::default();
+        h.set("IMAGETYP", Value::Str("Light".into()));
+        h.set("OBJECT", Value::Str("..".into()));
+        h.set("TELESCOP", Value::Str("..".into()));
+        h.set("INSTRUME", Value::Str("..".into()));
+        h.set("DATE-OBS", Value::Str("2024-10-01T21:00:00".into()));
+        h.set("EXPTIME", Value::Str("../../10".into()));
+        h.set("CCD-TEMP", Value::Str("/../../evil".into()));
+        let (name, dir) = destination(&h, &cfg).unwrap();
+        assert!(dir.starts_with(&cfg.repo), "{dir:?}");
+        assert!(
+            !dir.components().any(|c| matches!(c, Component::ParentDir)),
+            "{dir:?}"
+        );
+        assert!(!name.contains('/') && !name.contains('\\'), "{name}");
+    }
+
+    #[test]
+    fn zip_with_non_fits_is_kept_in_move_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("in");
+        std::fs::create_dir_all(&src).unwrap();
+        let f = make_frame(
+            &src,
+            "a.fits",
+            "Light",
+            Some("M 31"),
+            "2024-10-01T21:00:00",
+            30.0,
+            None,
+            1.0,
+        );
+        let fits_bytes = std::fs::read(&f).unwrap();
+        std::fs::remove_file(&f).unwrap();
+
+        let archive_path = src.join("mixed.zip");
+        {
+            let file = std::fs::File::create(&archive_path).unwrap();
+            let mut zw = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default();
+            zw.start_file("a.fits", opts).unwrap();
+            std::io::Write::write_all(&mut zw, &fits_bytes).unwrap();
+            zw.start_file("notes.txt", opts).unwrap();
+            std::io::Write::write_all(&mut zw, b"keep me").unwrap();
+            zw.finish().unwrap();
+        }
+        let cfg = Config {
+            repo: tmp.path().join("repo"),
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        let r = ingest_folder(&mut conn, &cfg, &src, IngestOptions::MOVE, &NoProgress).unwrap();
+        assert_eq!(r.registered, 1, "{r:?}");
+        assert!(
+            archive_path.exists(),
+            "archive containing non-FITS entries must not be deleted"
+        );
     }
 }

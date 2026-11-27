@@ -71,6 +71,7 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// Undo the octal escapes (`\040` for a space) of /proc/mounts.
+#[cfg(any(target_os = "linux", test))]
 fn unescape_mounts(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -89,6 +90,7 @@ fn unescape_mounts(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn gvfs_to_mount(path: &Path, mounts: &str) -> Option<PathBuf> {
     let (server, share, rest) = parse_gvfs_smb(path)?;
     let host = |h: &str| {
@@ -240,13 +242,72 @@ pub fn normalize_path(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
 }
 
-/// Replace characters that are invalid in file names with underscores.
+/// Prefix for SQLite `substr(path, 1, length(?1)) = ?1` queries, normalised
+/// to forward slashes with exactly one trailing `/`.
+pub fn path_prefix(p: &Path) -> String {
+    let s = normalize_path(p);
+    let trimmed = s.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".into()
+    } else {
+        format!("{trimmed}/")
+    }
+}
+
+/// Whether `a` and `b` refer to the same existing file on disk (handling
+/// symlinks, hardlinks, and case-insensitive filesystems).
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            return ma.dev() == mb.dev() && ma.ino() == mb.ino();
+        }
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn is_windows_reserved(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name);
+    let up = stem.to_ascii_uppercase();
+    matches!(
+        up.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+/// Replace characters that are invalid in file names with underscores, and
+/// neutralise path-traversal segments (`.` / `..`) and Windows reserved names.
 pub fn sanitize(name: &str) -> String {
     let mut s: String = name
         .trim()
         .chars()
         .map(|c| {
-            if " \\/:*?\"<>|\t\n\r".contains(c) {
+            if " \\/:*?\"<>|\t\n\r".contains(c) || c.is_control() {
                 '_'
             } else {
                 c
@@ -256,9 +317,11 @@ pub fn sanitize(name: &str) -> String {
     while s.contains("__") {
         s = s.replace("__", "_");
     }
-    let s = s.trim_matches('_').to_string();
-    if s.is_empty() {
+    let s = s.trim_matches('_').trim_end_matches(['.', ' ']).to_string();
+    if s.is_empty() || s == "." || s == ".." {
         "Unknown".into()
+    } else if is_windows_reserved(&s) {
+        format!("_{s}")
     } else {
         s
     }
@@ -469,13 +532,16 @@ fn read_whole(f: &std::fs::File) -> Result<Vec<u8>> {
 /// partial destination is removed on failure.
 pub fn copy_file(from: &Path, to: &Path) -> Result<u64> {
     use std::io::{Read, Write};
+    let input = std::fs::File::open(from)?;
+    let len = input.metadata()?.len();
+    if same_file(from, to) {
+        return Ok(len);
+    }
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let mut output = std::fs::File::create(to)?;
     let result = (|| -> Result<u64> {
-        let input = std::fs::File::open(from)?;
-        let len = input.metadata()?.len();
-        let mut output = std::fs::File::create(to)?;
         if len >= PARALLEL_MIN {
             output.set_len(len)?;
             in_parts(len, |start, n| {
@@ -489,6 +555,7 @@ pub fn copy_file(from: &Path, to: &Path) -> Result<u64> {
                 }
                 Ok(())
             })?;
+            output.flush()?;
             return Ok(len);
         }
         let mut input = input;
@@ -505,6 +572,7 @@ pub fn copy_file(from: &Path, to: &Path) -> Result<u64> {
         output.flush()?;
         Ok(total)
     })();
+    drop(output);
     if result.is_err() {
         std::fs::remove_file(to).ok();
     }
@@ -623,8 +691,8 @@ pub fn open_external(viewer: &str, path: &Path) -> Result<()> {
         return Ok(());
     }
     #[cfg(target_os = "windows")]
-    Command::new("cmd")
-        .args(["/C", "start", ""])
+    Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler"])
         .arg(path)
         .spawn()?;
     #[cfg(target_os = "macos")]
@@ -712,6 +780,14 @@ mod tests {
         assert_eq!(sanitize(" M 31 / core "), "M_31_core");
         assert_eq!(sanitize("a::b"), "a_b");
         assert_eq!(sanitize("  "), "Unknown");
+        assert_eq!(sanitize(".."), "Unknown");
+        assert_eq!(sanitize("."), "Unknown");
+        assert_eq!(sanitize("foo..."), "foo");
+        assert_eq!(sanitize("CON"), "_CON");
+        assert_eq!(sanitize("nul.fits"), "_nul.fits");
+        assert_eq!(sanitize("a\x00b"), "a_b");
+        assert_eq!(path_prefix(Path::new("/mnt/nas/repo/")), "/mnt/nas/repo/");
+        assert_eq!(path_prefix(Path::new("/mnt/nas/repo")), "/mnt/nas/repo/");
     }
 
     #[test]
@@ -723,6 +799,14 @@ mod tests {
         std::fs::write(&a, &data).unwrap();
         assert_eq!(copy_file(&a, &b).unwrap(), data.len() as u64);
         assert_eq!(std::fs::read(&b).unwrap(), data);
+        // Self-copy must not truncate or destroy the file.
+        assert_eq!(copy_file(&a, &a).unwrap(), data.len() as u64);
+        assert_eq!(std::fs::read(&a).unwrap(), data);
+        // Missing source must not delete a pre-existing destination.
+        let keep = dir.path().join("keep.bin");
+        std::fs::write(&keep, b"existing").unwrap();
+        assert!(copy_file(&dir.path().join("missing"), &keep).is_err());
+        assert_eq!(std::fs::read(&keep).unwrap(), b"existing");
         assert!(copy_file(&dir.path().join("missing"), &dir.path().join("c")).is_err());
         assert!(
             !dir.path().join("c").exists(),

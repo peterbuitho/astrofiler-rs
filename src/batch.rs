@@ -58,10 +58,24 @@ pub fn set_field(
     opts: EditOptions,
     progress: &dyn Progress,
 ) -> Result<EditReport> {
+    set_field_inner(conn, cfg, ids, card, value, opts, progress).map(|(r, _)| r)
+}
+
+fn set_field_inner(
+    conn: &mut Connection,
+    cfg: &Config,
+    ids: &[String],
+    card: &str,
+    value: &str,
+    opts: EditOptions,
+    progress: &dyn Progress,
+) -> Result<(EditReport, Vec<(PathBuf, PathBuf)>)> {
     let cfg = &crate::nick::effective(conn, cfg);
-    let (column, _) = column_for(card)?;
+    let (column, session_col) = column_for(card)?;
     let card = card.to_uppercase();
     let mut report = EditReport::default();
+    let mut moved_files: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut touched_sessions: std::collections::HashSet<String> = Default::default();
     // The write lock is taken before any file is touched: once files move,
     // their rows must follow.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -88,6 +102,7 @@ pub fn set_field(
                 Ok(edited) => {
                     if edited.path != path {
                         report.moved += 1;
+                        moved_files.push((path.clone(), edited.path.clone()));
                         if let (Some(old), Some(new)) = (path.parent(), edited.path.parent()) {
                             if old != new {
                                 moved_dirs.insert(old.to_path_buf(), new.to_path_buf());
@@ -115,17 +130,34 @@ pub fn set_field(
             &format!("UPDATE fitsFile SET \"{column}\"=?1, fitsFileName=?2, fitsFileHash=?3 WHERE fitsFileId=?4"),
             params![value, util::normalize_path(&new_path), new_hash, id],
         ) {
-            Ok(_) => report.updated += 1,
+            Ok(_) => {
+                report.updated += 1;
+                if let Some(sid) = file.session {
+                    touched_sessions.insert(sid);
+                }
+            }
             Err(e) => report
                 .errors
                 .push((file.name.clone(), format!("updating the catalogue: {e}"))),
+        }
+    }
+    if let Some(scol) = session_col {
+        for sid in touched_sessions {
+            let _ = tx.execute(
+                &format!(
+                    "UPDATE fitsSession SET \"{scol}\"=?1 WHERE fitsSessionId=?2 \
+                     AND NOT EXISTS (SELECT 1 FROM fitsFile WHERE fitsFileSession=?2 \
+                     AND COALESCE(fitsFileSoftDelete,0)=0 AND COALESCE(\"{column}\",'')<>?1)"
+                ),
+                params![value, sid],
+            );
         }
     }
     tx.commit()?;
     for (old, new) in &moved_dirs {
         move_sidecars(old, new);
     }
-    Ok(report)
+    Ok((report, moved_files))
 }
 
 /// Once every frame of a folder has been re-filed, move what is left in it
@@ -177,8 +209,13 @@ fn edit_file(
     if opts.update_headers && fits::is_gzip(path) {
         bail!("can't rewrite the header of a gzip-compressed file");
     }
+    let in_repo = path.starts_with(&cfg.repo)
+        || matches!(
+            (path.canonicalize(), cfg.repo.canonicalize()),
+            (Ok(p), Ok(r)) if p.starts_with(&r)
+        );
     let mut target = None;
-    if opts.refile && path.starts_with(&cfg.repo) {
+    if opts.refile && in_repo {
         // File by the header as ingest sees it (e.g. DWARF files carry no
         // IMAGETYP); the edited value wins over the mappings.
         let mut filed = header.clone();
@@ -223,19 +260,26 @@ pub fn merge_objects(
     opts: EditOptions,
     progress: &dyn Progress,
 ) -> Result<EditReport> {
-    let ids: Vec<String> = db::files_where(conn, "fitsFileObject=?1", &[&from])?
-        .into_iter()
-        .map(|f| f.id)
-        .collect();
+    let ids: Vec<String> = db::files_where(
+        conn,
+        "fitsFileObject=?1 AND COALESCE(fitsFileSoftDelete,0)=0",
+        &[&from],
+    )?
+    .into_iter()
+    .map(|f| f.id)
+    .collect();
     if ids.is_empty() {
         bail!("no files with object '{from}'");
     }
-    let report = set_field(conn, cfg, &ids, "OBJECT", to, opts, progress)?;
-    conn.execute(
-        "UPDATE fitsSession SET fitsSessionObjectName=?1 WHERE fitsSessionObjectName=?2",
-        params![to, from],
-    )?;
+    let (report, moved) = set_field_inner(conn, cfg, &ids, "OBJECT", to, opts, progress)?;
+    if report.errors.is_empty() {
+        conn.execute(
+            "UPDATE fitsSession SET fitsSessionObjectName=?1 WHERE fitsSessionObjectName=?2",
+            params![to, from],
+        )?;
+    }
     if opts.refile {
+        crate::pictures::follow(cfg, &moved);
         remove_empty_dirs(&cfg.repo.join("Light"));
         remove_empty_dirs(&cfg.repo.join("Stacked"));
     }
@@ -282,7 +326,7 @@ fn kept_name(original: &str, filed: &Path) -> Option<String> {
 pub fn layout_plan(conn: &Connection, cfg: &Config) -> Result<Vec<(PathBuf, PathBuf)>> {
     let cfg = &crate::nick::effective(conn, cfg);
     let repo = &cfg.repo;
-    let prefix = format!("{}/", util::normalize_path(repo));
+    let prefix = util::path_prefix(repo);
     let files = db::files_where(conn, "substr(fitsFileName, 1, length(?1)) = ?1", &[&prefix])?;
     // Object of each object folder, and new names of stacked results and of
     // the companions that share their name.
@@ -521,7 +565,7 @@ pub fn delete_files(
     ids: &[String],
     from_disk: bool,
 ) -> Result<(usize, Vec<(String, String)>)> {
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut n = 0;
     let mut errors = Vec::new();
     for id in ids {
@@ -563,62 +607,103 @@ pub fn export_files(
         .iter()
         .filter_map(|id| db::file_by_id(conn, id).ok().flatten())
         .collect();
+    // Take the write lock before moving files so a locked catalogue aborts first.
+    let tx = if move_files {
+        Some(conn.transaction_with_behavior(TransactionBehavior::Immediate)?)
+    } else {
+        None
+    };
+    // Pre-assign unique destination paths sequentially so parallel workers never race.
+    let mut claimed: std::collections::HashSet<PathBuf> = Default::default();
+    let plan: Vec<(FitsFile, PathBuf, PathBuf)> = files
+        .into_iter()
+        .map(|f| {
+            let src = PathBuf::from(&f.name);
+            let dir = match layout {
+                ExportLayout::Flat => dest.to_path_buf(),
+                ExportLayout::ByObject => {
+                    let kind = FrameKind::classify(f.image_type.as_deref().unwrap_or(""));
+                    let sub = match kind {
+                        Some(FrameKind::Light) | None => {
+                            f.filter.clone().unwrap_or_else(|| "OSC".into())
+                        }
+                        Some(k) => k.object_name().to_string(),
+                    };
+                    dest.join(util::sanitize(f.object.as_deref().unwrap_or("Unknown")))
+                        .join(util::sanitize(&sub))
+                }
+            };
+            let base = dir.join(src.file_name().unwrap_or_default());
+            let mut target = util::unique_path(&base);
+            if claimed.contains(&target) {
+                let stem = base
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                let ext = base
+                    .extension()
+                    .map(|e| format!(".{}", e.to_string_lossy()))
+                    .unwrap_or_default();
+                let mut i = 1u32;
+                while target.exists() || claimed.contains(&target) {
+                    target = dir.join(format!("{stem}_{i:03}{ext}"));
+                    i += 1;
+                }
+            }
+            claimed.insert(target.clone());
+            (f, dir, target)
+        })
+        .collect();
+    let total = plan.len();
     let done = AtomicUsize::new(0);
-    let first = files
+    let first = plan
         .first()
-        .map(|f| PathBuf::from(&f.name))
+        .map(|(f, _, _)| PathBuf::from(&f.name))
         .unwrap_or_default();
     let results: Vec<(String, Result<PathBuf>)> = util::with_io_pool(&[&first, dest], || {
-        files
-            .par_iter()
-            .map(|f| {
+        plan.par_iter()
+            .map(|(f, dir, target)| {
                 let src = PathBuf::from(&f.name);
-                let dir = match layout {
-                    ExportLayout::Flat => dest.to_path_buf(),
-                    ExportLayout::ByObject => {
-                        let kind = FrameKind::classify(f.image_type.as_deref().unwrap_or(""));
-                        let sub = match kind {
-                            Some(FrameKind::Light) | None => {
-                                f.filter.clone().unwrap_or_else(|| "OSC".into())
-                            }
-                            Some(k) => k.object_name().to_string(),
-                        };
-                        dest.join(util::sanitize(f.object.as_deref().unwrap_or("Unknown")))
-                            .join(util::sanitize(&sub))
-                    }
-                };
-                let target = util::unique_path(&dir.join(src.file_name().unwrap_or_default()));
                 let r = (|| -> Result<PathBuf> {
-                    std::fs::create_dir_all(&dir)?;
+                    std::fs::create_dir_all(dir)?;
                     if move_files {
-                        util::move_file(&src, &target)?;
+                        util::move_file(&src, target)?;
                     } else {
-                        util::copy_file(&src, &target)?;
+                        util::copy_file(&src, target)?;
                     }
-                    Ok(target)
+                    Ok(target.clone())
                 })();
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                progress.update(d, files.len(), &f.file_name());
+                progress.update(d, total, &f.file_name());
                 (f.id.clone(), r)
             })
             .collect()
     });
     let mut n = 0;
-    for (id, r) in results {
-        match r {
-            Ok(p) => {
-                n += 1;
-                if move_files {
+    if let Some(tx) = tx {
+        for (id, r) in results {
+            match r {
+                Ok(p) => {
+                    n += 1;
                     // The file has moved: keep going, so later rows follow theirs.
-                    if let Err(e) = conn.execute(
+                    if let Err(e) = tx.execute(
                         "UPDATE fitsFile SET fitsFileName=?1 WHERE fitsFileId=?2",
                         params![util::normalize_path(&p), id],
                     ) {
                         log::warn!("{}: catalogue not updated: {e}", p.display());
                     }
                 }
+                Err(e) => log::warn!("export failed: {e:#}"),
             }
-            Err(e) => log::warn!("export failed: {e:#}"),
+        }
+        tx.commit()?;
+    } else {
+        for (_, r) in results {
+            match r {
+                Ok(_) => n += 1,
+                Err(e) => log::warn!("export failed: {e:#}"),
+            }
         }
     }
     Ok(n)
@@ -843,15 +928,17 @@ pub fn move_to_inbox(
     if !inbox.is_dir() {
         bail!("the inbox {} is not a folder", inbox.display());
     }
+    let real_inbox = inbox.canonicalize().unwrap_or_else(|_| inbox.to_path_buf());
     let excluded_name = |n: &std::ffi::OsStr| exclude.iter().any(|x| x.as_str() == n);
-    // A file at or under a folder whose name is on the exclude list.
-    let excluded_path = |p: &Path| {
-        p.components()
+    // Whether a path relative to a moved entry contains an excluded folder name.
+    let has_excluded_component = |rel: &Path| {
+        rel.components()
             .any(|c| matches!(c, std::path::Component::Normal(n) if excluded_name(n)))
     };
     let mut report = InboxReport::default();
     // (file, where it goes)
     let mut plan: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut moved_dirs: Vec<PathBuf> = Vec::new();
     for entry in entries {
         let Some(name) = entry.file_name() else {
             continue;
@@ -860,11 +947,23 @@ pub fn move_to_inbox(
             report.excluded.push(entry.clone());
             continue;
         }
+        let real_entry = entry.canonicalize().unwrap_or_else(|_| entry.clone());
+        if real_inbox.starts_with(&real_entry) {
+            bail!(
+                "cannot move {} because the inbox {} is inside it",
+                entry.display(),
+                inbox.display()
+            );
+        }
         if entry.is_dir() {
+            moved_dirs.push(entry.clone());
             for e in walkdir::WalkDir::new(entry)
                 .into_iter()
                 .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().is_file() && !excluded_path(e.path()))
+                .filter(|e| {
+                    let rel = e.path().strip_prefix(entry).unwrap_or(e.path());
+                    e.file_type().is_file() && !has_excluded_component(rel)
+                })
             {
                 let rel = e.path().strip_prefix(entry).unwrap_or(e.path());
                 plan.push((e.path().to_path_buf(), inbox.join(name).join(rel)));
@@ -874,11 +973,19 @@ pub fn move_to_inbox(
         }
     }
     // Excluded folders inside a moved entry stay too; report each of them once.
-    for entry in entries.iter().filter(|e| e.is_dir() && !excluded_path(e)) {
+    for entry in &moved_dirs {
         for d in walkdir::WalkDir::new(entry)
             .into_iter()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_dir() && excluded_name(e.file_name()))
+            .filter(|e| {
+                if !e.file_type().is_dir() || e.path() == entry {
+                    return false;
+                }
+                let Ok(rel) = e.path().strip_prefix(entry) else {
+                    return false;
+                };
+                excluded_name(e.file_name()) && !rel.parent().is_some_and(has_excluded_component)
+            })
         {
             report.excluded.push(d.path().to_path_buf());
         }
@@ -898,7 +1005,7 @@ pub fn move_to_inbox(
             Err(e) => report.errors.push((from.clone(), format!("{e:#}"))),
         }
     }
-    for entry in entries.iter().filter(|e| e.is_dir() && !excluded_path(e)) {
+    for entry in &moved_dirs {
         prune_except(entry, exclude);
         std::fs::remove_dir(entry).ok();
     }
@@ -906,14 +1013,20 @@ pub fn move_to_inbox(
 }
 
 /// Remove the folders `root` was emptied of, leaving any folder whose name is
-/// on `exclude` (and everything in it) in place. Returns how many were removed.
+/// on `exclude` (and everything inside it) in place. Returns how many were removed.
 fn prune_except(root: &Path, exclude: &[String]) -> usize {
     let excluded_name = |n: &std::ffi::OsStr| exclude.iter().any(|x| x.as_str() == n);
+    let under_excluded = |p: &Path| {
+        p.strip_prefix(root).is_ok_and(|rel| {
+            rel.components()
+                .any(|c| matches!(c, std::path::Component::Normal(n) if excluded_name(n)))
+        })
+    };
     let dirs: Vec<PathBuf> = walkdir::WalkDir::new(root)
         .contents_first(true)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_dir() && e.path() != root && !excluded_name(e.file_name()))
+        .filter(|e| e.file_type().is_dir() && e.path() != root && !under_excluded(e.path()))
         .map(|e| e.into_path())
         .collect();
     let mut removed = 0;
@@ -1110,12 +1223,14 @@ pub fn remove_duplicates(conn: &mut Connection) -> Result<(usize, u64)> {
                     .iter()
                     .position(|f| Path::new(&f.name).exists())
                     .unwrap_or(0);
-                let kept_hash = util::sha256_file(Path::new(&group[keep].name)).ok();
+                let keep_path = Path::new(&group[keep].name);
+                let kept_hash = util::sha256_file(keep_path).ok();
                 let same = group
                     .par_iter()
                     .map(|f| {
                         let path = Path::new(&f.name);
                         f.name == group[keep].name
+                            || util::same_file(path, keep_path)
                             || !path.exists()
                             || (kept_hash.is_some() && util::sha256_file(path).ok() == kept_hash)
                     })
@@ -1124,14 +1239,16 @@ pub fn remove_duplicates(conn: &mut Connection) -> Result<(usize, u64)> {
             })
             .collect()
     });
-    let mut to_delete = Vec::new();
-    let mut freed = 0;
+    let mut to_delete: Vec<(String, String, u64)> = Vec::new();
+    let mut alias_ids: Vec<String> = Vec::new();
     for (group, (keep, same)) in groups.iter().zip(checked) {
+        let keep_path = Path::new(&group[keep].name);
         for (i, f) in group.iter().enumerate() {
             if i != keep {
-                // Never delete the kept file even if two rows point at the same path.
-                if f.name == group[keep].name {
-                    conn.execute("DELETE FROM fitsFile WHERE fitsFileId=?1", [&f.id])?;
+                // Never delete the kept file even if two rows point at the same
+                // underlying file via symlinks, hardlinks, or case differences.
+                if f.name == group[keep].name || util::same_file(Path::new(&f.name), keep_path) {
+                    alias_ids.push(f.id.clone());
                     continue;
                 }
                 if !same[i] {
@@ -1142,12 +1259,26 @@ pub fn remove_duplicates(conn: &mut Connection) -> Result<(usize, u64)> {
                     );
                     continue;
                 }
-                freed += std::fs::metadata(&f.name).map(|m| m.len()).unwrap_or(0);
-                to_delete.push(f.id.clone());
+                let size = std::fs::metadata(&f.name).map(|m| m.len()).unwrap_or(0);
+                to_delete.push((f.id.clone(), f.name.clone(), size));
             }
         }
     }
-    let (n, _) = delete_files(conn, &to_delete, true)?;
+    if !alias_ids.is_empty() {
+        delete_files(conn, &alias_ids, false)?;
+    }
+    let ids: Vec<String> = to_delete.iter().map(|(id, _, _)| id.clone()).collect();
+    let (n, errors) = delete_files(conn, &ids, true)?;
+    let failed: std::collections::HashSet<&str> =
+        errors.iter().map(|(name, _)| name.as_str()).collect();
+    for (name, e) in &errors {
+        log::warn!("duplicate {name} not deleted: {e}");
+    }
+    let freed: u64 = to_delete
+        .iter()
+        .filter(|(_, name, _)| !failed.contains(name.as_str()))
+        .map(|(_, _, size)| *size)
+        .sum();
     Ok((n, freed))
 }
 
@@ -1991,6 +2122,110 @@ mod tests {
         assert_eq!(
             repo.join("a/x.fits").exists() as u8 + repo.join("b/x.fits").exists() as u8,
             1
+        );
+    }
+
+    #[test]
+    fn move_to_inbox_ignores_ancestor_exclude_and_keeps_excluded_subdirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Ancestor above `entry` happens to share a name with `inbox_exclude`.
+        let local = tmp.path().join("suspect_subs/downloads");
+        let inbox = tmp.path().join("inbox");
+        let night = local.join("M 31");
+        std::fs::create_dir_all(&inbox).unwrap();
+        std::fs::create_dir_all(night.join("suspect_subs/empty_child")).unwrap();
+        std::fs::write(night.join("a.fits"), "a").unwrap();
+
+        let exclude = ["suspect_subs".to_string()];
+        let r = move_to_inbox(std::slice::from_ref(&night), &inbox, &exclude, &NoProgress).unwrap();
+        assert_eq!((r.moved, r.excluded.len()), (1, 1), "{r:?}");
+        assert!(inbox.join("M 31/a.fits").exists());
+        assert!(
+            night.join("suspect_subs/empty_child").is_dir(),
+            "empty subdirs inside excluded folders must stay"
+        );
+    }
+
+    #[test]
+    fn export_flat_handles_same_basenames_without_overwriting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        for sub in ["d1", "d2", "d3"] {
+            std::fs::create_dir_all(repo.join(sub)).unwrap();
+            make_frame(
+                &repo.join(sub),
+                "stacked.fits",
+                "Light",
+                Some("M 31"),
+                "2024-10-01T21:00:00",
+                60.0,
+                None,
+                sub.as_bytes()[1] as f32,
+            );
+        }
+        let cfg = Config {
+            repo: repo.clone(),
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        ingest::ingest_folder(
+            &mut conn,
+            &cfg,
+            &repo,
+            ingest::IngestOptions::IN_PLACE,
+            &NoProgress,
+        )
+        .unwrap();
+        let ids: Vec<String> = db::all_files(&conn, false)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.id)
+            .collect();
+        let out = tmp.path().join("export");
+        let n = export_files(&mut conn, &ids, &out, ExportLayout::Flat, true, &NoProgress).unwrap();
+        assert_eq!(n, 3);
+        let exported: Vec<_> = std::fs::read_dir(&out).unwrap().flatten().collect();
+        assert_eq!(
+            exported.len(),
+            3,
+            "every file must keep its own unique name"
+        );
+    }
+
+    #[test]
+    fn layout_plan_handles_trailing_slash_in_repo_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let dir = repo.join("Light/M_76/RedCat_51/ZWO_ASI2600MM/20241001");
+        std::fs::create_dir_all(&dir).unwrap();
+        make_frame(
+            &dir,
+            "a.fits",
+            "Light",
+            Some("M 76"),
+            "2024-10-01T21:00:00",
+            60.0,
+            None,
+            1.0,
+        );
+        let cfg = Config {
+            repo: PathBuf::from(format!("{}/", repo.display())),
+            ..Default::default()
+        };
+        let mut conn = db::open(&tmp.path().join("t.db")).unwrap();
+        ingest::ingest_folder(
+            &mut conn,
+            &cfg,
+            &repo,
+            ingest::IngestOptions::IN_PLACE,
+            &NoProgress,
+        )
+        .unwrap();
+        let plan = layout_plan(&conn, &cfg).unwrap();
+        assert_eq!(
+            plan.len(),
+            1,
+            "trailing slash must not break DB prefix match"
         );
     }
 }

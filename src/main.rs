@@ -297,11 +297,24 @@ fn run(cli: Cli) -> Result<()> {
         // Every JPG/PNG that isn't a stacked-result preview goes, the user's
         // own pictures included: show them and ask before deleting.
         let (files, bytes) = batch::clean_previews(dir, true)?;
+        let user_pics: Vec<&PathBuf> = files
+            .iter()
+            .filter(|f| astrofiler::pictures::is_picture(f))
+            .collect();
         for f in files.iter().take(20) {
             println!("{}", f.display());
         }
         if files.len() > 20 {
             println!("... and {} more", files.len() - 20);
+        }
+        if !user_pics.is_empty() {
+            eprintln!(
+                "Warning: {} of these look like user-processed pictures (not telescope thumbnails/previews):",
+                user_pics.len()
+            );
+            for p in &user_pics {
+                eprintln!("  picture: {}", p.display());
+            }
         }
         if !*dry_run && !files.is_empty() {
             if !*yes {
@@ -594,6 +607,9 @@ fn run(cli: Cli) -> Result<()> {
                 r.moved,
                 r.errors.len()
             );
+            for (p, e) in r.errors {
+                println!("  {p}: {e}");
+            }
         }
         Cmd::Export {
             dest,
@@ -645,10 +661,9 @@ fn run(cli: Cli) -> Result<()> {
                 r.mismatched.len()
             );
             if prune && !r.missing.is_empty() {
-                println!(
-                    "removed {} catalogue entries",
-                    batch::remove_missing(&mut conn, &NoProgress)?
-                );
+                let ids: Vec<String> = r.missing.into_iter().map(|f| f.id).collect();
+                let (removed, _) = batch::delete_files(&mut conn, &ids, false)?;
+                println!("removed {removed} catalogue entries");
             }
         }
         Cmd::MigrateLayout { dry_run } => {
@@ -742,7 +757,12 @@ fn select_files(
     session: Option<&str>,
 ) -> Result<Vec<db::FitsFile>> {
     match (object, session) {
-        (Some(o), _) => db::files_where(
+        (Some(o), Some(s)) => db::files_where(
+            conn,
+            "fitsFileObject=?1 AND fitsFileSession=?2 AND COALESCE(fitsFileSoftDelete,0)=0",
+            &[&o, &s],
+        ),
+        (Some(o), None) => db::files_where(
             conn,
             "fitsFileObject=?1 AND COALESCE(fitsFileSoftDelete,0)=0",
             &[&o],

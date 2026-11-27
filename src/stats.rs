@@ -25,9 +25,15 @@ pub struct Stats {
     pub by_type: Vec<(String, usize)>,
 }
 
-fn sorted<V: PartialOrd + Copy>(m: BTreeMap<String, V>) -> Vec<(String, V)> {
+fn sorted<V: Ord + Copy>(m: BTreeMap<String, V>) -> Vec<(String, V)> {
     let mut v: Vec<_> = m.into_iter().collect();
-    v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    v.sort_by_key(|a| std::cmp::Reverse(a.1));
+    v
+}
+
+fn sorted_f64(m: BTreeMap<String, f64>) -> Vec<(String, f64)> {
+    let mut v: Vec<_> = m.into_iter().collect();
+    v.sort_by(|a, b| b.1.total_cmp(&a.1));
     v
 }
 
@@ -49,22 +55,27 @@ pub fn compute(conn: &Connection) -> Result<Stats> {
     let mut typ: BTreeMap<String, usize> = BTreeMap::new();
     for f in &files {
         let t = f.image_type.clone().unwrap_or_default();
-        let is_light = t.contains("LIGHT");
+        let is_light = crate::util::is_light(&t);
         let exp: f64 = f
             .exptime
             .as_deref()
-            .and_then(|e| e.trim().parse().ok())
+            .and_then(|e| e.trim().parse::<f64>().ok())
+            .filter(|e| e.is_finite() && *e >= 0.0)
             .unwrap_or(0.0);
         if is_light {
             s.light_files += 1;
-            let e = obj
-                .entry(f.object.clone().unwrap_or_else(|| "Unknown".into()))
-                .or_default();
-            e.0 += 1;
-            e.1 += exp;
-            *filt
-                .entry(f.filter.clone().unwrap_or_else(|| "OSC".into()))
-                .or_default() += exp;
+            // Stacked results carry total integration time and would double-count
+            // their sub-frames if added into integration totals.
+            if !f.stacked {
+                let e = obj
+                    .entry(f.object.clone().unwrap_or_else(|| "Unknown".into()))
+                    .or_default();
+                e.0 += 1;
+                e.1 += exp;
+                *filt
+                    .entry(f.filter.clone().unwrap_or_else(|| "OSC".into()))
+                    .or_default() += exp;
+            }
         } else {
             s.calibration_files += 1;
         }
@@ -89,7 +100,7 @@ pub fn compute(conn: &Connection) -> Result<Stats> {
     let mut by_object: Vec<_> = obj.into_iter().map(|(k, (n, e))| (k, n, e)).collect();
     by_object.sort_by(|a, b| b.2.total_cmp(&a.2));
     s.by_object = by_object;
-    s.by_filter = sorted(filt);
+    s.by_filter = sorted_f64(filt);
     s.by_telescope = sorted(tel);
     s.by_instrument = sorted(ins);
     s.by_type = sorted(typ);

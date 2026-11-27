@@ -36,7 +36,7 @@ fn pictures_under(dir: &Path, skip: &[PathBuf], out: &mut Vec<PathBuf>) {
     };
     for e in rd.flatten() {
         let p = e.path();
-        if p.is_dir() {
+        if e.file_type().is_ok_and(|t| t.is_dir()) {
             if !skip.contains(&p) {
                 pictures_under(&p, skip, out);
             }
@@ -105,13 +105,13 @@ pub fn file(cfg: &Config, src: &Path, filed: &[(PathBuf, PathBuf)], opts: Ingest
             .collect();
         // A preview of every sub-frame is the telescope's doing, not the
         // user's; one or two pictures named like a frame are the user's.
-        let twin = beside.iter().find(|(a, _)| stem(a) == stem(&pic));
+        let twin = beside.iter().find(|(a, _)| stem(a) == stem(pic));
         let frame_twin = |p: &Path| {
             beside
                 .iter()
                 .any(|(a, b)| stem(a) == stem(p) && top(b).as_deref() != Some("Stacked"))
         };
-        if frame_twin(&pic)
+        if frame_twin(pic)
             && pictures
                 .iter()
                 .filter(|p| p.parent() == Some(dir) && frame_twin(p))
@@ -153,13 +153,18 @@ pub fn file(cfg: &Config, src: &Path, filed: &[(PathBuf, PathBuf)], opts: Ingest
         if dest == pic {
             continue;
         }
-        let same_size = |a: &Path, b: &Path| match (a.metadata(), b.metadata()) {
-            (Ok(x), Ok(y)) => x.len() == y.len(),
+        let same_picture = |a: &Path, b: &Path| match (a.metadata(), b.metadata()) {
+            (Ok(x), Ok(y)) if x.len() == y.len() => {
+                matches!(
+                    (util::sha256_file(a), util::sha256_file(b)),
+                    (Ok(ha), Ok(hb)) if ha == hb
+                )
+            }
             _ => false,
         };
         // Pictures keep their names: one that is taken stays where it is.
         if dest.exists() {
-            if same_size(pic, &dest) {
+            if same_picture(pic, &dest) {
                 log::info!("{}: already at {}", pic.display(), dest.display());
             } else {
                 log::warn!(
@@ -176,9 +181,9 @@ pub fn file(cfg: &Config, src: &Path, filed: &[(PathBuf, PathBuf)], opts: Ingest
             continue;
         }
         let done = if opts.placement == Placement::Move {
-            util::move_file(&pic, &dest)
+            util::move_file(pic, &dest)
         } else {
-            util::copy_file(&pic, &dest).map(|_| ())
+            util::copy_file(pic, &dest).map(|_| ())
         };
         match done {
             Ok(()) => {
@@ -209,7 +214,20 @@ pub fn follow(cfg: &Config, moved: &[(PathBuf, PathBuf)]) {
             dirs.insert((a.to_path_buf(), b.to_path_buf()));
         }
     }
+    let has_frames = |dir: &Path| {
+        walkdir::WalkDir::new(dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_type().is_file()
+                    && util::is_supported_file(e.path())
+                    && !util::is_sidecar(e.path())
+            })
+    };
     for (old, new) in dirs {
+        if has_frames(&old) {
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(&old) else {
             continue;
         };

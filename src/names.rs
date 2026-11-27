@@ -273,11 +273,11 @@ const GENERIC: &[&str] = &[
     "temp",
 ];
 
-/// The catalogue designation a folder name starts with, as written:
-/// "NGC 1333 Embryo Nebula" -> "NGC 1333", "Sh 2-132_Lion Nebula_EXP_30" ->
-/// "Sh 2-132", "SH2-158 Northern Lagoon" -> "SH2-158", "C4 Iris" -> "C4".
-fn designation(name: &str) -> Option<String> {
-    let name = name.trim();
+/// Splits a name that starts with a catalogue number into that designation
+/// (as written) and the remaining suffix:
+/// "NGC 1333 Embryo Nebula" -> ("NGC 1333", " Embryo Nebula"),
+/// "Sh 2-132_Lion Nebula_EXP_30" -> ("Sh 2-132", "_Lion Nebula_EXP_30").
+pub(crate) fn split_designation(name: &str) -> Option<(String, &str)> {
     let prefix_len = name.chars().take_while(|c| c.is_ascii_alphabetic()).count();
     let prefix = &name[..prefix_len];
     if !CATALOGUES.iter().any(|c| c.eq_ignore_ascii_case(prefix)) {
@@ -303,11 +303,12 @@ fn designation(name: &str) -> Option<String> {
     {
         return None;
     }
-    Some(format!(
-        "{prefix}{}{}",
-        &rest[..gap].replace('_', " "),
-        &num[..end]
-    ))
+    let object = format!("{prefix}{}{}", rest[..gap].replace('_', " "), &num[..end]);
+    Some((object, &num[end..]))
+}
+
+fn designation(name: &str) -> Option<String> {
+    split_designation(name.trim()).map(|(object, _)| object)
 }
 
 fn is_generic(name: &str) -> bool {

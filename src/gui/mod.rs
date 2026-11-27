@@ -14,9 +14,13 @@ use eframe::egui::{self, Align2, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 pub fn run(cfg: Config) -> Result<()> {
     let options = eframe::NativeOptions {
@@ -130,10 +134,13 @@ pub struct App {
     scope: ScopeUi,
     /// What is in the download folder, and which of it is ticked.
     local: Arc<Mutex<Vec<LocalEntry>>>,
+    local_gen: Arc<AtomicU64>,
     local_sel: HashSet<PathBuf>,
     /// Folder `local` was listed from (None = not listed yet).
     local_dir: Option<String>,
     cfg_edit: Config,
+    /// Editable text buffer for `cfg_edit.inbox_exclude` so commas/spaces can be typed freely.
+    inbox_exclude_text: String,
 }
 
 impl App {
@@ -144,6 +151,7 @@ impl App {
         } else {
             egui::Visuals::dark()
         });
+        let inbox_exclude_text = cfg.inbox_exclude.join(", ");
         let mut app = App {
             allow_close: false,
             applied_zoom: None,
@@ -168,9 +176,11 @@ impl App {
                 dest: cfg.source.to_string_lossy().into(),
             },
             local: Arc::new(Mutex::new(vec![])),
+            local_gen: Arc::new(AtomicU64::new(0)),
             local_sel: HashSet::new(),
             local_dir: None,
             cfg_edit: cfg.clone(),
+            inbox_exclude_text,
             cfg,
         };
         // Offer USB telescopes straight away.
@@ -185,7 +195,7 @@ impl App {
                 app.scope.usb_path = p.to_string_lossy().into();
             }
         }
-        *app.scope.found.lock().unwrap() = usb;
+        *lock(&app.scope.found) = usb;
         app
     }
 
@@ -229,7 +239,7 @@ impl App {
             .partition(|j| j.state.done.load(Ordering::SeqCst));
         self.jobs = running;
         for job in finished {
-            let result = job.state.result.lock().unwrap().take();
+            let result = lock(&job.state.result).take();
             let ok = matches!(result, Some(Ok(_)));
             self.status = match result {
                 Some(Ok(msg)) => format!("{}: {msg}", job.name),
@@ -237,7 +247,7 @@ impl App {
                 None => String::new(),
             };
             if job.name.ends_with(" telescope") {
-                let n = self.scope.files.lock().unwrap().len();
+                let n = lock(&self.scope.files).len();
                 self.scope.selected = vec![false; n];
                 self.scope.anchor = None;
             }
@@ -271,6 +281,13 @@ impl App {
         } else {
             format!("http://{base}{page}")
         };
+        let lower = url.to_ascii_lowercase();
+        if !(lower.starts_with("http://") || lower.starts_with("https://"))
+            || url.chars().any(|c| c.is_control())
+        {
+            self.status = format!("Refusing to open invalid web URL: {url}");
+            return;
+        }
         if let Err(e) = util::open_external("", Path::new(&url)) {
             self.status = format!("Could not open {url}: {e:#}");
         }
@@ -422,7 +439,7 @@ impl App {
         ui.label("FITS files and DWARF session info (shotsInfo.json) are transferred — the telescope's JPG/PNG previews and thumbnails are skipped. They are saved in the telescope's own folders.");
         ui.add_space(6.0);
 
-        let found = self.scope.found.lock().unwrap().clone();
+        let found = lock(&self.scope.found).clone();
         ui.horizontal_wrapped(|ui| {
             ui.label("Detected:");
             if found.is_empty() {
@@ -447,7 +464,7 @@ impl App {
                 }
             }
             if ui.button("🔌 Detect USB").clicked() {
-                *self.scope.found.lock().unwrap() = telescope::find_usb();
+                *lock(&self.scope.found) = telescope::find_usb();
             }
             if ui.button("📡 Scan Wi-Fi").clicked() {
                 let slot = self.scope.found.clone();
@@ -457,7 +474,7 @@ impl App {
                         all.extend(telescope::find_network(cfg, *t, p));
                     }
                     let n = all.len();
-                    *slot.lock().unwrap() = all;
+                    *lock(&slot) = all;
                     Ok(format!("{n} telescope(s) found"))
                 });
             }
@@ -538,7 +555,7 @@ impl App {
         };
         let t = scopes[self.scope.telescope.min(scopes.len() - 1)];
         ui.horizontal(|ui| {
-            if ui.button(format!("🔍 Connect & list files")).clicked() {
+            if ui.button("🔍 Connect & list files").clicked() {
                 let slot = self.scope.files.clone();
                 let link = link.clone();
                 let stacked = self.scope.include_stacked;
@@ -548,13 +565,13 @@ impl App {
                     let files = s.scan(stacked)?;
                     let n = files.len();
                     let size: u64 = files.iter().map(|f| f.size).sum();
-                    *slot.lock().unwrap() = files;
+                    *lock(&slot) = files;
                     Ok(format!("{n} files ({})", util::human_size(size)))
                 });
             }
         });
 
-        let files = self.scope.files.lock().unwrap().clone();
+        let files = lock(&self.scope.files).clone();
         if self.scope.selected.len() != files.len() {
             self.scope.selected = vec![false; files.len()];
         }
@@ -635,7 +652,9 @@ impl App {
                 .on_hover_text("Delete from the telescope without downloading")
                 .clicked()
             {
-                // A fully ticked folder goes as a whole, previews included.
+                // Only delete a whole folder (including previews) when stacked
+                // results are also shown; otherwise unlisted stacked files in
+                // that folder would be deleted with it.
                 let mut folders = Vec::new();
                 let mut single = Vec::new();
                 for (_, idx) in &groups {
@@ -646,7 +665,9 @@ impl App {
                         .collect();
                     let dir = files[idx[0]].path.rsplit_once('/').map(|(d, _)| d);
                     match dir {
-                        Some(d) if picked.len() == idx.len() => folders.push(d.to_string()),
+                        Some(d) if self.scope.include_stacked && picked.len() == idx.len() => {
+                            folders.push(d.to_string())
+                        }
                         _ => single.extend(picked.into_iter().map(|i| files[i].clone())),
                     }
                 }
@@ -795,11 +816,7 @@ impl App {
     }
 
     fn start_download(&mut self, delete: bool) {
-        let files: Vec<RemoteFile> = self
-            .scope
-            .files
-            .lock()
-            .unwrap()
+        let files: Vec<RemoteFile> = lock(&self.scope.files)
             .iter()
             .zip(&self.scope.selected)
             .filter(|(_, s)| **s)
@@ -823,7 +840,7 @@ impl App {
             }
             // Rescan so the list reflects what is left on the telescope.
             if let Ok(left) = s.scan(stacked) {
-                *slot.lock().unwrap() = left;
+                *lock(&slot) = left;
             }
             Ok(r.summary())
         });
@@ -847,7 +864,7 @@ impl App {
             }
             // Rescan so the list reflects what is left on the telescope.
             if let Ok(left) = s.scan(stacked) {
-                *slot.lock().unwrap() = left;
+                *lock(&slot) = left;
             }
             Ok(r.summary())
         });
@@ -859,8 +876,10 @@ impl App {
     fn list_local(&mut self, ctx: &egui::Context) {
         let dir = self.scope.dest.clone();
         self.local_dir = Some(dir.clone());
-        let (slot, ctx, exclude) = (
+        let gen = self.local_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let (slot, gen_counter, ctx, exclude) = (
             self.local.clone(),
+            self.local_gen.clone(),
             ctx.clone(),
             self.cfg.inbox_exclude.clone(),
         );
@@ -895,8 +914,10 @@ impl App {
                 })
                 .collect();
             entries.sort_by_key(|e| e.name.to_lowercase());
-            *slot.lock().unwrap() = entries;
-            ctx.request_repaint();
+            if gen_counter.load(Ordering::SeqCst) == gen {
+                *lock(&slot) = entries;
+                ctx.request_repaint();
+            }
         });
     }
 
@@ -904,7 +925,7 @@ impl App {
         if self.local_dir.as_deref() != Some(self.scope.dest.as_str()) {
             self.list_local(ctx);
         }
-        let entries = self.local.lock().unwrap().clone();
+        let entries = lock(&self.local).clone();
         self.local_sel
             .retain(|p| entries.iter().any(|e| &e.path == p && !e.excluded));
         let inbox = self.cfg.inbox.clone();
@@ -1039,6 +1060,7 @@ impl App {
     fn config_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let auto = self.auto_zoom(ctx);
         let c = &mut self.cfg_edit;
+        let exclude_text = &mut self.inbox_exclude_text;
         let picker = &mut self.picker;
         egui::Grid::new("cfg")
             .num_columns(3)
@@ -1081,12 +1103,11 @@ impl App {
                 );
                 ui.label("Inbox excludes")
                     .on_hover_text("Folders with these names stay in the download folder when you send to the inbox; comma-separated");
-                let mut s = c.inbox_exclude.join(", ");
                 if ui
-                    .add(egui::TextEdit::singleline(&mut s).desired_width(420.0))
+                    .add(egui::TextEdit::singleline(exclude_text).desired_width(420.0))
                     .changed()
                 {
-                    c.inbox_exclude = s
+                    c.inbox_exclude = exclude_text
                         .split(',')
                         .map(|n| n.trim().to_string())
                         .filter(|n| !n.is_empty())
@@ -1156,6 +1177,7 @@ impl App {
                         self.scope.dest = self.cfg_edit.source.to_string_lossy().into();
                     }
                     self.cfg = self.cfg_edit.clone();
+                    self.inbox_exclude_text = self.cfg.inbox_exclude.join(", ");
                     // The excludes may have changed: list the download folder anew.
                     self.local_dir = None;
                     ctx.style_mut(interaction_style);

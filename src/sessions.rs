@@ -208,21 +208,23 @@ pub fn clear_all(conn: &mut Connection) -> Result<usize> {
 
 /// Remove one session and unassign its files.
 pub fn delete(conn: &Connection, session_id: &str) -> Result<()> {
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "UPDATE fitsFile SET fitsFileSession=NULL WHERE fitsFileSession=?1",
         [session_id],
     )?;
-    conn.execute(
+    tx.execute(
         "DELETE FROM fitsSession WHERE fitsSessionId=?1",
         [session_id],
     )?;
+    tx.commit()?;
     Ok(())
 }
 
 pub fn session_files(conn: &Connection, session_id: &str) -> Result<Vec<FitsFile>> {
     db::files_where(
         conn,
-        "fitsFileSession=?1 ORDER BY fitsFileDate",
+        "fitsFileSession=?1 AND COALESCE(fitsFileSoftDelete,0)=0 ORDER BY fitsFileDate",
         &[&session_id],
     )
 }

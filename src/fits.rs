@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 
 pub const BLOCK: usize = 2880;
 const CARD: usize = 80;
+/// Maximum uncompressed size accepted when expanding a gzip-wrapped FITS into memory.
+const MAX_GZIP_BYTES: u64 = 2 << 30;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -163,28 +165,33 @@ impl Header {
     }
 
     fn naxes(&self) -> Vec<usize> {
-        let n = self.get_i64("NAXIS").unwrap_or(0).max(0) as usize;
+        let n = self.get_i64("NAXIS").unwrap_or(0).clamp(0, 999) as usize;
         (1..=n)
             .map(|i| self.get_i64(&format!("NAXIS{i}")).unwrap_or(0).max(0) as usize)
             .collect()
     }
 
-    /// Size in bytes of the data unit (unpadded).
-    fn data_len(&self) -> u64 {
+    /// Size in bytes of the data unit (unpadded), with overflow checking.
+    fn checked_data_len(&self) -> Result<u64> {
         let bitpix = self.get_i64("BITPIX").unwrap_or(8);
         let naxes = self.naxes();
         if naxes.is_empty() {
-            return 0;
+            return Ok(0);
         }
         let groups = matches!(self.get("GROUPS"), Some(Value::Bool(true)));
-        let prod: u64 = naxes
+        let prod = naxes
             .iter()
             .skip(if groups { 1 } else { 0 })
-            .map(|&n| n as u64)
-            .product();
+            .try_fold(1u64, |acc, &n| acc.checked_mul(n as u64))
+            .ok_or_else(|| anyhow!("FITS NAXIS dimensions overflow"))?;
         let pcount = self.get_i64("PCOUNT").unwrap_or(0).max(0) as u64;
         let gcount = self.get_i64("GCOUNT").unwrap_or(1).max(1) as u64;
-        (bitpix.unsigned_abs() / 8) * gcount * (pcount + prod)
+        let bpp = bitpix.unsigned_abs() / 8;
+        pcount
+            .checked_add(prod)
+            .and_then(|n| n.checked_mul(gcount))
+            .and_then(|n| n.checked_mul(bpp))
+            .ok_or_else(|| anyhow!("FITS data size overflows"))
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -211,13 +218,32 @@ fn pad_to_block(buf: &mut Vec<u8>, fill: u8) {
 }
 
 fn format_card(card: &Card) -> [u8; CARD] {
+    let key: String = card
+        .key
+        .chars()
+        .filter(|c| c.is_ascii() && !c.is_ascii_control() && *c != '=')
+        .take(8)
+        .collect();
     let mut s = match &card.value {
-        Value::Commentary(text) => format!("{:<8}{}", card.key, text),
+        Value::Commentary(text) => format!("{key:<8}{text}"),
         Value::Str(v) => {
-            let escaped = v.replace('\'', "''");
+            let clean: String = v
+                .chars()
+                .filter(|c| c.is_ascii() && !c.is_ascii_control())
+                .collect();
+            let mut escaped = clean.replace('\'', "''");
+            // Columns 1..10 are `KEY     = `, leaving 70 bytes for `'...'` (max 68 inner bytes).
+            if escaped.len() > 68 {
+                escaped.truncate(68);
+                // Do not leave a dangling half of an escaped `''` quote pair.
+                let trailing_quotes = escaped.bytes().rev().take_while(|&b| b == b'\'').count();
+                if trailing_quotes % 2 == 1 {
+                    escaped.pop();
+                }
+            }
             let quoted = format!("'{escaped:<8}'");
-            let mut s = format!("{:<8}= {:<20}", card.key, quoted);
-            if !card.comment.is_empty() {
+            let mut s = format!("{key:<8}= {quoted:<20}");
+            if !card.comment.is_empty() && s.len() + 3 < CARD {
                 s.push_str(" / ");
                 s.push_str(&card.comment);
             }
@@ -236,7 +262,7 @@ fn format_card(card: &Card) -> [u8; CARD] {
                 }
                 _ => String::new(),
             };
-            let mut s = format!("{:<8}= {:>20}", card.key, v);
+            let mut s = format!("{key:<8}= {v:>20}");
             if !card.comment.is_empty() {
                 s.push_str(" / ");
                 s.push_str(&card.comment);
@@ -359,7 +385,7 @@ fn read_header<R: Read>(r: &mut R) -> Result<Option<(Header, u64)>> {
             bail!("not a FITS file (missing SIMPLE/XTENSION)");
         }
         consumed += BLOCK as u64;
-        for raw in block.chunks_exact(CARD) {
+        for raw in block.as_chunks::<CARD>().0 {
             if &raw[..8] == b"END     " {
                 merge_continue_cards(&mut header);
                 return Ok(Some((header, consumed)));
@@ -372,6 +398,26 @@ fn read_header<R: Read>(r: &mut R) -> Result<Option<(Header, u64)>> {
     }
 }
 
+/// Parse a FITS single-quoted string starting right after the opening `'`.
+fn parse_fits_quoted(stripped: &str) -> (String, usize) {
+    let chars: Vec<char> = stripped.chars().collect();
+    let mut value = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\'' {
+            if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                value.push('\'');
+                i += 2;
+                continue;
+            }
+            break;
+        }
+        value.push(chars[i]);
+        i += 1;
+    }
+    (value, i)
+}
+
 /// Fold long-string CONTINUE cards into the preceding string value.
 fn merge_continue_cards(header: &mut Header) {
     let mut merged: Vec<Card> = Vec::with_capacity(header.cards.len());
@@ -382,11 +428,10 @@ fn merge_continue_cards(header: &mut Header) {
                     if s.ends_with('&') {
                         s.pop();
                         let t = text.trim_start();
-                        let part = t
-                            .strip_prefix('\'')
-                            .and_then(|t| t.split('\'').next())
-                            .unwrap_or("");
-                        s.push_str(part);
+                        if let Some(stripped) = t.strip_prefix('\'') {
+                            let (part, _) = parse_fits_quoted(stripped);
+                            s.push_str(part.trim_end());
+                        }
                         continue;
                     }
                 }
@@ -424,7 +469,11 @@ pub fn read_primary_header(path: &Path) -> Result<Header> {
     let (mut header, _) = read_header(&mut reader)?.ok_or_else(|| anyhow!("empty FITS file"))?;
     // Tile-compressed files keep their real metadata in the first extension.
     if header.get_i64("NAXIS") == Some(0) && header.cards.len() < 12 {
-        let skip = header.data_len().div_ceil(BLOCK as u64) * BLOCK as u64;
+        let skip = header
+            .checked_data_len()?
+            .div_ceil(BLOCK as u64)
+            .checked_mul(BLOCK as u64)
+            .ok_or_else(|| anyhow!("FITS data size overflows"))?;
         std::io::copy(&mut reader.by_ref().take(skip), &mut std::io::sink())?;
         if let Some((ext, _)) = read_header(&mut reader)? {
             if matches!(ext.get("ZIMAGE"), Some(Value::Bool(true))) {
@@ -474,14 +523,25 @@ impl Seek for Source {
     }
 }
 
+fn gunzip_bounded<R: Read>(r: R) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut dec = GzDecoder::new(r).take(MAX_GZIP_BYTES + 1);
+    dec.read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_GZIP_BYTES {
+        bail!(
+            "gzip-compressed FITS exceeds {} bytes limit",
+            MAX_GZIP_BYTES
+        );
+    }
+    Ok(buf)
+}
+
 impl FitsFile {
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let mut buffered = BufReader::with_capacity(1 << 20, file);
         let source = if std::io::BufRead::fill_buf(&mut buffered)?.starts_with(&[0x1f, 0x8b]) {
-            let mut buf = Vec::new();
-            GzDecoder::new(buffered).read_to_end(&mut buf)?;
-            Source::Mem(Cursor::new(buf))
+            Source::Mem(Cursor::new(gunzip_bounded(buffered)?))
         } else {
             Source::File(buffered)
         };
@@ -491,9 +551,7 @@ impl FitsFile {
     /// A whole file already in memory (gzip or plain).
     pub fn from_bytes(bytes: Vec<u8>, path: &Path) -> Result<Self> {
         let bytes = if bytes.starts_with(&[0x1f, 0x8b]) {
-            let mut buf = Vec::new();
-            GzDecoder::new(&bytes[..]).read_to_end(&mut buf)?;
-            buf
+            gunzip_bounded(&bytes[..])?
         } else {
             bytes
         };
@@ -515,9 +573,17 @@ impl FitsFile {
             else {
                 break;
             };
-            let data_start = pos + consumed;
-            let data_len = header.data_len();
-            pos = data_start + data_len.div_ceil(BLOCK as u64) * BLOCK as u64;
+            let data_start = pos
+                .checked_add(consumed)
+                .ok_or_else(|| anyhow!("FITS HDU offset overflow"))?;
+            let data_len = header.checked_data_len()?;
+            let padded = data_len
+                .div_ceil(BLOCK as u64)
+                .checked_mul(BLOCK as u64)
+                .ok_or_else(|| anyhow!("FITS data size overflow"))?;
+            pos = data_start
+                .checked_add(padded)
+                .ok_or_else(|| anyhow!("FITS HDU offset overflow"))?;
             hdus.push(HduInfo {
                 header,
                 data_start,
@@ -562,13 +628,35 @@ impl FitsFile {
         let info = &self.hdus[hdu];
         let h = &info.header;
         let bitpix = h.get_i64("BITPIX").unwrap_or(16);
+        if !matches!(bitpix, 8 | 16 | 32 | 64 | -32 | -64) {
+            bail!("unsupported FITS BITPIX {bitpix}");
+        }
         let bzero = h.get_f64("BZERO").unwrap_or(0.0);
         let bscale = h.get_f64("BSCALE").unwrap_or(1.0);
-        let width = h.naxes()[0];
+        let width = *h
+            .naxes()
+            .first()
+            .ok_or_else(|| anyhow!("FITS image has no NAXIS1"))?;
         let bpp = (bitpix.unsigned_abs() / 8) as usize;
-        let offset = info.data_start + (row * width * bpp) as u64;
-        let count = nrows * width;
-        let mut raw = vec![0u8; count * bpp];
+        let byte_off = (row as u64)
+            .checked_mul(width as u64)
+            .and_then(|n| n.checked_mul(bpp as u64))
+            .ok_or_else(|| anyhow!("FITS row offset overflow"))?;
+        let byte_len = nrows
+            .checked_mul(width)
+            .and_then(|n| n.checked_mul(bpp))
+            .ok_or_else(|| anyhow!("FITS read size overflow"))?;
+        if byte_off
+            .checked_add(byte_len as u64)
+            .is_none_or(|end| end > info.data_len)
+        {
+            bail!("requested FITS rows exceed HDU data length");
+        }
+        let offset = info
+            .data_start
+            .checked_add(byte_off)
+            .ok_or_else(|| anyhow!("FITS seek offset overflow"))?;
+        let mut raw = vec![0u8; byte_len];
         self.source.seek(SeekFrom::Start(offset))?;
         self.source
             .read_exact(&mut raw)
@@ -579,7 +667,11 @@ impl FitsFile {
     pub fn read_image(&mut self) -> Result<Image> {
         let hdu = self.image_hdu()?;
         let shape = self.shape(hdu);
-        let data = self.read_rows(hdu, 0, shape.height * shape.planes)?;
+        let rows = shape
+            .height
+            .checked_mul(shape.planes)
+            .ok_or_else(|| anyhow!("FITS image dimensions overflow"))?;
+        let data = self.read_rows(hdu, 0, rows)?;
         Ok(Image {
             header: self.hdus[hdu].header.clone(),
             shape,
@@ -594,21 +686,29 @@ fn decode_pixels(raw: &[u8], bitpix: i64, bzero: f64, bscale: f64) -> Vec<f32> {
     match bitpix {
         8 => raw.iter().map(|&b| scale(b as f64)).collect(),
         16 => raw
-            .chunks_exact(2)
-            .map(|c| scale(i16::from_be_bytes([c[0], c[1]]) as f64))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| scale(i16::from_be_bytes(c) as f64))
             .collect(),
         32 => raw
-            .chunks_exact(4)
-            .map(|c| scale(i32::from_be_bytes([c[0], c[1], c[2], c[3]]) as f64))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| scale(i32::from_be_bytes(c) as f64))
             .collect(),
         64 => raw
-            .chunks_exact(8)
-            .map(|c| scale(i64::from_be_bytes(c.try_into().unwrap()) as f64))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|&c| scale(i64::from_be_bytes(c) as f64))
             .collect(),
         -32 => raw
-            .chunks_exact(4)
-            .map(|c| {
-                let v = f32::from_be_bytes([c[0], c[1], c[2], c[3]]);
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| {
+                let v = f32::from_be_bytes(c);
                 if identity {
                     v
                 } else {
@@ -617,8 +717,10 @@ fn decode_pixels(raw: &[u8], bitpix: i64, bzero: f64, bscale: f64) -> Vec<f32> {
             })
             .collect(),
         -64 => raw
-            .chunks_exact(8)
-            .map(|c| scale(f64::from_be_bytes(c.try_into().unwrap())))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|&c| scale(f64::from_be_bytes(c)))
             .collect(),
         _ => Vec::new(),
     }
@@ -634,6 +736,9 @@ pub struct ImageShape {
 impl ImageShape {
     pub fn len(&self) -> usize {
         self.width * self.height * self.planes
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
     pub fn rows(&self) -> usize {
         self.height * self.planes
@@ -699,7 +804,7 @@ pub fn write_image(
     }
 
     let tmp = tmp_path(path);
-    {
+    let written = (|| -> Result<()> {
         let mut w = BufWriter::with_capacity(1 << 20, File::create(&tmp)?);
         w.write_all(&h.to_bytes())?;
         let mut buf = Vec::with_capacity(data.len() * 4);
@@ -723,14 +828,19 @@ pub fn write_image(
         pad_to_block(&mut buf, 0);
         w.write_all(&buf)?;
         w.flush()?;
+        drop(w);
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if written.is_err() {
+        std::fs::remove_file(&tmp).ok();
     }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    written
 }
 
 pub(crate) fn tmp_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".astrofiler-tmp");
+    name.push(format!(".{}.astrofiler-tmp", uuid::Uuid::new_v4().simple()));
     path.with_file_name(name)
 }
 
@@ -767,26 +877,37 @@ pub fn rewrite_primary_header(path: &Path, header: &Header) -> Result<()> {
     if is_gzip(path) {
         bail!("refusing to rewrite header of gzip-compressed file");
     }
-    let mut file = File::open(path)?;
-    let (_, old_len) =
-        read_header(&mut BufReader::new(&mut file))?.ok_or_else(|| anyhow!("empty FITS file"))?;
+    // Close the read handle before writing or renaming over `path` (Windows/SMB).
+    let old_len = {
+        let mut file = File::open(path)?;
+        read_header(&mut BufReader::new(&mut file))?
+            .ok_or_else(|| anyhow!("empty FITS file"))?
+            .1
+    };
     let new_bytes = header.to_bytes();
     if new_bytes.len() as u64 == old_len {
         let mut f = std::fs::OpenOptions::new().write(true).open(path)?;
         f.write_all(&new_bytes)?;
+        f.flush()?;
         return Ok(());
     }
     let tmp = tmp_path(path);
-    {
+    let written = (|| -> Result<()> {
         let mut src = File::open(path)?;
         src.seek(SeekFrom::Start(old_len))?;
         let mut w = BufWriter::new(File::create(&tmp)?);
         w.write_all(&new_bytes)?;
         std::io::copy(&mut src, &mut w)?;
         w.flush()?;
+        drop(w);
+        drop(src);
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if written.is_err() {
+        std::fs::remove_file(&tmp).ok();
     }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    written
 }
 
 #[cfg(test)]
@@ -857,5 +978,34 @@ mod tests {
         let img = read_image(&p).unwrap();
         assert_eq!(img.data, data);
         assert_eq!(img.header.get_i64("KEY59"), Some(59));
+    }
+
+    #[test]
+    fn long_strings_and_continue_cards_stay_valid() {
+        let long = format!("{}'", "x".repeat(67));
+        let card = Card {
+            key: "OBJECT".into(),
+            value: Value::Str(long),
+            comment: "comment".into(),
+        };
+        let raw = format_card(&card);
+        let text = std::str::from_utf8(&raw).unwrap();
+        // Must end with a closing quote inside 80 bytes and round-trip cleanly.
+        assert!(text.trim_end().ends_with('\''), "{text}");
+        let parsed = parse_card(&raw);
+        assert_eq!(parsed.value, Value::Str("x".repeat(67)));
+
+        let mut h = Header::default();
+        h.cards.push(parse_card(
+            format!("{:<80}", "NOTES   = 'first part &'").as_bytes(),
+        ));
+        h.cards.push(parse_card(
+            format!("{:<80}", "CONTINUE  'it''s continued'").as_bytes(),
+        ));
+        merge_continue_cards(&mut h);
+        assert_eq!(
+            h.get_str("NOTES").as_deref(),
+            Some("first part it's continued")
+        );
     }
 }

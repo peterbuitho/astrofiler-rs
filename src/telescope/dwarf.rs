@@ -365,7 +365,11 @@ impl RawFolder {
             info.camera = Some(cam.to_uppercase());
         }
         let is_date = |t: &str| {
-            t.len() >= 10 && t.as_bytes()[4] == b'-' && t[..4].chars().all(|c| c.is_ascii_digit())
+            t.get(..10).is_some_and(|head| {
+                head.is_ascii()
+                    && head.as_bytes()[4] == b'-'
+                    && head[..4].chars().all(|c| c.is_ascii_digit())
+            })
         };
         let is_keyword =
             |t: &str| ["EXP", "GAIN", "MANUAL"].contains(&t.to_uppercase().as_str()) || is_date(t);
@@ -509,5 +513,12 @@ mod tests {
         Dwarf.normalize_header(&mut h, p).unwrap();
         assert_eq!(h.get_str("IMAGETYP").as_deref(), Some("LIGHT"));
         assert_eq!(h.get_str("INSTRUME").as_deref(), Some("TELE"));
+    }
+
+    #[test]
+    fn non_ascii_date_token_does_not_panic() {
+        let p = RawFolder::parse("DWARF_RAW_TELE_M31_2026-ééééé");
+        assert_eq!(p.camera.as_deref(), Some("TELE"));
+        assert_eq!(p.date, None);
     }
 }

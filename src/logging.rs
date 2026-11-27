@@ -54,9 +54,10 @@ impl Log for Logger {
         if let Some(f) = &self.file {
             use std::io::Write;
             let date = chrono::Local::now().format("%Y-%m-%d");
-            let _ = writeln!(f.lock().unwrap(), "{date} {line}");
+            let mut guard = f.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = writeln!(guard, "{date} {line}");
         }
-        let mut lines = LINES.lock().unwrap();
+        let mut lines = LINES.lock().unwrap_or_else(|e| e.into_inner());
         if lines.len() >= KEEP {
             lines.pop_front();
         }
@@ -82,13 +83,18 @@ pub fn init(verbose: bool, to_stderr: bool) {
 
 /// Snapshot of recent log lines (oldest first).
 pub fn recent() -> Vec<String> {
-    LINES.lock().unwrap().iter().cloned().collect()
+    LINES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .cloned()
+        .collect()
 }
 
 pub fn count() -> usize {
-    LINES.lock().unwrap().len()
+    LINES.lock().unwrap_or_else(|e| e.into_inner()).len()
 }
 
 pub fn clear() {
-    LINES.lock().unwrap().clear();
+    LINES.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }

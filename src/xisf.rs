@@ -249,6 +249,17 @@ fn plan_rewrite(path: &Path, header: &Header) -> Result<Rewrite> {
             edits.push((attr.range_value(), escape(text)));
         } else if let Some(t) = prop.children().find(|n| n.is_text()) {
             edits.push((t.range(), escape(text)));
+        } else {
+            let range = prop.range();
+            let raw = &clean[range.clone()];
+            if raw.ends_with("/>") {
+                edits.push((
+                    range.end - 2..range.end,
+                    format!(">{}</Property>", escape(text)),
+                ));
+            } else if let Some(close) = raw.rfind("</") {
+                edits.push((range.start + close..range.start + close, escape(text)));
+            }
         }
     }
 
@@ -326,10 +337,11 @@ pub fn rewrite_header(path: &Path, header: &Header) -> Result<()> {
     if plan.data_start == Some(plan.prefix.len() as u64) {
         let mut f = std::fs::OpenOptions::new().write(true).open(path)?;
         f.write_all(&plan.prefix)?;
+        f.flush()?;
         return Ok(());
     }
     let tmp = fits::tmp_path(path);
-    {
+    let written = (|| -> Result<()> {
         let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
         w.write_all(&plan.prefix)?;
         if let Some(start) = plan.data_start {
@@ -338,9 +350,14 @@ pub fn rewrite_header(path: &Path, header: &Header) -> Result<()> {
             std::io::copy(&mut src, &mut w)?;
         }
         w.flush()?;
+        drop(w);
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if written.is_err() {
+        std::fs::remove_file(&tmp).ok();
     }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    written
 }
 
 /// SHA-256 of the file as it would be after [`rewrite_header`] with
@@ -373,14 +390,21 @@ pub struct XisfImage {
 }
 
 pub fn read(path: &Path) -> Result<XisfImage> {
+    const MAX_DECOMPRESS_BYTES: usize = 2 << 30;
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     if bytes.len() < PREAMBLE || &bytes[..8] != SIGNATURE {
         bail!("not an XISF 1.0 file");
     }
     let hlen = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    if hlen > 64 << 20 {
+        bail!("XISF header too large ({hlen} bytes); the file is probably damaged");
+    }
+    let end = PREAMBLE
+        .checked_add(hlen)
+        .ok_or_else(|| anyhow!("XISF header length overflow"))?;
     let xml = std::str::from_utf8(
         bytes
-            .get(PREAMBLE..PREAMBLE + hlen)
+            .get(PREAMBLE..end)
             .ok_or_else(|| anyhow!("truncated XISF header"))?,
     )?;
     let xml = sanitise(xml.trim_end_matches('\0'));
@@ -405,13 +429,22 @@ pub fn read(path: &Path) -> Result<XisfImage> {
         .attribute("sampleFormat")
         .unwrap_or("UInt16")
         .to_string();
-    let item_size = match sample_format.as_str() {
+    let item_size: usize = match sample_format.as_str() {
         "UInt8" => 1,
         "UInt16" => 2,
         "UInt32" | "Float32" => 4,
         "Float64" => 8,
         other => bail!("unsupported XISF sample format {other}"),
     };
+    let expected_bytes = shape
+        .width
+        .checked_mul(shape.height)
+        .and_then(|n| n.checked_mul(shape.planes))
+        .and_then(|n| n.checked_mul(item_size))
+        .ok_or_else(|| anyhow!("XISF image dimensions overflow"))?;
+    if expected_bytes > MAX_DECOMPRESS_BYTES {
+        bail!("XISF image data too large ({expected_bytes} bytes)");
+    }
     let big_endian = image.attribute("byteOrder") == Some("big");
     let planar = image
         .attribute("pixelStorage")
@@ -420,14 +453,20 @@ pub fn read(path: &Path) -> Result<XisfImage> {
 
     let raw = block_bytes(&bytes, image, image.attribute("location"))?;
     let raw = match image.attribute("compression") {
-        Some(c) => decompress(&raw, c)?,
+        Some(c) => decompress(
+            &raw,
+            c,
+            expected_bytes
+                .saturating_add(4096)
+                .min(MAX_DECOMPRESS_BYTES),
+        )?,
         None => raw,
     };
-    if raw.len() < shape.len() * item_size {
+    if raw.len() < expected_bytes {
         bail!("XISF image data is shorter than its geometry");
     }
 
-    let mut data = decode(&raw[..shape.len() * item_size], &sample_format, big_endian);
+    let mut data = decode(&raw[..expected_bytes], &sample_format, big_endian);
     // Normalised float images (0..1) are common in XISF; keep values as-is.
     if !planar && shape.planes > 1 {
         let (w, h, c) = (shape.width, shape.height, shape.planes);
@@ -480,8 +519,11 @@ fn block_bytes(file: &[u8], node: roxmltree::Node, location: Option<&str>) -> Re
                 .get(2)
                 .and_then(|v| v.parse().ok())
                 .ok_or_else(|| anyhow!("bad location"))?;
+            let end = pos
+                .checked_add(len)
+                .ok_or_else(|| anyhow!("attachment offset overflow"))?;
             Ok(file
-                .get(pos..pos + len)
+                .get(pos..end)
                 .ok_or_else(|| anyhow!("attachment beyond end of file"))?
                 .to_vec())
         }
@@ -497,6 +539,9 @@ fn block_bytes(file: &[u8], node: roxmltree::Node, location: Option<&str>) -> Re
             };
             let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
             if parts.get(1) == Some(&"hex") {
+                if !text.is_ascii() || !text.len().is_multiple_of(2) {
+                    bail!("invalid hex-encoded XISF data");
+                }
                 (0..text.len())
                     .step_by(2)
                     .map(|i| u8::from_str_radix(&text[i..i + 2], 16).map_err(Into::into))
@@ -509,7 +554,7 @@ fn block_bytes(file: &[u8], node: roxmltree::Node, location: Option<&str>) -> Re
     }
 }
 
-fn decompress(data: &[u8], spec: &str) -> Result<Vec<u8>> {
+fn decompress(data: &[u8], spec: &str, max_size: usize) -> Result<Vec<u8>> {
     // e.g. "zlib:123456" or "lz4+sh:123456:2"
     let parts: Vec<&str> = spec.split(':').collect();
     let (codec, shuffled) = match parts[0].strip_suffix("+sh") {
@@ -520,10 +565,17 @@ fn decompress(data: &[u8], spec: &str) -> Result<Vec<u8>> {
         .get(1)
         .and_then(|v| v.parse().ok())
         .ok_or_else(|| anyhow!("bad compression spec"))?;
+    if size > max_size {
+        bail!("XISF uncompressed size ({size} bytes) exceeds limit ({max_size} bytes)");
+    }
     let out = match codec {
         "zlib" => {
-            let mut out = Vec::with_capacity(size);
-            flate2::read::ZlibDecoder::new(data).read_to_end(&mut out)?;
+            let mut out = Vec::with_capacity(size.min(16 << 20));
+            let mut dec = flate2::read::ZlibDecoder::new(data).take(size as u64 + 1);
+            dec.read_to_end(&mut out)?;
+            if out.len() > size {
+                bail!("XISF zlib payload exceeds declared uncompressed size ({size} bytes)");
+            }
             out
         }
         "lz4" | "lz4hc" => {
@@ -747,5 +799,36 @@ pub(crate) mod tests {
     fn unshuffles() {
         // items [0x0102, 0x0304] shuffled -> [01,03,02,04]
         assert_eq!(unshuffle(&[1, 3, 2, 4], 2), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn rejects_malformed_xisf_and_updates_empty_property() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("empty_prop.xisf");
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?><xisf version="1.0" xmlns="http://www.pixinsight.com/xisf"><Image geometry="2:2:1" sampleFormat="UInt16" location="attachment:4096:8"><Property id="Observation:Object:Name" type="String"></Property><FITSKeyword name="OBJECT" value="'Old'" comment=""/></Image></xisf>"#;
+        let mut file = SIGNATURE.to_vec();
+        file.extend_from_slice(&(xml.len() as u32).to_le_bytes());
+        file.extend_from_slice(&[0u8; 4]);
+        file.extend_from_slice(xml.as_bytes());
+        file.resize(4096, 0);
+        file.extend_from_slice(&[0u8; 8]);
+        std::fs::write(&p, file).unwrap();
+
+        let mut h = read_header(&p).unwrap();
+        h.set("OBJECT", Value::Str("M 31".into()));
+        rewrite_header(&p, &h).unwrap();
+        let after = std::fs::read(&p).unwrap();
+        assert!(String::from_utf8_lossy(&after)
+            .contains(r#"<Property id="Observation:Object:Name" type="String">M 31</Property>"#));
+
+        // Crafted overflow attachment must return Err, not panic.
+        let bad = dir.path().join("bad.xisf");
+        let bad_xml = r#"<?xml version="1.0" encoding="UTF-8"?><xisf version="1.0" xmlns="http://www.pixinsight.com/xisf"><Image geometry="2:2:1" sampleFormat="UInt16" location="attachment:18446744073709551615:10"/></xisf>"#;
+        let mut raw = SIGNATURE.to_vec();
+        raw.extend_from_slice(&(bad_xml.len() as u32).to_le_bytes());
+        raw.extend_from_slice(&[0u8; 4]);
+        raw.extend_from_slice(bad_xml.as_bytes());
+        std::fs::write(&bad, raw).unwrap();
+        assert!(read(&bad).is_err());
     }
 }

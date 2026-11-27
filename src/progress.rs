@@ -62,17 +62,20 @@ pub struct JobState {
 
 impl JobState {
     pub fn snapshot(&self) -> (usize, usize, String) {
-        self.status.lock().unwrap().clone()
+        self.status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
     pub fn finish(&self, result: Result<String, String>) {
-        *self.result.lock().unwrap() = Some(result);
+        *self.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
         self.done.store(true, Ordering::SeqCst);
     }
 }
 
 impl Progress for JobState {
     fn update(&self, done: usize, total: usize, message: &str) {
-        *self.status.lock().unwrap() = (done, total, message.to_string());
+        *self.status.lock().unwrap_or_else(|e| e.into_inner()) = (done, total, message.to_string());
     }
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)

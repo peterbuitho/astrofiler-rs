@@ -225,32 +225,37 @@ impl Session {
             }
             let dir = dest.join(&f.local_dir);
             let local = dir.join(&f.name);
+            let tmp = dir.join(format!("{}.part", f.name));
             let fetched = std::fs::create_dir_all(&dir)
                 .map_err(anyhow::Error::from)
-                .and_then(|_| {
-                    let tmp = dir.join(format!("{}.part", f.name));
-                    self.transport.fetch(&f.path, &tmp)?;
-                    std::fs::rename(&tmp, &local)?;
-                    Ok(())
-                });
+                .and_then(|_| self.transport.fetch(&f.path, &tmp));
             match fetched {
                 Ok(()) => {
-                    bytes += f.size;
-                    // Before the header fix below, which can change the size.
-                    if !std::fs::metadata(&local).is_ok_and(|m| m.len() == f.size) {
-                        std::fs::remove_file(&local).ok();
+                    // Verify size on the temp file before moving into place, so
+                    // an incomplete download never clobbers an existing good file.
+                    if !std::fs::metadata(&tmp).is_ok_and(|m| m.len() == f.size) {
+                        std::fs::remove_file(&tmp).ok();
                         failed.push((
                             f.path.clone(),
                             "copy is incomplete, kept on the telescope".into(),
                         ));
                         continue;
                     }
+                    if let Err(e) = std::fs::rename(&tmp, &local) {
+                        std::fs::remove_file(&tmp).ok();
+                        failed.push((f.path.clone(), format!("{e:#}")));
+                        continue;
+                    }
+                    bytes += f.size;
                     if let Err(e) = self.telescope.after_download(&local, f) {
                         log::warn!("{}: {e:#}", local.display());
                     }
                     downloaded.push((f.clone(), local));
                 }
-                Err(e) => failed.push((f.path.clone(), format!("{e:#}"))),
+                Err(e) => {
+                    std::fs::remove_file(&tmp).ok();
+                    failed.push((f.path.clone(), format!("{e:#}")));
+                }
             }
         }
         downloaded
@@ -387,8 +392,10 @@ impl Session {
 fn is_safe_name(name: &str) -> bool {
     // "C:x" names a drive on Windows; elsewhere a colon is just a character.
     !name.is_empty()
+        && name != "."
         && name != ".."
         && !name.contains(['/', '\\'])
+        && !name.chars().any(|c| c.is_control())
         && !(cfg!(windows) && name.contains(':'))
 }
 
@@ -558,7 +565,7 @@ pub fn find_network(
         0,
         &format!("Scanning {a}.{b}.{c}.0/24 for {}...", t.name()),
     );
-    let pool = match rayon::ThreadPoolBuilder::new().num_threads(96).build() {
+    let pool = match rayon::ThreadPoolBuilder::new().num_threads(32).build() {
         Ok(p) => p,
         Err(_) => return vec![],
     };
@@ -567,11 +574,17 @@ pub fn find_network(
             .into_par_iter()
             .map(|d| IpAddr::V4(Ipv4Addr::new(a, b, c, d)))
             .filter(|ip| {
-                *ip != IpAddr::V4(me) && port_open(*ip, t.port(), Duration::from_millis(600))
+                !progress.cancelled()
+                    && *ip != IpAddr::V4(me)
+                    && port_open(*ip, t.port(), Duration::from_millis(600))
             })
             .collect()
     });
+    if progress.cancelled() {
+        return vec![];
+    }
     hits.into_iter()
+        .take_while(|_| !progress.cancelled())
         .filter_map(|ip| {
             let hostname = dns_lookup::lookup_addr(&ip).unwrap_or_default();
             t.identify_network(cfg, &ip.to_string(), &hostname)
@@ -776,7 +789,7 @@ mod tests {
 
     #[test]
     fn names_from_the_telescope_stay_inside_the_download_folder() {
-        for bad in ["..", "", "../x.fit", "a\\b.fit"] {
+        for bad in [".", "..", "", "../x.fit", "a\\b.fit", "bad\x00.fit"] {
             assert!(!is_safe_name(bad), "{bad}");
         }
         assert_eq!(is_safe_name("C:x.fit"), !cfg!(windows));

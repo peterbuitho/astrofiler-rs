@@ -59,10 +59,26 @@ pub struct LocalTransport {
     pub root: PathBuf,
 }
 
+impl LocalTransport {
+    /// Join a relative remote path under `self.root`, rejecting absolute paths
+    /// or `..` components that would escape the telescope root.
+    fn safe_join(&self, rel: &str) -> Result<PathBuf> {
+        let mut out = self.root.clone();
+        for comp in Path::new(rel).components() {
+            match comp {
+                std::path::Component::Normal(part) => out.push(part),
+                std::path::Component::CurDir => {}
+                _ => anyhow::bail!("unsafe remote path '{rel}'"),
+            }
+        }
+        Ok(out)
+    }
+}
+
 impl Transport for LocalTransport {
     fn list(&mut self, dir: &str) -> Result<Vec<Entry>> {
         let mut out = Vec::new();
-        for e in std::fs::read_dir(self.root.join(dir))? {
+        for e in std::fs::read_dir(self.safe_join(dir)?)? {
             let e = e?;
             let md = e.metadata()?;
             out.push(Entry {
@@ -75,15 +91,19 @@ impl Transport for LocalTransport {
         Ok(out)
     }
     fn fetch(&mut self, path: &str, local: &Path) -> Result<()> {
-        crate::util::copy_file(&self.root.join(path), local)?;
+        crate::util::copy_file(&self.safe_join(path)?, local)?;
         Ok(())
     }
     fn delete(&mut self, path: &str) -> Result<()> {
-        std::fs::remove_file(self.root.join(path))?;
+        std::fs::remove_file(self.safe_join(path)?)?;
         Ok(())
     }
     fn remove_dir(&mut self, dir: &str) -> Result<()> {
-        std::fs::remove_dir(self.root.join(dir))?;
+        let target = self.safe_join(dir)?;
+        if target == self.root {
+            anyhow::bail!("refusing to remove telescope root");
+        }
+        std::fs::remove_dir(target)?;
         Ok(())
     }
 }
@@ -95,29 +115,41 @@ pub struct SmbTransport {
     tree: smb2::Tree,
 }
 
+const SMB_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const SMB_OP_TIMEOUT: Duration = Duration::from_secs(30);
+const SMB_CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
+
 impl SmbTransport {
     pub fn connect(host: &str, user: &str, password: &str, share: &str) -> Result<Self> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         let addr = resolve(host, 445)?;
-        let (client, tree) = rt
-            .block_on(async {
+        let (client, tree) = rt.block_on(async {
+            tokio::time::timeout(SMB_CONNECT_TIMEOUT, async {
                 let mut client = smb2::connect(&addr.to_string(), user, password).await?;
                 let tree = client.connect_share(share).await?;
                 Ok::<_, smb2::Error>((client, tree))
             })
-            .map_err(|e| anyhow!("SMB connection to {host} failed: {e}"))?;
+            .await
+            .map_err(|_| anyhow!("SMB connection to {host} timed out"))?
+            .map_err(|e| anyhow!("SMB connection to {host} failed: {e}"))
+        })?;
         Ok(SmbTransport { rt, client, tree })
     }
 }
 
 impl Transport for SmbTransport {
     fn list(&mut self, dir: &str) -> Result<Vec<Entry>> {
-        let entries = self
-            .rt
-            .block_on(self.client.list_directory(&mut self.tree, dir))
-            .map_err(|e| anyhow!("listing {dir}: {e}"))?;
+        let entries = self.rt.block_on(async {
+            tokio::time::timeout(
+                SMB_OP_TIMEOUT,
+                self.client.list_directory(&mut self.tree, dir),
+            )
+            .await
+            .map_err(|_| anyhow!("listing {dir} timed out"))?
+            .map_err(|e| anyhow!("listing {dir}: {e}"))
+        })?;
         Ok(entries
             .into_iter()
             .filter(|e| e.name != "." && e.name != "..")
@@ -132,12 +164,18 @@ impl Transport for SmbTransport {
     fn fetch(&mut self, path: &str, local: &Path) -> Result<()> {
         let SmbTransport { rt, client, tree } = self;
         rt.block_on(async {
-            let mut dl = client
-                .download(tree, path)
+            let mut dl = tokio::time::timeout(SMB_OP_TIMEOUT, client.download(tree, path))
                 .await
+                .map_err(|_| anyhow!("opening {path} timed out"))?
                 .map_err(|e| anyhow!("{e}"))?;
             let mut out = std::io::BufWriter::new(std::fs::File::create(local)?);
-            while let Some(chunk) = dl.next_chunk().await {
+            loop {
+                let next = tokio::time::timeout(SMB_CHUNK_TIMEOUT, dl.next_chunk())
+                    .await
+                    .map_err(|_| anyhow!("downloading {path} timed out"))?;
+                let Some(chunk) = next else {
+                    break;
+                };
                 out.write_all(&chunk.map_err(|e| anyhow!("{e}"))?)?;
             }
             out.flush()?;
@@ -145,14 +183,26 @@ impl Transport for SmbTransport {
         })
     }
     fn delete(&mut self, path: &str) -> Result<()> {
-        self.rt
-            .block_on(self.client.delete_file(&mut self.tree, path))
+        self.rt.block_on(async {
+            tokio::time::timeout(
+                SMB_OP_TIMEOUT,
+                self.client.delete_file(&mut self.tree, path),
+            )
+            .await
+            .map_err(|_| anyhow!("deleting {path} timed out"))?
             .map_err(|e| anyhow!("deleting {path}: {e}"))
+        })
     }
     fn remove_dir(&mut self, dir: &str) -> Result<()> {
-        self.rt
-            .block_on(self.client.delete_directory(&mut self.tree, dir))
+        self.rt.block_on(async {
+            tokio::time::timeout(
+                SMB_OP_TIMEOUT,
+                self.client.delete_directory(&mut self.tree, dir),
+            )
+            .await
+            .map_err(|_| anyhow!("removing {dir} timed out"))?
             .map_err(|e| anyhow!("removing {dir}: {e}"))
+        })
     }
 }
 

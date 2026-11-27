@@ -232,8 +232,21 @@ impl Config {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        ini.write_to_file(&self.path)?;
-        Ok(())
+        let tmp = crate::fits::tmp_path(&self.path);
+        let written = (|| -> Result<()> {
+            ini.write_to_file(&tmp)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+            }
+            std::fs::rename(&tmp, &self.path)?;
+            Ok(())
+        })();
+        if written.is_err() {
+            std::fs::remove_file(&tmp).ok();
+        }
+        written
     }
 
     /// Database lookup order: `$ASTROFILER_DB_PATH`, the `database` key, an

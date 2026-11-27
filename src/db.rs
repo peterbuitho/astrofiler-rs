@@ -345,7 +345,7 @@ pub fn file_by_id(conn: &Connection, id: &str) -> Result<Option<FitsFile>> {
 pub fn hash_exists(conn: &Connection, hash: &str) -> Result<Option<String>> {
     Ok(conn
         .query_row(
-            "SELECT fitsFileName FROM fitsFile WHERE fitsFileHash=?1 LIMIT 1",
+            "SELECT fitsFileName FROM fitsFile WHERE fitsFileHash=?1 AND COALESCE(fitsFileSoftDelete,0)=0 LIMIT 1",
             [hash],
             |r| r.get(0),
         )
@@ -397,7 +397,7 @@ pub fn all_sessions(conn: &Connection) -> Result<Vec<Session>> {
         "SELECT s.fitsSessionId, s.fitsSessionObjectName, s.fitsSessionDate, s.fitsSessionTelescope, \
          s.fitsSessionImager, s.fitsSessionExposure, s.fitsSessionBinningX, s.fitsSessionBinningY, \
          s.fitsSessionCCDTemp, s.fitsSessionGain, s.fitsSessionOffset, s.fitsSessionFilter, \
-         (SELECT count(*) FROM fitsFile f WHERE f.fitsFileSession = s.fitsSessionId) \
+         (SELECT count(*) FROM fitsFile f WHERE f.fitsFileSession = s.fitsSessionId AND COALESCE(f.fitsFileSoftDelete,0)=0) \
          FROM fitsSession s ORDER BY s.fitsSessionDate DESC, s.fitsSessionObjectName",
     )?;
     let rows = stmt
